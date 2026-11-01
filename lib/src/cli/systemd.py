@@ -13,11 +13,6 @@ except ImportError:
     from output_control import (log_info, log_success, log_warning, log_error,
                                 log_debug, run_command)
 
-try:
-    from ..installation import is_nix_install, nix_profile_command
-except ImportError:
-    from installation import is_nix_install, nix_profile_command
-
 from ._shared import (HYPRWHSPR_ROOT, SERVICE_NAME, RESUME_SERVICE_NAME,
                       YDOTOOL_UNIT, _YDOTOOL_MARKERS, USER_SYSTEMD_DIR,
                       _validate_hyprwhspr_root)
@@ -76,32 +71,6 @@ def _is_hyprwhspr_managed_ydotool_unit(target: Path) -> bool:
     return any(marker in text for marker in _YDOTOOL_MARKERS)
 
 
-def _nix_service_content(template: str):
-    """Render the unit for a Nix profile launcher, or None when none is on PATH.
-
-    The profile path survives updates; the store path it resolves to does not.
-    The launcher wrapper sets HYPRWHSPR_ROOT itself.
-    """
-    launcher = nix_profile_command('hyprwhspr', HYPRWHSPR_ROOT)
-    if not launcher:
-        log_error('This hyprwhspr is not on PATH through a Nix profile. Install it with nix profile install, then retry.')
-        return None
-    # The ':' prefix disables argv environment expansion. Doubling '$' would
-    # alter the executable filename, which systemd resolves separately from argv.
-    escaped = (launcher.replace('\\', '\\\\')
-               .replace('"', '\\"').replace('%', '%%')
-               .replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t'))
-    quoted = f'"{escaped}"'
-    lines = []
-    for line in template.splitlines(keepends=True):
-        if line.startswith('ExecStart='):
-            line = f'ExecStart=:{quoted}\n'
-        elif line.startswith('Environment=HYPRWHSPR_ROOT='):
-            continue
-        lines.append(line)
-    return ''.join(lines)
-
-
 def setup_systemd(mode: str = 'install'):
     """Setup systemd user service"""
     log_info("Configuring systemd user services...")
@@ -119,8 +88,7 @@ def setup_systemd(mode: str = 'install'):
     # Create user systemd directory
     USER_SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
     
-    # Only 'install' deploys the unit; enable/disable must still work when a
-    # customized unit would make the rewrite refuse.
+    # Read hyprwhspr service file template and substitute paths
     service_source = Path(HYPRWHSPR_ROOT) / 'config' / 'systemd' / SERVICE_NAME
     service_dest = USER_SYSTEMD_DIR / SERVICE_NAME
     
@@ -128,35 +96,22 @@ def setup_systemd(mode: str = 'install'):
         log_error(f"Service file not found: {service_source}")
         return False
     
-    # Read template and substitute HYPRWHSPR_ROOT. 'enable' also deploys when no
-    # unit is present, or systemctl enable would fail into a success message.
-    if mode == 'install' or (mode == 'enable' and not service_dest.exists()):
-        try:
-            with open(service_source, 'r', encoding='utf-8') as f:
-                service_content = f.read()
+    # Read template and substitute HYPRWHSPR_ROOT
+    try:
+        with open(service_source, 'r', encoding='utf-8') as f:
+            service_content = f.read()
+        
+        # Substitute hardcoded path with actual HYPRWHSPR_ROOT
+        service_content = service_content.replace('/usr/lib/hyprwhspr', HYPRWHSPR_ROOT)
+        
+        # Write substituted content to user directory
+        with open(service_dest, 'w', encoding='utf-8') as f:
+            f.write(service_content)
 
-            # Substitute hardcoded path with actual HYPRWHSPR_ROOT
-            if os.environ.get('HYPRWHSPR_GENERATION'):
-                from managed_install import Installation, write_owned, service_content as render_unit
-                service_content = render_unit(HYPRWHSPR_ROOT, Installation().data / 'launcher')
-                write_owned(service_dest, service_content)
-            elif is_nix_install():
-                service_content = _nix_service_content(service_content)
-                if service_content is None:
-                    return False
-                with open(service_dest, 'w', encoding='utf-8') as f:
-                    f.write(service_content)
-            else:
-                service_content = service_content.replace('/usr/lib/hyprwhspr', HYPRWHSPR_ROOT)
-                with open(service_dest, 'w', encoding='utf-8') as f:
-                    f.write(service_content)
-
-            log_success("User service file created with correct paths")
-        except (OSError, RuntimeError, ValueError, TypeError) as e:
-            log_error(f"Failed to read/write service file: {e}")
-            if os.environ.get('HYPRWHSPR_GENERATION'):
-                log_error(f'Inspect and back up {service_dest}. If it is a stale generated unit, remove it and rerun hyprwhspr systemd install. Customized units must be reconciled manually.')
-            return False
+        log_success("User service file created with correct paths")
+    except IOError as e:
+        log_error(f"Failed to read/write service file: {e}")
+        return False
 
     # hyprwhspr no longer deploys/manages a ydotool.service. The paste fallback now
     # runs a *private* ydotoold child from the app (lib/src/ydotoold_session.py) on
@@ -193,13 +148,8 @@ def setup_systemd(mode: str = 'install'):
         except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
             pass
         
-        enabled = run_command(['systemctl', '--user', 'enable', '--now', SERVICE_NAME], check=False)
-        if getattr(enabled, 'returncode', 0) != 0:
-            # Reporting success here hid a unit systemd could not see at all.
-            log_error(f'systemctl --user enable failed for {SERVICE_NAME} (exit {enabled.returncode}).')
-            log_info(f'Check that the unit exists where systemd looks: {USER_SYSTEMD_DIR}')
-            return False
-
+        run_command(['systemctl', '--user', 'enable', '--now', SERVICE_NAME], check=False)
+        
         # If service was already running, restart it to pick up any config changes
         if service_was_running:
             log_info("Service was already running, restarting to apply configuration changes...")

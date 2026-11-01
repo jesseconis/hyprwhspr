@@ -5,16 +5,8 @@ Runs CohereLabs/cohere-transcribe via HuggingFace transformers with
 trust_remote_code, on CUDA (bfloat16) or CPU (float32).
 """
 
-import contextlib
-import sys
-import threading
 import time
 from typing import Optional
-
-try:
-    from ..service_log import log
-except ImportError:
-    from service_log import log
 
 try:
     from ..dependencies import require_package
@@ -28,61 +20,13 @@ try:
 except ImportError:
     from credential_manager import get_credential
 
-try:
-    from ..backend_utils import COHERE_LANGUAGES, release_memory
-except ImportError:
-    from backend_utils import COHERE_LANGUAGES, release_memory
-
 from .base import TranscriptionBackend
-
-
-MODEL_ID = 'CohereLabs/cohere-transcribe-03-2026'
-
-
-def _cached_model_path():
-    from huggingface_hub import snapshot_download
-
-    # Some processor/tokenizer loaders drop local_files_only on nested calls.
-    # A filesystem path avoids Hub metadata requests even in those code paths.
-    return snapshot_download(MODEL_ID, local_files_only=True)
-
-
-@contextlib.contextmanager
-def _quiet_loader_output():
-    """Suppress loader noise while preserving output from service threads.
-
-    redirect_stdout/stderr alone affect the entire process, including shortcut
-    messages explaining that recording is waiting for background model loading.
-    Model initialization and reinitialization are serialized by WhisperManager.
-    """
-    owner = threading.get_ident()
-
-    class LoaderOutput:
-        def __init__(self, stream):
-            self.stream = stream
-
-        def write(self, text):
-            if threading.get_ident() == owner:
-                return len(text)
-            return self.stream.write(text)
-
-        def flush(self):
-            if threading.get_ident() != owner:
-                self.stream.flush()
-
-        def __getattr__(self, name):
-            return getattr(self.stream, name)
-
-    with contextlib.redirect_stdout(LoaderOutput(sys.stdout)), \
-            contextlib.redirect_stderr(LoaderOutput(sys.stderr)):
-        yield
 
 
 class CohereBackend(TranscriptionBackend):
     """Transformers backend; CUDA context needs a refresh after long idle."""
 
     name = 'cohere-transcribe'
-    loads_in_background = True
     reinit_on_idle = True
 
     def __init__(self, manager):
@@ -91,8 +35,6 @@ class CohereBackend(TranscriptionBackend):
         self._cohere_model = None
         self._cohere_processor = None
         self._cohere_compile_done = False  # True after first torch.compile run; suppression no longer needed
-        self._autodetect_notice_shown = False   # "cannot auto-detect" is said once per model load
-        self._rejected_languages = set()        # unsupported codes already reported
 
     def initialize(self) -> bool:
         """Configure Cohere Transcribe backend (transformers, CUDA/CPU)"""
@@ -100,10 +42,10 @@ class CohereBackend(TranscriptionBackend):
             import torch
             from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
         except ImportError:
-            log('ERROR: cohere-transcribe dependencies not installed. Run: hyprwhspr setup and select cohere-transcribe')
+            print('ERROR: cohere-transcribe dependencies not installed. Run: hyprwhspr setup and select cohere-transcribe', flush=True)
             return False
 
-        model_id = MODEL_ID
+        model_id = 'CohereLabs/cohere-transcribe-03-2026'
         device_setting = self.config.get_setting('cohere_transcribe_device', 'auto')
         dtype_setting = self.config.get_setting('cohere_transcribe_dtype', 'bfloat16')
 
@@ -129,87 +71,46 @@ class CohereBackend(TranscriptionBackend):
             pass
 
         try:
-            log(f'[BACKEND] Loading Cohere Transcribe model (device={device}, dtype={torch_dtype})')
-            model_path = _cached_model_path()
+            import contextlib, os as _os
+            print(f'[BACKEND] Loading Cohere Transcribe model (device={device}, dtype={torch_dtype})', flush=True)
             # Cohere's trust_remote_code path prints large ANSI-laden blobs that
             # journald records as "[NNK blob data]". Redirect during from_pretrained.
-            with _quiet_loader_output():
+            with open(_os.devnull, 'w') as _devnull, \
+                    contextlib.redirect_stdout(_devnull), \
+                    contextlib.redirect_stderr(_devnull):
                 self._cohere_processor = AutoProcessor.from_pretrained(
-                    model_path, trust_remote_code=True, token=hf_token,
+                    model_id, trust_remote_code=True, token=hf_token,
                     local_files_only=True)
                 self._cohere_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                    model_path,
+                    model_id,
                     trust_remote_code=True,
                     dtype=torch_dtype,
                     token=hf_token,
                     local_files_only=True,
                 ).to(device)
             self._cohere_model.eval()
-            log(f'[BACKEND] Cohere Transcribe ready (device={device}, dtype={torch_dtype})')
+            print(f'[BACKEND] Cohere Transcribe ready (device={device}, dtype={torch_dtype})', flush=True)
         except Exception as e:
-            log(f'ERROR: Failed to load Cohere Transcribe model: {e}')
+            print(f'ERROR: Failed to load Cohere Transcribe model: {e}', flush=True)
             import traceback
             traceback.print_exc()
             return False
-
-        # Surface a broken language at startup rather than on first recording.
-        # Never fail init over it: an unusable secondary shortcut must not take
-        # the whole service down.
-        checked = ['language']
-        if self.config.get_setting('secondary_shortcut', None):
-            checked.append('secondary_language')  # dead config otherwise
-        for setting in checked:
-            value = (self.config.get_setting(setting, None) or '').lower()
-            if value and value not in self._supported_languages():
-                self._reject_language(value, setting)
 
         self.current_model = model_id
         self.ready = True
         self._last_use_time = time.monotonic()
         return True
 
-    def _supported_languages(self) -> tuple:
-        """The loaded model's own list when available, else the shipped copy."""
-        configured = getattr(getattr(self._cohere_model, 'config', None), 'supported_languages', None)
-        return tuple(configured) if configured else COHERE_LANGUAGES
-
-    def _reject_language(self, language: str, setting: str) -> None:
-        """Report an unsupported language; the model would only raise on it."""
-        supported = ' '.join(sorted(self._supported_languages()))
-        log(f"[ERROR] cohere-transcribe does not support {setting} '{language}'")
-        log(f"        supported: {supported}")
-
-        if language in self._rejected_languages:
-            return
-        self._rejected_languages.add(language)
-        try:
-            from desktop_notify import notify
-            notify("hyprwhspr",
-                   f"Unsupported language '{language}' for cohere-transcribe.\nSupported: {supported}",
-                   urgency="critical")
-        except Exception:
-            pass  # Best effort notification
-
     def transcribe(self, audio_data: np.ndarray, sample_rate: int = 16000,
                    language_override: Optional[str] = None) -> str:
         """Transcribe using Cohere Transcribe (transformers)."""
         if self._cohere_model is None or self._cohere_processor is None:
-            log('[ERROR] Cohere Transcribe model not initialized')
+            print('[ERROR] Cohere Transcribe model not initialized', flush=True)
             return ''
 
         language = language_override if language_override is not None else self.config.get_setting('language', None)
-        language = (language or '').lower()
         if not language:
-            # The language becomes decoder tokens; the model cannot detect it.
             language = 'en'
-            if not self._autodetect_notice_shown:
-                self._autodetect_notice_shown = True
-                log('[LANG] cohere-transcribe cannot auto-detect; using en '
-                      '(set "language" for other languages)')
-
-        if language not in self._supported_languages():
-            self._reject_language(language, 'language')
-            return ''
 
         use_compile = self.config.get_setting('cohere_transcribe_compile', False)
 
@@ -253,7 +154,7 @@ class CohereBackend(TranscriptionBackend):
             self._last_use_time = time.monotonic()
             return result
         except Exception as e:
-            log(f'[ERROR] Cohere Transcribe transcription failed: {e}')
+            print(f'[ERROR] Cohere Transcribe transcription failed: {e}', flush=True)
             import traceback
             traceback.print_exc()
             return ''
@@ -264,11 +165,7 @@ class CohereBackend(TranscriptionBackend):
             import torch
             from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 
-            # Drop the old copy first: holding both briefly doubles VRAM (OOM on 8 GB).
-            self.unload()
-            release_memory()
-
-            model_id = MODEL_ID
+            model_id = 'CohereLabs/cohere-transcribe-03-2026'
             device_setting = self.config.get_setting('cohere_transcribe_device', 'auto')
             dtype_setting = self.config.get_setting('cohere_transcribe_dtype', 'bfloat16')
 
@@ -281,14 +178,16 @@ class CohereBackend(TranscriptionBackend):
             except Exception:
                 pass
 
-            log(f'[MODEL] Reinitializing Cohere Transcribe (device={device})')
-            model_path = _cached_model_path()
-            with _quiet_loader_output():
+            print(f'[MODEL] Reinitializing Cohere Transcribe (device={device})', flush=True)
+            import contextlib, os as _os
+            with open(_os.devnull, 'w') as _devnull, \
+                    contextlib.redirect_stdout(_devnull), \
+                    contextlib.redirect_stderr(_devnull):
                 self._cohere_processor = AutoProcessor.from_pretrained(
-                    model_path, trust_remote_code=True, token=hf_token,
+                    model_id, trust_remote_code=True, token=hf_token,
                     local_files_only=True)
                 self._cohere_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                    model_path,
+                    model_id,
                     trust_remote_code=True,
                     dtype=torch_dtype,
                     token=hf_token,
@@ -298,14 +197,12 @@ class CohereBackend(TranscriptionBackend):
             self._last_use_time = time.monotonic()
             return True
         except Exception as e:
-            self.unload()
-            log(f'[ERROR] Cohere Transcribe reinitialization failed: {e}')
+            print(f'[ERROR] Cohere Transcribe reinitialization failed: {e}', flush=True)
             return False
 
     def unload(self) -> None:
         self._cohere_model = None
         self._cohere_processor = None
-        self._cohere_compile_done = False  # a fresh model compiles (and leaks output) again
 
     @property
     def is_loaded(self) -> bool:

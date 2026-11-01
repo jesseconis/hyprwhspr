@@ -12,36 +12,14 @@ import time
 import threading
 import json
 import ast
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Dict, Any, List, Tuple
-
-try:
-    from .service_log import log
-except ImportError:
-    from service_log import log
 
 try:
     from .ydotoold_session import YdotooldSession
 except ImportError:
     from ydotoold_session import YdotooldSession
-
-try:
-    from .text_script import boundaried_pattern, ends_with_no_space_script
-except ImportError:
-    from text_script import boundaried_pattern, ends_with_no_space_script
-
-try:
-    from .filler_filter import filter_filler_words
-except ImportError:
-    from filler_filter import filter_filler_words
-
-try:
-    from . import keyboard_layout
-except ImportError:
-    import keyboard_layout
-
 
 class _LazyPyperclip:
     """Load the optional fallback only when native clipboard tools are absent."""
@@ -78,116 +56,7 @@ class _LazyPyperclip:
 pyperclip = _LazyPyperclip()
 
 
-# Plain-text clipboard types, most preferred first; wl-paste picks these too.
-_PLAIN_TEXT_TYPES = ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT")
-
-
-class ClipboardData(bytes):
-    """Saved clipboard bytes plus the type they were read as, if known."""
-
-    def __new__(cls, data: bytes, mime_type: Optional[str] = None):
-        obj = super().__new__(cls, data)
-        obj.mime_type = mime_type
-        return obj
-
-
 POST_TRANSCRIPTION_HOOK_CONSUMED_EXIT_CODE = 77
-
-_SPOKEN_REPLACEMENTS = (
-    ('period', '.'), ('comma', ','), ('question mark', '?'),
-    ('exclamation mark', '!'), ('colon', ':'), ('semicolon', ';'),
-    ('tab', '\t'), ('dash', '-'), ('underscore', '_'),
-    ('open paren', '('), ('close paren', ')'), ('open bracket', '['),
-    ('close bracket', ']'), ('open brace', '{'), ('close brace', '}'),
-    ('at symbol', '@'), ('hash', '#'), ('dollar sign', '$'),
-    ('percent', '%'), ('caret', '^'), ('ampersand', '&'),
-    ('asterisk', '*'), ('plus', '+'), ('equals', '='),
-    ('less than', '<'), ('greater than', '>'), ('slash', '/'),
-    ('backslash', '\\'), ('pipe', '|'), ('tilde', '~'), ('grave', '`'),
-    ('quote', '"'), ('apostrophe', "'"),
-)
-
-
-def _config_setting(config_manager, name, default=None):
-    if config_manager is None:
-        return default
-    return config_manager.get_setting(name, default)
-
-
-def _apply_configured_word_overrides(text, config_manager):
-    if config_manager is None:
-        return text
-    for original, replacement in (config_manager.get_word_overrides() or {}).items():
-        if original:
-            text = re.sub(
-                boundaried_pattern(original), replacement, text, flags=re.IGNORECASE
-            )
-    return re.sub(r' +', ' ', text).strip()
-
-
-def _filter_configured_filler_words(text, config_manager):
-    if config_manager is None or not config_manager.get_filter_filler_words():
-        return text
-    return filter_filler_words(text, config_manager.get_filler_words())
-
-
-def preprocess_text(text: str, config_manager=None) -> str:
-    """Apply dictation corrections without injection or external hooks."""
-    processed = text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
-    processed = _apply_configured_word_overrides(processed, config_manager)
-    processed = _filter_configured_filler_words(processed, config_manager)
-
-    if not _config_setting(config_manager, 'symbol_replacements', True):
-        return re.sub(r'[ \t]+', ' ', processed).strip()
-
-    # Recognizers commonly punctuate the spoken command itself. Sentence
-    # punctuation after "new line" is not intended for the new line.
-    processed = re.sub(
-        r'\bnew[ \t]+line\b(?:[ \t]*[.!?]+)?', '\n', processed,
-        flags=re.IGNORECASE,
-    )
-
-    # Mark commands before spacing them. Identical literal punctuation touching
-    # a command is another rendering of the same requested symbol.
-    markers = {}
-    for index, (command, symbol) in enumerate(_SPOKEN_REPLACEMENTS):
-        marker = f'\ue000{index}\ue001'
-        markers[marker] = symbol
-        escaped_symbol = re.escape(symbol)
-        escaped_command = re.escape(command)
-        single_symbol = rf'{escaped_symbol}(?!{escaped_symbol})'
-        pattern = (
-            rf'(?:{escaped_symbol}+[ \t]+\b{escaped_command}\b{single_symbol}'
-            rf'|{escaped_symbol}+\b{escaped_command}\b'
-            rf'|\b{escaped_command}\b{single_symbol}'
-            rf'|\b{escaped_command}\b)'
-        )
-        processed = re.sub(pattern, marker, processed, flags=re.IGNORECASE)
-
-    # Only command markers receive punctuation spacing; unrelated raw
-    # punctuation, including ellipses and repeated emphasis, stays untouched.
-    for marker, symbol in markers.items():
-        if symbol in '.,?!:;':
-            processed = re.sub(rf'[ \t]*{re.escape(marker)}[ \t]*', marker, processed)
-            # Add separation only before following prose. A different raw
-            # punctuation mark is preserved directly beside the spoken one.
-            processed = re.sub(
-                rf'{re.escape(marker)}(?=[^\s\ue000)\]}}>,.?!:;。，、！？：；])',
-                symbol + ' ', processed,
-            )
-            processed = processed.replace(marker, symbol)
-        elif symbol in '([{':
-            processed = re.sub(rf'{re.escape(marker)}[ \t]*', marker, processed)
-            processed = processed.replace(marker, symbol)
-        elif symbol in ')]}':
-            processed = re.sub(rf'[ \t]*{re.escape(marker)}', marker, processed)
-            processed = processed.replace(marker, symbol)
-        else:
-            processed = processed.replace(marker, symbol)
-
-    processed = re.sub(r'[ \t]+', ' ', processed)
-    processed = re.sub(r' *\n *', '\n', processed)
-    return processed.strip()
 
 
 class _PostTranscriptionHookOutcome(Enum):
@@ -202,56 +71,8 @@ class _PostTranscriptionHookResult:
     text: str
 
 
-class InjectionOutcome(Enum):
-    INJECTED = "injected"
-    CONSUMED = "consumed"
-    FAILED = "failed"
-
-
-_CLIPBOARD_UNSAVED = object()
-
-# A chunk starting with one of these attaches to the previous chunk: spoken
-# "comma" renders as ",", which must not follow a separating space.
-_NO_SPACE_BEFORE = set(',.?!:;)]}\n')
-# ...and nothing follows these with a space.
-_NO_SPACE_AFTER = set('([{\n\t')
-
-
-def _phrase_word(word: str) -> str:
-    return re.sub(r'[^\w]', '', word.lower())
-
-
-@dataclass
-class _StreamSession:
-    """One recording's live-typed delivery (realtime_live_typing).
-
-    Per-dictation work - saving and restoring the clipboard, auto_submit's
-    Enter, retaining text for recovery - happens once per session, not once
-    per chunk. Ported from Jacob Banghart's incremental injection (#261).
-    """
-    saved_clipboard: Any = _CLIPBOARD_UNSAVED
-    last_pasted: Optional[str] = None
-    last_char: str = ''
-    held: List[str] = None
-    raw_parts: List[str] = None
-    injected_any: bool = False
-    failed: bool = False
-    # Text never reached the app (injection disabled for it, or no paste
-    # tool): no Enter, no clipboard restore.
-    not_pasted: bool = False
-    # A blocked app must not expose its dictation through copy-last/paste-last.
-    recovery_allowed: bool = True
-    cancelled: threading.Event = field(default_factory=threading.Event)
-    recovery_text: Optional[str] = None
-
-    def __post_init__(self):
-        self.held = []
-        self.raw_parts = []
-
-
 DEFAULT_PASTE_KEYCODE = 47  # Linux evdev KEY_V on QWERTY
 NON_XKB_INPUT_METHOD_LAYOUT = '__non_xkb_input_method__'
-_UNSET_LAYOUT_VALUES = {'(unset)', 'unset', 'n/a', 'none'}
 
 PASTE_MODE_CHORDS = {
     'ctrl_shift': 'ctrl+shift+v',
@@ -352,17 +173,6 @@ YDOTOOL_KEYCODES = {
     'leftbrace': 26,
     'rightbrace': 27,
     'backslash': 43,
-    'capslock': 58,
-    'leftctrl': 29,
-    'rightctrl': 97,
-    'leftshift': 42,
-    'rightshift': 54,
-    'leftalt': 56,
-    'rightalt': 100,
-    'leftmeta': 125,
-    'rightmeta': 126,
-    'leftsuper': 125,
-    'rightsuper': 126,
 }
 
 FKEY_CODES = {
@@ -376,19 +186,10 @@ class TextInjector:
     """Handles injecting text into focused applications"""
 
     _LAYOUT_CACHE_TTL_S = 1.0
-    # The live-typed dictation in progress (realtime_live_typing).
-    _stream: Optional[_StreamSession] = None
 
     def __init__(self, config_manager=None):
         # Configuration
         self.config_manager = config_manager
-        self._delivery_lock = threading.RLock()
-        self._stream_lock = threading.Lock()
-        self._stream = None
-        self._clipboard_lock = threading.RLock()
-        self._last_text_lock = threading.Lock()
-        self._last_text = None
-        self._clipboard_generation = 0
 
         # Detect available injectors once for the active display protocol.
         self.session_type = os.environ.get('XDG_SESSION_TYPE', '').lower()
@@ -396,27 +197,22 @@ class TextInjector:
         self.wtype_available = not self._is_x11_session() and shutil.which('wtype') is not None
         self.xdotool_available = self._is_x11_session() and shutil.which('xdotool') is not None
         self._hyprland_shortcut_syntax = None
-        self._warned_invalid_ydotool_modifier_overrides = set()
 
         # Private ydotoold instance (lazily started on first uinput-fallback use, so
         # wtype-only sessions never spawn it). Replaces the old shared/managed
         # ydotool.service: hyprwhspr owns this daemon on its own socket.
         self._ydotoold = YdotooldSession()
         self._atspi_unavailable = False
-        self._warned_focused_window_unavailable = False
 
-        if self._use_hyprland_ydotool() and not self.ydotool_available:
-            log("⚠️  hyprland_paste_backend='ydotool' requires both ydotool and ydotoold. "
-                "Install them or set hyprland_paste_backend='auto'; paste will fail until corrected.")
-        elif (
+        if (
             not self.ydotool_available
             and not self.wtype_available
             and not self.xdotool_available
             and not self._is_hyprland_session()
         ):
-            log("⚠️  No injection backend found. Install wtype or ydotool on Wayland, or xdotool on X11.")
+            print("⚠️  No injection backend found. Install wtype or ydotool on Wayland, or xdotool on X11.")
         elif not self._is_x11_session() and not self.wtype_available and self.ydotool_available:
-            log("ℹ️  wtype not found. Falling back to ydotool for paste hotkey injection.")
+            print("ℹ️  wtype not found. Falling back to ydotool for paste hotkey injection.")
 
     def _check_ydotool(self) -> bool:
         """Check if ydotool is usable (both the client and the ydotoold daemon)."""
@@ -452,7 +248,6 @@ class TextInjector:
         could not be started (callers degrade gracefully).
         """
         if not self._ydotoold.ensure_running():
-            log("ydotoold failed to become ready; check /dev/uinput permissions and the hyprwhspr journal.")
             return None
         return subprocess.run(
             ['ydotool', *args],
@@ -516,14 +311,14 @@ class TextInjector:
         except Exception:
             return True
 
-    def _read_active_layout(self) -> Tuple[str, str]:
-        """Best-effort active XKB layout and variant, lowercased: ('pl', 'dvorak').
+    def _read_active_layout(self) -> str:
+        """Best-effort active XKB keyboard layout, lowercased (e.g. 'us', 'de').
 
-        Returns ('', '') when undetectable, NON_XKB_INPUT_METHOD_LAYOUT when
+        Returns '' when undetectable. Returns NON_XKB_INPUT_METHOD_LAYOUT when
         GNOME's active source is an input method rather than an XKB layout.
-        Tries, in order: GNOME input-sources (the most-recently-used source is
-        the active one), `localectl`, then XKB_DEFAULT_LAYOUT. The variant
-        counts as much as the layout: pl(dvorak) shares nothing with pl.
+        Tries, in order: GNOME input-sources
+        (the most-recently-used source is the active one), `localectl` (system
+        X11 layout), then the XKB_DEFAULT_LAYOUT environment variable.
         """
         try:
             out = subprocess.run(
@@ -544,72 +339,47 @@ class TextInjector:
                 if sources:
                     source_type, source_id = sources[0][0], sources[0][1]
                     if source_type == 'xkb':
-                        # 'pl+dvorak' -> ('pl', 'dvorak')
-                        layout, _, variant = source_id.lower().partition('+')
-                        return layout, variant
-                    return NON_XKB_INPUT_METHOD_LAYOUT, ''
+                        return source_id.split('+')[0].lower()
+                    return NON_XKB_INPUT_METHOD_LAYOUT
         except Exception:
             pass
         try:
             out = subprocess.run(['localectl', 'status'], capture_output=True, text=True, timeout=2)
             if out.returncode == 0:
-                m = re.search(r'X11 Layout:[^\S\n]*([^\s,]+)', out.stdout)
+                m = re.search(r'X11 Layout:\s*([^\s,]+)', out.stdout)
                 if m:
                     layout = m.group(1).lower()
-                    if layout not in _UNSET_LAYOUT_VALUES:
-                        return layout, self._first_localectl_variant(out.stdout)
+                    if layout not in {'(unset)', 'unset', 'n/a', 'none'}:
+                        return layout
         except Exception:
             pass
         env_layout = os.environ.get('XKB_DEFAULT_LAYOUT', '')
         if env_layout:
-            variant = os.environ.get('XKB_DEFAULT_VARIANT', '')
-            return (
-                env_layout.split(',')[0].strip().lower(),
-                variant.split(',')[0].strip().lower(),
-            )
-        return '', ''
+            return env_layout.split(',')[0].strip().lower()
+        return ''
 
-    @staticmethod
-    def _first_localectl_variant(status_output: str) -> str:
-        """The `X11 Variant:` line of `localectl status`, '' when absent/unset."""
-        # [^\S\n]* so an empty variant line does not swallow the next one.
-        m = re.search(r'X11 Variant:[^\S\n]*([^\s,]*)', status_output)
-        if not m:
-            return ''
-        variant = m.group(1).lower()
-        return '' if variant in _UNSET_LAYOUT_VALUES else variant
-
-    def _detect_active_layout(self) -> Tuple[str, str]:
-        """Return the active layout/variant using a short cache to avoid stalls."""
+    def _detect_active_layout(self) -> str:
+        """Return the active layout using a short cache to avoid repeated stalls."""
         now = time.monotonic()
         cache_time = getattr(self, '_layout_cache_time', None)
         if cache_time is not None and now - cache_time < self._LAYOUT_CACHE_TTL_S:
-            return getattr(self, '_layout_cache_value', ('', ''))
+            return getattr(self, '_layout_cache_value', '')
 
-        detected = self._read_active_layout()
-        self._layout_cache_value = detected
+        layout = self._read_active_layout()
+        self._layout_cache_value = layout
         self._layout_cache_time = now
-        return detected
+        return layout
 
     def _layout_is_type_safe(self) -> bool:
-        """True when `ydotool type` would emit ASCII verbatim on this layout.
+        """True unless we positively detect a non-US keyboard layout.
 
-        ydotool holds a built-in US keycode table, so we ask the compiled keymap
-        whether ASCII sits where US puts it rather than keeping a list of country
-        codes — pl and pl(dvorak) sit on opposite sides of that line.
-        Conservative toward the status quo: an undetectable layout keeps direct
-        typing, and without xkbcli we fall back to the name check.
+        `ydotool type` assumes US/QWERTY keycodes and can only emit ASCII, so on
+        non-US layouts (de, fr, ...) it mangles output (z<->y, ?-> _, dropped
+        umlauts). There we must use layout-independent clipboard paste instead.
+        Conservative toward the status quo: an unknown layout keeps direct typing.
         """
-        layout, variant = self._detect_active_layout()
-        if layout == '':
-            return True
-        if layout == NON_XKB_INPUT_METHOD_LAYOUT:
-            return False
-
-        matches_us = keyboard_layout.ascii_positions_match_us(layout, variant)
-        if matches_us is not None:
-            return matches_us
-        return layout == 'us' and not variant
+        layout = self._detect_active_layout()
+        return layout == '' or layout.startswith('us')
 
     def _force_clipboard_paste(self) -> bool:
         """User override (config `prefer_clipboard_paste`): always use verbatim
@@ -895,9 +665,9 @@ except Exception:
             if isinstance(auto_paste, str) and auto_paste.strip():
                 chord = auto_paste.strip()
                 if not self._chord_is_usable(chord):
-                    log(f"⚠️  Ignoring unusable auto_paste chord {chord!r} for app "
+                    print(f"⚠️  Ignoring unusable auto_paste chord {chord!r} for app "
                           f"'{matched_identifier}'. Use a form like 'ctrl+v' or 'ctrl+y'; "
-                          f"text will be left on the clipboard.")
+                          f"text will be left on the clipboard.", flush=True)
                 return chord, matched_identifier
 
         paste_mode = None
@@ -913,8 +683,8 @@ except Exception:
         # Auto-detected modes ('ctrl'/'ctrl_shift') always resolve; only an
         # explicitly-configured paste_mode can be unusable here.
         if not self._chord_is_usable(chord):
-            log(f"⚠️  Configured paste_mode {paste_mode!r} is not a usable chord; "
-                  f"text will be left on the clipboard.")
+            print(f"⚠️  Configured paste_mode {paste_mode!r} is not a usable chord; "
+                  f"text will be left on the clipboard.", flush=True)
         return chord, matched_identifier
 
     def _clear_stuck_modifiers(self):
@@ -937,12 +707,10 @@ except Exception:
             # 56  = LeftAlt,         100 = RightAlt
             # 29  = LeftCtrl,        97  = RightCtrl
             # 42  = LeftShift,       54  = RightShift
-            modifier_codes = [125, 126, 56, 100, 29, 97, 42, 54]
-            modifier_codes.extend(self._ydotool_modifier_keycodes().values())
-            modifiers_to_clear = [f'{code}:0' for code in dict.fromkeys(modifier_codes)]
+            modifiers_to_clear = ['125:0', '126:0', '56:0', '100:0', '29:0', '97:0', '42:0', '54:0']
             self._run_ydotool(['key'] + modifiers_to_clear, timeout=1)
         except Exception as e:
-            log(f"Warning: Could not clear stuck modifiers: {e}")
+            print(f"Warning: Could not clear stuck modifiers: {e}")
 
     def _parse_key_chord(self, chord: str) -> Optional[Tuple[List[str], str]]:
         """Parse a single-key chord such as ctrl+shift+v.
@@ -998,11 +766,11 @@ except Exception:
             result = subprocess.run(['wtype'] + args, capture_output=True, timeout=5)
             if result.returncode != 0:
                 stderr = (result.stderr or b'').decode('utf-8', 'ignore')
-                log(f"  wtype paste failed: {stderr}")
+                print(f"  wtype paste failed: {stderr}")
                 return False
             return True
         except Exception as e:
-            log(f"wtype paste failed: {e}")
+            print(f"wtype paste failed: {e}")
             return False
 
     def _send_shortcut_hyprland(self, shortcut: str) -> bool:
@@ -1067,9 +835,9 @@ except Exception:
             if result.returncode == 0:
                 return True
             stderr = (result.stderr or b'').decode('utf-8', 'ignore')
-            log(f"  xdotool paste failed: {stderr}")
+            print(f"  xdotool paste failed: {stderr}")
         except Exception as e:
-            log(f"xdotool paste failed: {e}")
+            print(f"xdotool paste failed: {e}")
         return False
 
     @staticmethod
@@ -1090,72 +858,11 @@ except Exception:
             return FKEY_CODES[key]
         return YDOTOOL_KEYCODES.get(key)
 
-    def _warn_invalid_ydotool_modifier_override(self, identifier, value):
-        """Warn once for each malformed ydotool modifier override."""
-        warning_key = (str(identifier), repr(value))
-        warned = getattr(self, '_warned_invalid_ydotool_modifier_overrides', set())
-        if warning_key in warned:
-            return
-        warned.add(warning_key)
-        self._warned_invalid_ydotool_modifier_overrides = warned
-        log(f"⚠️  Ignoring invalid ydotool_modifier_overrides entry "
-            f"{identifier!r}: {value!r}; using the default modifier key.")
-
-    @staticmethod
-    def _ydotool_named_keycode(value: str) -> Optional[int]:
-        """Resolve a readable physical key name to a Linux evdev keycode."""
-        normalized = value.strip().lower()
-        if normalized.startswith('key_'):
-            normalized = normalized[4:]
-        normalized = normalized.replace('_', '').replace('-', '')
-        return FKEY_CODES.get(normalized, YDOTOOL_KEYCODES.get(normalized))
-
-    def _ydotool_modifier_keycodes(self) -> Dict[str, int]:
-        """Return logical modifier -> physical evdev keycodes for ydotool."""
-        resolved = dict(YDOTOOL_MODIFIERS)
-        if not self.config_manager:
-            return resolved
-
-        overrides = self.config_manager.get_setting('ydotool_modifier_overrides', {})
-        if not isinstance(overrides, dict):
-            self._warn_invalid_ydotool_modifier_override(
-                'ydotool_modifier_overrides', overrides
-            )
-            return resolved
-
-        for raw_modifier, value in overrides.items():
-            modifier = raw_modifier.strip().lower() if isinstance(raw_modifier, str) else ''
-            canonical_modifier = MODIFIER_ALIASES.get(modifier)
-            if canonical_modifier not in YDOTOOL_MODIFIERS:
-                self._warn_invalid_ydotool_modifier_override(raw_modifier, value)
-                continue
-
-            keycode = None
-            if isinstance(value, int) and not isinstance(value, bool):
-                if 0 < value <= 767:  # Linux input-event-codes.h KEY_MAX
-                    keycode = value
-            elif isinstance(value, str):
-                stripped = value.strip()
-                if stripped.isdigit():
-                    numeric_keycode = int(stripped)
-                    if 0 < numeric_keycode <= 767:
-                        keycode = numeric_keycode
-                else:
-                    keycode = self._ydotool_named_keycode(value)
-
-            if keycode is None:
-                self._warn_invalid_ydotool_modifier_override(raw_modifier, value)
-                continue
-            resolved[canonical_modifier] = keycode
-
-        return resolved
-
     def _send_paste_keys_slow(self, paste_chord: str) -> bool:
         """
         Send paste keystroke with delays between events via ydotool.
-        Used for the explicit Hyprland backend and as a fallback.
+        Used as fallback when wtype is unavailable.
         """
-        self._last_ydotool_failure_explicit = False
         paste_chord = PASTE_MODE_CHORDS.get(paste_chord, paste_chord)
         parsed = self._parse_key_chord(paste_chord)
         if not parsed:
@@ -1164,46 +871,30 @@ except Exception:
         keycode = self._keycode_for_chord_key(key)
         if keycode is None:
             return False
-        modifier_keycodes = self._ydotool_modifier_keycodes()
-        press_args = [f'{modifier_keycodes[modifier]}:1' for modifier in modifiers]
-        release_args = [f'{modifier_keycodes[modifier]}:0' for modifier in reversed(modifiers)]
+        press_args = [f'{YDOTOOL_MODIFIERS[modifier]}:1' for modifier in modifiers]
+        release_args = [f'{YDOTOOL_MODIFIERS[modifier]}:0' for modifier in reversed(modifiers)]
 
-        modifiers_pressed = False
-
-        def _key(*args, modifier_press=False):
-            nonlocal modifiers_pressed
+        def _key(*args):
             result = self._run_ydotool(['key'] + list(args), timeout=1)
             if result is None:
                 raise RuntimeError("ydotoold unavailable")
-            if modifier_press:
-                # Once ydotool accepted the command, some key-down events may
-                # have landed even if the command ultimately reports failure.
-                modifiers_pressed = True
             if result.returncode != 0:
                 stderr = (result.stderr or b'').decode('utf-8', 'ignore')
                 raise RuntimeError(f"ydotool key {' '.join(args)} failed: {stderr}")
 
         try:
             if press_args:
-                _key(*press_args, modifier_press=True)
+                _key(*press_args)
             time.sleep(0.015)
             _key(f'{keycode}:1', f'{keycode}:0')
             time.sleep(0.010)
             if release_args:
                 _key(*release_args)
-                modifiers_pressed = False
             return True
 
         except Exception as e:
-            self._last_ydotool_failure_explicit = True
-            log(f"Slow paste key injection failed: {e}")
+            print(f"Slow paste key injection failed: {e}")
             return False
-        finally:
-            if modifiers_pressed and release_args:
-                try:
-                    _key(*release_args)
-                except Exception as e:
-                    log(f"Warning: Could not release ydotool paste modifiers: {e}")
 
     def _is_gnome_wayland_session(self) -> bool:
         """Return True for Mutter/GNOME Wayland sessions where uinput chords are unreliable."""
@@ -1240,11 +931,11 @@ except Exception:
             )
             if result is None or result.returncode != 0:
                 stderr = (result.stderr or b'').decode('utf-8', 'ignore') if result else 'ydotoold unavailable'
-                log(f"  ydotool type failed: {stderr}")
+                print(f"  ydotool type failed: {stderr}")
                 return False
             return True
         except Exception as e:
-            log(f"ydotool type injection failed: {e}")
+            print(f"ydotool type injection failed: {e}")
             return False
 
     def _gnome_force_latin_layout(self):
@@ -1290,7 +981,7 @@ except Exception:
             time.sleep(0.12)  # let gnome-shell apply the layout before the chord
             return cur_idx
         except Exception as e:
-            log(f"  paste layout switch skipped: {e}")
+            print(f"  paste layout switch skipped: {e}")
             return None
 
     def _gnome_restore_layout(self, prev_idx):
@@ -1305,21 +996,12 @@ except Exception:
             pass
 
     def _save_clipboard(self) -> Optional[bytes]:
-        """Save current clipboard contents: ClipboardData (with its type) on Wayland, else bytes or None."""
+        """Save current clipboard contents. Returns raw bytes or None."""
         if not self._is_x11_session() and shutil.which("wl-paste"):
             try:
-                # Read one type and remember it, so restore offers the same type.
-                listed = subprocess.run(["wl-paste", "--list-types"], capture_output=True, timeout=2)
-                offered = listed.stdout.decode("utf-8", "replace").split() if listed.returncode == 0 else []
-                # Else the first MIME type: X11 owners also list atoms such as TARGETS.
-                mime_type = next((t for t in _PLAIN_TEXT_TYPES if t in offered),
-                                 next((t for t in offered if "/" in t), None))
-                if mime_type:
-                    result = subprocess.run(
-                        ["wl-paste", "--no-newline", "--type", mime_type], capture_output=True, timeout=2
-                    )
-                    if result.returncode == 0:
-                        return ClipboardData(result.stdout, mime_type)
+                result = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, timeout=2)
+                if result.returncode == 0:
+                    return result.stdout
             except Exception:
                 pass
         # Fallback: pyperclip (X11 or non-standard Wayland setups)
@@ -1331,23 +1013,12 @@ except Exception:
             pass
         return None
 
-    def _try_wl_copy(self, data: bytes, mime_type: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+    def _try_wl_copy(self, data: bytes) -> Tuple[bool, Optional[str]]:
         """Try the Wayland clipboard writer and retain a useful failure detail."""
         if self._is_x11_session() or not shutil.which("wl-copy"):
             return False, None
-        command = ["wl-copy"]
-        if mime_type and mime_type not in _PLAIN_TEXT_TYPES:
-            command += ["--type", mime_type]
-        else:
-            # Name text explicitly: wl-copy's content sniffing reads prose
-            # starting "From " as application/mbox and then offers no text type.
-            try:
-                data.decode("utf-8")
-                command += ["--type", "text/plain;charset=utf-8"]
-            except UnicodeDecodeError:
-                pass  # Binary of unknown type (images, etc.): let wl-copy infer it
         try:
-            result = subprocess.run(command, input=data, timeout=2)
+            result = subprocess.run(["wl-copy"], input=data, timeout=2)
             if result.returncode == 0:
                 return True, None
             return False, f"wl-copy exited with status {result.returncode}"
@@ -1355,21 +1026,18 @@ except Exception:
             return False, f"wl-copy failed: {exc}"
 
     def _copy_text_to_clipboard(self, text: str) -> bool:
-        """Copy text and invalidate older restores only after a successful write."""
-        with self._clipboard_lock:
-            copied, wayland_error = self._try_wl_copy(text.encode("utf-8"))
-            if copied:
-                self._clipboard_generation += 1
-                return True
-            # Fallback: pyperclip (X11, or wl-copy present but no compositor to reach)
-            try:
-                pyperclip.copy(text)
-                self._clipboard_generation += 1
-                return True
-            except Exception as e:
-                detail = f" after {wayland_error}" if wayland_error else ""
-                log(f"ERROR: Clipboard copy failed{detail}: {e}")
-                return False
+        """Copy text to the clipboard without triggering paste."""
+        copied, wayland_error = self._try_wl_copy(text.encode("utf-8"))
+        if copied:
+            return True
+        # Fallback: pyperclip (X11, or wl-copy present but no compositor to reach)
+        try:
+            pyperclip.copy(text)
+            return True
+        except Exception as e:
+            detail = f" after {wayland_error}" if wayland_error else ""
+            print(f"ERROR: Clipboard copy failed{detail}: {e}")
+            return False
 
     def _restore_clipboard(self, saved: Optional[bytes], injected: Optional[bytes] = None, delay: float = 5.0):
         """Restore clipboard to saved contents after a delay (background thread).
@@ -1380,66 +1048,40 @@ except Exception:
         if saved is None:
             return
 
-        generation = self._clipboard_generation
-
         def _restore():
             time.sleep(delay)
-            # Restoration serializes clipboard I/O, but is not active delivery:
-            # a recovery request may wait for it without hitting the busy gate.
-            with self._clipboard_lock:
-                if generation != self._clipboard_generation:
-                    return
-                try:
-                    # Guard: if the user copied something else during the delay, don't clobber it.
-                    if injected is not None:
-                        current = self._save_clipboard()
-                        if current != injected:
-                            return
+            try:
+                # Guard: if the user copied something else during the delay, don't clobber it.
+                if injected is not None:
+                    current = self._save_clipboard()
+                    if current != injected:
+                        return
 
-                    restored, wayland_error = self._try_wl_copy(saved, getattr(saved, "mime_type", None))
-                    if not restored:
-                        # Fallback: pyperclip (X11, or wl-copy present but no compositor to
-                        # reach). It's text-only; only restore if the saved bytes are valid
-                        # UTF-8 text. Binary clipboard data (images, etc.) cannot be
-                        # round-tripped through pyperclip without corruption.
-                        try:
-                            pyperclip.copy(saved.decode("utf-8"))
-                        except UnicodeDecodeError:
-                            if wayland_error:
-                                log(f"Warning: Could not restore binary clipboard: {wayland_error}")
-                            # Binary data cannot safely pass through the text fallback.
-                        except Exception as exc:
-                            detail = f" after {wayland_error}" if wayland_error else ""
-                            raise RuntimeError(f"clipboard fallback failed{detail}: {exc}") from exc
-                except Exception as e:
-                    log(f"Warning: Could not restore clipboard: {e}")
+                restored, wayland_error = self._try_wl_copy(saved)
+                if not restored:
+                    # Fallback: pyperclip (X11, or wl-copy present but no compositor to
+                    # reach). It's text-only; only restore if the saved bytes are valid
+                    # UTF-8 text. Binary clipboard data (images, etc.) cannot be
+                    # round-tripped through pyperclip without corruption.
+                    try:
+                        pyperclip.copy(saved.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        if wayland_error:
+                            print(f"Warning: Could not restore binary clipboard: {wayland_error}")
+                        # Binary data cannot safely pass through the text fallback.
+                    except Exception as exc:
+                        detail = f" after {wayland_error}" if wayland_error else ""
+                        raise RuntimeError(f"clipboard fallback failed{detail}: {exc}") from exc
+            except Exception as e:
+                print(f"Warning: Could not restore clipboard: {e}")
 
         threading.Thread(target=_restore, daemon=True).start()
 
-    def _use_hyprland_ydotool(self) -> bool:
-        if not self._is_hyprland_session():
-            return False
-        backend = self.config_manager.get_setting('hyprland_paste_backend', 'auto') if self.config_manager else 'auto'
-        if backend not in ('auto', 'ydotool'):
-            if not getattr(self, '_warned_invalid_hyprland_paste_backend', False):
-                log(f"Invalid hyprland_paste_backend {backend!r}; using 'auto'")
-                self._warned_invalid_hyprland_paste_backend = True
-            return False
-        return backend == 'ydotool'
-
-    def _send_enter_if_auto_submit(self, cancel_event=None):
+    def _send_enter_if_auto_submit(self):
         """Send Enter key if auto_submit is enabled"""
         if not (self.config_manager and self.config_manager.get_setting('auto_submit', False)):
             return
-        if cancel_event is not None and cancel_event.is_set():
-            return
         try:
-            if self._use_hyprland_ydotool():
-                enter_result = self._run_ydotool(['key', '28:1', '28:0'], timeout=1) if self.ydotool_available else None
-                if enter_result is None or enter_result.returncode != 0:
-                    stderr = (enter_result.stderr or b'').decode('utf-8', 'ignore') if enter_result else 'ydotool unavailable'
-                    log(f"  ydotool auto_submit Enter failed: {stderr}; not retrying")
-                return
             if self._is_x11_session() and getattr(self, 'xdotool_available', False):
                 enter_result = subprocess.run(
                     ['xdotool', 'key', '--clearmodifiers', 'Return'],
@@ -1447,16 +1089,14 @@ except Exception:
                 )
                 if enter_result.returncode != 0:
                     stderr = (enter_result.stderr or b'').decode('utf-8', 'ignore')
-                    log(f"  xdotool Enter key failed: {stderr}")
+                    print(f"  xdotool Enter key failed: {stderr}")
             elif self._is_hyprland_session() and self._send_shortcut_hyprland('enter'):
-                return
-            elif cancel_event is not None and cancel_event.is_set():
                 return
             elif self.ydotool_available:
                 enter_result = self._run_ydotool(['key', '28:1', '28:0'], timeout=1)  # 28 = Enter
                 if enter_result is None or enter_result.returncode != 0:
                     stderr = (enter_result.stderr or b"").decode("utf-8", "ignore") if enter_result else "ydotoold unavailable"
-                    log(f"  ydotool Enter key failed: {stderr}")
+                    print(f"  ydotool Enter key failed: {stderr}")
             elif self.wtype_available:
                 enter_result = subprocess.run(
                     ['wtype', '-k', 'Return'],
@@ -1464,237 +1104,15 @@ except Exception:
                 )
                 if enter_result.returncode != 0:
                     stderr = (enter_result.stderr or b"").decode("utf-8", "ignore")
-                    log(f"  wtype Enter key failed: {stderr}")
+                    print(f"  wtype Enter key failed: {stderr}")
             else:
-                log("  auto_submit enabled but no key-injection tool available")
+                print("  auto_submit enabled but no key-injection tool available")
         except Exception as e:
-            log(f"  auto_submit Enter key failed: {e}")
+            print(f"  auto_submit Enter key failed: {e}")
 
     # ------------------------ Public API ------------------------
 
-    def stream_busy(self) -> bool:
-        """Read ownership without waiting for desktop operations."""
-        with self._stream_lock:
-            return self._stream is not None
-
-    def begin_stream(self) -> _StreamSession:
-        """Reserve delivery before launching a live-typing worker."""
-        if not self._delivery_lock.acquire(blocking=False):
-            raise RuntimeError('Text delivery is busy')
-        try:
-            with self._stream_lock:
-                if self._stream is not None:
-                    raise RuntimeError('Text delivery is busy')
-                self._stream = _StreamSession()
-                return self._stream
-        finally:
-            self._delivery_lock.release()
-
-    def release_stream(self, session: _StreamSession) -> None:
-        """Release only this worker's reservation, after cleanup."""
-        with self._stream_lock:
-            if self._stream is session:
-                self._stream = None
-
-    def inject_text(self, text: str) -> InjectionOutcome:
-        """Prepare, retain and deliver one dictation at a time."""
-        if self.stream_busy():
-            return InjectionOutcome.FAILED
-        with self._delivery_lock:
-            if self.stream_busy():
-                return InjectionOutcome.FAILED
-            return self._prepare_and_inject_text(text)
-
-    def inject_stream_chunk(self, session: _StreamSession, text: str, final: bool = False) -> InjectionOutcome:
-        """Deliver one chunk of a dictation typed while recording.
-
-        Chunks are joined with a separating space, except before punctuation
-        and after an opening bracket or newline. Words that could begin a
-        multi-word spoken command or word override ("new" of "new line") are
-        held and delivered with the next chunk, so the phrase is preprocessed
-        as one. `final` (a finalized segment) releases what's held, except a
-        trailing "new line". The post-transcription hook doesn't run: it takes
-        a whole dictation, and live typing is off while one is configured.
-        """
-        with self._stream_lock:
-            if session is not self._stream or session.cancelled.is_set():
-                return InjectionOutcome.FAILED
-        with self._delivery_lock:
-            if session is not self._stream or session.cancelled.is_set():
-                return InjectionOutcome.FAILED
-            words = session.held + text.split()
-            hold = self._stream_holdback(words, final)
-            deliver, session.held = words[:len(words) - hold], words[len(words) - hold:]
-            if not deliver:
-                return InjectionOutcome.INJECTED
-            return self._deliver_stream_words(session, deliver)
-
-    def end_stream(self, session: _StreamSession, submit: bool = True) -> Optional[InjectionOutcome]:
-        """Finish the live-typed dictation.
-
-        Delivers held words, adds the trailing space append_trailing_space asks
-        for, retains the whole dictation for copy-last/paste-last, sends
-        auto_submit's Enter once, and schedules the one clipboard restore.
-        submit=False (a cancelled recording) skips the held words and the
-        Enter. Returns None when nothing was typed, else the worst outcome.
-        """
-        if session is not self._stream:
-            return InjectionOutcome.FAILED
-        try:
-            return self._finish_stream(session, submit)
-        finally:
-            try:
-                if session.recovery_text is not None and session.recovery_allowed:
-                    with self._last_text_lock:
-                        self._last_text = self._preprocess_text(session.recovery_text)
-            finally:
-                self.release_stream(session)
-
-    def _finish_stream(self, session, submit):
-        with self._delivery_lock:
-            if session is not self._stream:
-                return InjectionOutcome.FAILED
-            if submit and not session.failed and not session.cancelled.is_set() and session.held:
-                try:
-                    self._deliver_stream_words(session, session.held)
-                except Exception as e:
-                    session.failed = True
-                    log(f'[LIVE] Held text delivery failed: {e}')
-            full_text = self._preprocess_text(' '.join(session.raw_parts))
-            if not session.injected_any:
-                if session.failed and session.recovery_allowed:
-                    with self._last_text_lock:
-                        self._last_text = full_text
-                return InjectionOutcome.FAILED if session.failed else None
-
-            if (
-                submit
-                and not session.cancelled.is_set()
-                and not session.failed
-                and session.last_char not in _NO_SPACE_AFTER
-                and self._should_append_trailing_space(full_text)
-            ):
-                if self._inject_via_clipboard_and_hotkey(' ', auto_submit=False, stream=session):
-                    full_text += ' '
-                else:
-                    session.failed = True
-            if session.recovery_allowed:
-                with self._last_text_lock:
-                    self._last_text = full_text
-
-            if (
-                session.saved_clipboard is not _CLIPBOARD_UNSAVED
-                and not session.not_pasted
-                and session.last_pasted is not None
-            ):
-                restore_delay = 5.0
-                if self.config_manager:
-                    restore_delay = float(self.config_manager.get_setting('clipboard_clear_delay', 5.0))
-                self._restore_clipboard(
-                    session.saved_clipboard,
-                    injected=session.last_pasted.encode("utf-8"),
-                    delay=restore_delay,
-                )
-            if submit and not session.cancelled.is_set() and not session.failed and not session.not_pasted:
-                self._send_enter_if_auto_submit(cancel_event=session.cancelled)
-            return InjectionOutcome.FAILED if session.failed else InjectionOutcome.INJECTED
-
-    def _deliver_stream_words(self, session: _StreamSession, words: List[str]) -> InjectionOutcome:
-        if session.cancelled.is_set():
-            return InjectionOutcome.FAILED
-        raw = ' '.join(words)
-        session.raw_parts.append(raw)
-        # Preprocessing strips a chunk's edges, which would drop the newline
-        # of a "new line" that starts it, so render leading ones here.
-        newlines = 0
-        if _config_setting(self.config_manager, 'symbol_replacements', True):
-            while [_phrase_word(w) for w in words[:2]] == ['new', 'line']:
-                words = words[2:]
-                newlines += 1
-        processed = self._preprocess_text(' '.join(words))
-        if not processed:
-            # Includes a "new line" with nothing after it: like the trailing
-            # newline inject_text trims, it would only act as Enter.
-            return InjectionOutcome.INJECTED
-        processed = '\n' * newlines + processed
-        if (
-            session.injected_any
-            and session.last_char not in _NO_SPACE_AFTER
-            and processed[0] not in _NO_SPACE_BEFORE
-            and not ends_with_no_space_script(session.last_char)
-        ):
-            processed = ' ' + processed
-        if self._inject_via_clipboard_and_hotkey(processed, auto_submit=False, stream=session):
-            session.injected_any = True
-            session.last_char = processed[-1]
-            return InjectionOutcome.INJECTED
-        session.failed = True
-        return InjectionOutcome.FAILED
-
-    def _stream_holdback(self, words: List[str], final: bool = False) -> int:
-        """How many trailing words to hold for the next chunk.
-
-        A trailing "new line" is always held, to start the next chunk; if
-        nothing follows it, it's dropped like any trailing newline. Unless
-        `final`, so is any tail that could still grow into a multi-word phrase
-        that preprocessing rewrites (spoken commands, word overrides, filler).
-        """
-        symbols = _config_setting(self.config_manager, 'symbol_replacements', True)
-        tail = [_phrase_word(w) for w in words]
-        phrases = []
-        if symbols:
-            phrases.append(('new', 'line'))
-            phrases.extend(tuple(command.split()) for command, _ in _SPOKEN_REPLACEMENTS)
-        config = self.config_manager
-        if config is not None:
-            phrases.extend(config.get_word_overrides() or {})
-            if config.get_filter_filler_words():
-                phrases.extend(config.get_filler_words() or [])
-        longest = 0
-        for phrase in (() if final else phrases):
-            if isinstance(phrase, str):
-                phrase = tuple(_phrase_word(w) for w in phrase.split())
-            for k in range(min(len(phrase) - 1, len(tail)), longest, -1):
-                if tuple(tail[-k:]) == phrase[:k]:
-                    longest = k
-                    break
-        # Keep the whole trailing run, including before an unfinished phrase:
-        # preprocessing strips every newline left at the end of a chunk.
-        if symbols:
-            end = len(tail) - longest
-            while end >= 2 and tail[end - 2:end] == ['new', 'line']:
-                longest += 2
-                end -= 2
-        return longest
-
-    def recover_last(self, action):
-        """Recover prepared text without rerunning hooks or submitting Enter."""
-        if action == 'clear_last':
-            with self._last_text_lock:
-                self._last_text = None
-            return True, 'Last dictation cleared'
-        if action not in ('copy_last', 'paste_last'):
-            return False, 'Unknown recovery action'
-        if self.stream_busy() or not self._delivery_lock.acquire(blocking=False):
-            return False, 'Text delivery is busy; try again when it finishes'
-        try:
-            if self.stream_busy():
-                return False, 'Text delivery is busy; try again when it finishes'
-            with self._last_text_lock:
-                text = self._last_text
-            if text is None:
-                return False, 'No saved dictation in this daemon session'
-            if action == 'copy_last':
-                ok = self._copy_text_to_clipboard(text)
-                return ok, ('Last dictation copied' if ok else 'Could not copy last dictation')
-            ok = self._inject_via_clipboard_and_hotkey(text, auto_submit=False)
-            return ok, ('Last dictation delivery dispatched' if ok else 'Could not paste last dictation; try record copy-last')
-        except Exception:
-            return False, 'Could not recover last dictation; check clipboard and paste tools'
-        finally:
-            self._delivery_lock.release()
-
-    def _prepare_and_inject_text(self, text: str) -> InjectionOutcome:
+    def inject_text(self, text: str) -> bool:
         """
         Inject text into the currently focused application
 
@@ -1702,27 +1120,19 @@ except Exception:
             text: Text to inject
 
         Returns:
-            InjectionOutcome.INJECTED if pasted, CONSUMED if a post-transcription
-            hook consumed the transcription, FAILED otherwise
+            True if successful, False otherwise
         """
         if not text or text.strip() == "":
-            log("No text to inject (empty or whitespace)")
-            return InjectionOutcome.INJECTED
+            print("No text to inject (empty or whitespace)")
+            return True
 
         # Preprocess; also trim trailing newlines (avoid unwanted Enter)
         processed_text = self._preprocess_text(text).rstrip("\r\n")
-        # Filtering can empty a transcript outright -- an utterance that was
-        # nothing but filler words. Pasting the trailing space alone is worse
-        # than pasting nothing.
-        if not processed_text.strip():
-            log("No text to inject (empty after preprocessing)")
-            return InjectionOutcome.INJECTED
         hook_result = self._run_post_transcription_hook(processed_text)
         if hook_result.outcome == _PostTranscriptionHookOutcome.CONSUME:
-            return InjectionOutcome.CONSUMED
-        processed_text = hook_result.text
-        if self._should_append_trailing_space(processed_text):
-            processed_text += ' '
+            print("Post-transcription hook consumed transcription")
+            return True
+        processed_text = hook_result.text + ' '
 
         try:
             inject_mode = None
@@ -1730,37 +1140,86 @@ except Exception:
                 inject_mode = self.config_manager.get_setting('inject_mode', None)
 
             if inject_mode in ('wtype', 'ydotool_type'):
-                log(f"⚠️  inject_mode='{inject_mode}' is deprecated: direct typing drops characters at speed. "
+                print(f"⚠️  inject_mode='{inject_mode}' is deprecated: direct typing drops characters at speed. "
                       f"Using clipboard+paste instead.")
 
-            injected = self._inject_via_clipboard_and_hotkey(processed_text, retain=True)
-            return InjectionOutcome.INJECTED if injected else InjectionOutcome.FAILED
+            return self._inject_via_clipboard_and_hotkey(processed_text)
 
         except Exception as e:
-            log(f"Primary injection method failed: {e}")
-            return InjectionOutcome.FAILED
+            print(f"Primary injection method failed: {e}")
+            return False
 
     # ------------------------ Helpers ------------------------
-
-    def _should_append_trailing_space(self, text: str) -> bool:
-        """Whether to separate this transcription from whatever is typed next.
-
-        A trailing space keeps English dictation from colliding with the next
-        word; in CJK it is a stray character. "auto" decides from the final
-        character alone, true/false override it.
-        """
-        setting = 'auto'
-        if self.config_manager:
-            setting = self.config_manager.get_setting('append_trailing_space', 'auto')
-        if isinstance(setting, bool):
-            return setting
-        return not ends_with_no_space_script(text)
 
     def _preprocess_text(self, text: str) -> str:
         """
         Preprocess text to handle common speech-to-text corrections and remove unwanted line breaks
         """
-        return preprocess_text(text, self.config_manager)
+        # Normalize line breaks to spaces to avoid unintended "Enter"
+        processed = text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
+
+        # Apply user-defined overrides first
+        processed = self._apply_word_overrides(processed)
+
+        # Filter filler words if enabled
+        processed = self._filter_filler_words(processed)
+
+        # Built-in speech-to-text replacements (can be disabled via config)
+        symbol_replacements_enabled = True
+        if self.config_manager:
+            symbol_replacements_enabled = self.config_manager.get_setting('symbol_replacements', True)
+
+        if not symbol_replacements_enabled:
+            # Collapse runs of whitespace (newlines already normalized to spaces on line 243)
+            processed = re.sub(r'[ \t]+', ' ', processed)
+            return processed.strip()
+
+        replacements = {
+            r'\bperiod\b': '.',
+            r'\bcomma\b': ',',
+            r'\bquestion mark\b': '?',
+            r'\bexclamation mark\b': '!',
+            r'\bcolon\b': ':',
+            r'\bsemicolon\b': ';',
+            r'\bnew line\b': '\n',
+            r'\btab\b': '\t',
+            r'\bdash\b': '-',
+            r'\bunderscore\b': '_',
+            r'\bopen paren\b': '(',
+            r'\bclose paren\b': ')',
+            r'\bopen bracket\b': '[',
+            r'\bclose bracket\b': ']',
+            r'\bopen brace\b': '{',
+            r'\bclose brace\b': '}',
+            r'\bat symbol\b': '@',
+            r'\bhash\b': '#',
+            r'\bdollar sign\b': '$',
+            r'\bpercent\b': '%',
+            r'\bcaret\b': '^',
+            r'\bampersand\b': '&',
+            r'\basterisk\b': '*',
+            r'\bplus\b': '+',
+            r'\bequals\b': '=',
+            r'\bless than\b': '<',
+            r'\bgreater than\b': '>',
+            r'\bslash\b': '/',
+            r'\bbackslash\b': r'\\',
+            r'\bpipe\b': '|',
+            r'\btilde\b': '~',
+            r'\bgrave\b': '`',
+            r'\bquote\b': '"',
+            r'\bapostrophe\b': "'",
+        }
+
+        for pattern, replacement in replacements.items():
+            processed = re.sub(pattern, replacement, processed, flags=re.IGNORECASE)
+
+        # Collapse runs of whitespace, preserve intentional newlines
+        processed = re.sub(r'[ \t]+', ' ', processed)
+        processed = re.sub(r' *\n *', '\n', processed)
+        processed = processed.strip()
+
+        return processed
 
     def _run_post_transcription_hook(self, text: str) -> _PostTranscriptionHookResult:
         """Run the user's post_transcription_hook shell command.
@@ -1789,151 +1248,133 @@ except Exception:
                 text=True, timeout=5.0, env=env,
             )
         except Exception as e:
-            log(f"post_transcription_hook failed: {e}")
+            print(f"post_transcription_hook failed: {e}", flush=True)
             return preserve
         if result.returncode == POST_TRANSCRIPTION_HOOK_CONSUMED_EXIT_CODE:
             return _PostTranscriptionHookResult(_PostTranscriptionHookOutcome.CONSUME, "")
         if result.returncode != 0:
             stderr = (result.stderr or '').strip()
-            log(f"post_transcription_hook exited {result.returncode}: {stderr}")
+            print(f"post_transcription_hook exited {result.returncode}: {stderr}", flush=True)
             return preserve
         out = result.stdout.rstrip("\r\n")
         if not out:
             return preserve
         return _PostTranscriptionHookResult(_PostTranscriptionHookOutcome.REPLACE, out)
 
+    def _apply_word_overrides(self, text: str) -> str:
+        """Apply user-defined word overrides to the text"""
+        if not self.config_manager:
+            return text
+
+        word_overrides = self.config_manager.get_word_overrides()
+        if not word_overrides:
+            return text
+
+        processed = text
+        for original, replacement in word_overrides.items():
+            # Only require original to be non-empty; replacement can be empty string to delete words
+            if original:
+                if len(original) == 1:
+                    # Single characters can't use \b word boundaries (e.g. ß mid-word in Straße)
+                    processed = re.sub(re.escape(original), replacement, processed, flags=re.IGNORECASE)
+                else:
+                    pattern = r'\b' + re.escape(original) + r'\b'
+                    processed = re.sub(pattern, replacement, processed, flags=re.IGNORECASE)
+
+        # Clean up extra spaces left by word deletions (multiple spaces -> single space)
+        processed = re.sub(r' +', ' ', processed)
+        processed = processed.strip()
+
+        return processed
+
+    def _filter_filler_words(self, text: str) -> str:
+        """Remove filler words like uh, um, er if enabled in config"""
+        if not self.config_manager:
+            return text
+
+        if not self.config_manager.get_filter_filler_words():
+            return text
+
+        filler_words = self.config_manager.get_filler_words()
+        if not filler_words:
+            return text
+
+        processed = text
+        for word in filler_words:
+            if word:
+                pattern = r'\b' + re.escape(word) + r'\b'
+                processed = re.sub(pattern, '', processed, flags=re.IGNORECASE)
+
+        # Clean up extra spaces left by word deletions
+        processed = re.sub(r' +', ' ', processed)
+        processed = processed.strip()
+
+        return processed
+
     # ------------------------ Paste injection (primary method) ------------------------
 
-    def _inject_via_clipboard_and_hotkey(
-        self, text: str, auto_submit: bool = True, retain: bool = False,
-        stream: Optional[_StreamSession] = None,
-    ) -> bool:
+    def _inject_via_clipboard_and_hotkey(self, text: str) -> bool:
         """Copy text to clipboard, then trigger the compositor-native paste path."""
         try:
-            window_lookup_needed = self._active_window_lookup_needed()
             window_info = (
                 self._get_active_window_info()
-                if window_lookup_needed
+                if self._active_window_lookup_needed()
                 else None
             )
             gnome_wayland_session = self._is_gnome_wayland_session()
             paste_chord, app_match = self._resolve_paste_chord(window_info)
-            if (
-                not window_info
-                and window_lookup_needed
-                and not getattr(self, '_warned_focused_window_unavailable', False)
-            ):
-                log(f"⚠️  Focused-window detection failed; using resolved paste chord {paste_chord!r}.")
-                self._warned_focused_window_unavailable = True
             if paste_chord is False:
                 # Injection is explicitly disabled for this app. Do nothing at all —
                 # no paste, no clipboard write. "Disabled" means hands off, which also
                 # avoids leaking dictated text (e.g. into a password field) onto the
                 # clipboard where other apps could read it.
-                log(f"Injection disabled for focused app ({app_match}); leaving it untouched.")
-                if stream is not None:
-                    stream.not_pasted = True
-                    stream.recovery_allowed = False
+                print(f"Injection disabled for focused app ({app_match}); leaving it untouched.")
                 return True
-
-            if stream is not None and stream.cancelled.is_set():
-                return False
-
-            # Only ordinary, permitted delivery can replace recovery text.
-            # Re-paste must not undo a concurrent clear-last request.
-            if retain:
-                with self._last_text_lock:
-                    self._last_text = text
 
             # On GNOME/Mutter the layer-shell overlay is unavailable, so we can
             # type directly with `ydotool type` to avoid touching the clipboard.
-            # But that is ONLY correct for pure-ASCII text on a layout that keeps
-            # ASCII where US puts it: ydotool type assumes US keycodes and can't
-            # emit non-ASCII, so a layout that moves keys (z<->y, ?-> _) or text
-            # with umlauts/typographic characters comes out mangled. In those
-            # cases — or with a custom paste keycode / the prefer_clipboard_paste
-            # override — fall through to the layout-independent clipboard paste.
+            # But that is ONLY correct for pure-ASCII text on a US layout:
+            # ydotool type assumes US keycodes and can't emit non-ASCII, so on a
+            # non-US layout (z<->y, ?-> _) or with umlauts/typographic characters
+            # it mangles the output. In those cases — or with a custom paste
+            # keycode / the prefer_clipboard_paste override — fall through to the
+            # layout-independent verbatim clipboard paste below.
             if (
                 gnome_wayland_session
                 and self.ydotool_available
                 and app_match is None
                 and not self._has_custom_paste_keycode()
                 and not self._force_clipboard_paste()
-                and text.isascii()
                 and self._layout_is_type_safe()
+                and text.isascii()
             ):
                 self._clear_stuck_modifiers()
                 time.sleep(0.05)
-                if stream is not None and stream.cancelled.is_set():
-                    return False
                 typed = self._type_text_ydotool(text)
                 if typed:
-                    if auto_submit:
-                        self._send_enter_if_auto_submit()
+                    self._send_enter_if_auto_submit()
                     return True
 
-            if stream is not None and stream.cancelled.is_set():
-                return False
-            with self._clipboard_lock:
-                if stream is not None:
-                    return self._paste_via_clipboard(
-                        text, paste_chord, gnome_wayland_session, auto_submit, stream=stream)
-                return self._paste_via_clipboard(text, paste_chord, gnome_wayland_session, auto_submit)
-
-        except Exception as e:
-            log(f"Clipboard+hotkey injection failed: {e}")
-            return False
-
-    def _paste_via_clipboard(self, text, paste_chord, gnome_wayland_session, auto_submit, stream=None):
-        """Deliver while owning _clipboard_lock, excluding background restores.
-
-        With a stream session, the clipboard is saved before its first chunk
-        only - by the next chunk it holds the previous one - and restored once,
-        by end_stream.
-        """
-        try:
-            saved_clipboard = None
-            if stream is None:
-                saved_clipboard = self._save_clipboard()
-            elif stream.saved_clipboard is _CLIPBOARD_UNSAVED:
-                stream.saved_clipboard = self._save_clipboard()
-
-            if stream is not None and stream.cancelled.is_set():
-                return False
+            saved_clipboard = self._save_clipboard()
 
             # Copy text to clipboard
             if not self._copy_text_to_clipboard(text):
                 return False
-            delay = self.config_manager.get_setting('clipboard_settle_delay', 0.15) if self.config_manager else 0.15
-            if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < 0:
-                log(f"Invalid clipboard_settle_delay {delay!r}; using 0.15 seconds")
-                delay = 0.15
-            if delay:
-                time.sleep(delay)
+            time.sleep(0.15)
 
-            # Unless ydotool is explicitly selected, prefer the native path: xdotool on
+            # Send paste hotkey through the session-native path first: xdotool on
             # X11, Hyprland's dispatcher there, or wtype on other Wayland sessions.
             # Fall back to wtype and then ydotool if native Hyprland dispatch fails.
             # ydotool key chords DO reach Mutter (uinput
             # is seen as a real device, unlike wtype's virtual-keyboard protocol
             # which Mutter blocks), so we use them on GNOME too — this is the path
             # taken when direct typing was skipped for a non-US layout / non-ASCII text.
-            if stream is not None and stream.cancelled.is_set():
-                return False
             pasted = False
-            hyprland_ydotool = self._use_hyprland_ydotool()
-            if hyprland_ydotool:
-                pasted = self.ydotool_available and self._send_paste_keys_slow(paste_chord)
-                if not pasted:
-                    log("Hyprland ydotool paste failed; text is on the clipboard. Not trying another backend.")
-                    if stream is not None:
-                        stream.not_pasted = True
-                    return False
-            elif self._is_x11_session() and getattr(self, 'xdotool_available', False):
+            if self._is_x11_session() and getattr(self, 'xdotool_available', False):
                 pasted = self._send_paste_keys_xdotool(paste_chord)
             elif self._is_hyprland_session():
                 pasted = self._send_shortcut_hyprland(paste_chord)
-                if not pasted and self.wtype_available and not (stream and stream.cancelled.is_set()):
+                if not pasted and self.wtype_available:
                     pasted = self._send_paste_keys_wtype(paste_chord)
                     if pasted:
                         self._clear_stuck_modifiers()
@@ -1944,11 +1385,7 @@ except Exception:
                     # state so subsequent physical keypresses are not affected.
                     self._clear_stuck_modifiers()
 
-            if not pasted and self.ydotool_available and not (stream and stream.cancelled.is_set()):
-                if self.wtype_available:
-                    log(f"⚠️  wtype rejected paste chord {paste_chord!r}; falling back to ydotool.")
-                else:
-                    log(f"ℹ️  Dispatching paste chord {paste_chord!r} with ydotool.")
+            if not pasted and self.ydotool_available:
                 self._clear_stuck_modifiers()
                 time.sleep(0.02)
                 # Non-Latin layouts (Thai, Russian, …) remap KEY_V, so the raw-keycode
@@ -1957,8 +1394,7 @@ except Exception:
                 # Unicode and pastes correctly regardless of the active layout.
                 _prev_layout = self._gnome_force_latin_layout()
                 try:
-                    if stream is None or not stream.cancelled.is_set():
-                        pasted = self._send_paste_keys_slow(paste_chord)
+                    pasted = self._send_paste_keys_slow(paste_chord)
                 finally:
                     self._gnome_restore_layout(_prev_layout)
 
@@ -1968,11 +1404,9 @@ except Exception:
                 and not self.ydotool_available
                 and not getattr(self, 'xdotool_available', False)
             ):
-                log("No key-injection tool available; text is on the clipboard.")
+                print("No key-injection tool available; text is on the clipboard.")
                 # Text is clipboard-only: don't restore old clipboard (would erase it)
                 # and don't auto-submit (nothing was pasted into the field).
-                if stream is not None:
-                    stream.not_pasted = True
                 return True
 
             # Only restore clipboard after successful injection — if injection failed,
@@ -1980,31 +1414,24 @@ except Exception:
             # the exception: the ydotool chord is an automatic fallback after direct
             # typing was skipped, and a failed chord should not clobber the user's
             # previous clipboard.
-            if stream is not None:
-                if pasted:
-                    stream.last_pasted = text
-            elif pasted:
+            if pasted:
                 restore_delay = 5.0
                 if self.config_manager:
                     restore_delay = float(self.config_manager.get_setting('clipboard_clear_delay', 5.0))
                 self._restore_clipboard(saved_clipboard, injected=text.encode("utf-8"), delay=restore_delay)
-                if auto_submit:
-                    self._send_enter_if_auto_submit()
-            elif (
-                gnome_wayland_session
-                and not getattr(self, '_last_ydotool_failure_explicit', False)
-            ):
+                self._send_enter_if_auto_submit()
+            elif gnome_wayland_session:
                 self._restore_clipboard(saved_clipboard, injected=text.encode("utf-8"), delay=0)
 
             return pasted
 
         except Exception as e:
-            log(f"Clipboard+hotkey injection failed: {e}")
+            print(f"Clipboard+hotkey injection failed: {e}")
             return False
 
     def _inject_via_clipboard(self, text: str) -> bool:
         """Fallback: copy text to clipboard when no paste tool is available."""
         if self._copy_text_to_clipboard(text):
-            log("Text copied to clipboard (no paste tool available)")
+            print("Text copied to clipboard (no paste tool available)")
             return True
         return False

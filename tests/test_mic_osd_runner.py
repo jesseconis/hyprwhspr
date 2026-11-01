@@ -1,10 +1,8 @@
 import sys
 import tempfile
-import threading
 import types
 import unittest
 import builtins
-import signal
 from pathlib import Path
 from unittest import mock
 
@@ -87,8 +85,7 @@ class MicOSDRunnerTests(unittest.TestCase):
             ),
             CssProvider=object,
             StyleContext=types.SimpleNamespace(add_provider_for_display=lambda *args: None),
-            STYLE_PROVIDER_PRIORITY_APPLICATION=600,
-            STYLE_PROVIDER_PRIORITY_USER=800,
+            STYLE_PROVIDER_PRIORITY_APPLICATION=0,
         )
         gdk_module = types.SimpleNamespace(Display=types.SimpleNamespace(get_default=lambda: None))
         glib_module = types.SimpleNamespace(Error=Exception)
@@ -220,35 +217,61 @@ class MicOSDRunnerTests(unittest.TestCase):
             finally:
                 runner_module.MIC_OSD_PID_FILE = original_pid_file
 
-    def test_orphaned_pid_signal_revalidates_before_sending(self):
+    def test_show_restarts_a_live_but_unresponsive_daemon_once(self):
         runner = MicOSDRunner()
-        runner._process = types.SimpleNamespace(pid=999, poll=lambda: None)
-        runner._orphaned_daemon_pid = 12345
+        runner._process = types.SimpleNamespace(pid=12345, poll=lambda: None)
 
         with mock.patch.object(MicOSDRunner, "is_available", return_value=True), \
-                mock.patch.object(runner, "_is_mic_osd_daemon_pid", return_value=False), \
-                mock.patch.object(runner_module.os, "kill") as kill:
-            self.assertFalse(runner.show())
+                mock.patch.object(runner, "_ensure_daemon", return_value=True) as ensure, \
+                mock.patch.object(runner, "_start_level_feed") as start_feed, \
+                mock.patch.object(runner, "_signal_show_and_wait", side_effect=[False, True]), \
+                mock.patch.object(runner, "stop") as stop:
+            self.assertTrue(runner.show())
 
-        kill.assert_not_called()
-        self.assertIsNone(runner._process)
-        self.assertIsNone(runner._orphaned_daemon_pid)
+        self.assertEqual(start_feed.call_count, 2)
+        self.assertEqual(ensure.call_count, 2)
+        stop.assert_called_once_with()
 
-    def test_custom_css_cannot_override_transparent_outer_surface(self):
-        module, _ = self._import_window_with_stubs()
-        transparency, custom = mock.Mock(), mock.Mock()
-        display = object()
-        with mock.patch.object(module, '_transparency_provider', None), \
-                mock.patch.object(module.Gtk, 'CssProvider', side_effect=[transparency, custom]), \
-                mock.patch.object(module.Gdk.Display, 'get_default', return_value=display), \
-                mock.patch.object(module.Gtk.StyleContext, 'add_provider_for_display') as add:
-            module.load_css('/optional/cosmetics.css')
-        custom.load_from_path.assert_called_once_with('/optional/cosmetics.css')
-        self.assertEqual(add.call_args_list, [
-            mock.call(display, transparency, module.TRANSPARENCY_PRIORITY),
-            mock.call(display, custom, module.Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION),
-        ])
-        self.assertGreater(module.TRANSPARENCY_PRIORITY, module.Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    def test_visible_ack_must_match_the_signaled_daemon_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ack_file = Path(tmp) / "mic_osd_visible"
+            original = runner_module.MIC_OSD_VISIBLE_FILE
+            original_timeout = MicOSDRunner.SHOW_ACK_TIMEOUT_SECONDS
+            runner_module.MIC_OSD_VISIBLE_FILE = ack_file
+            MicOSDRunner.SHOW_ACK_TIMEOUT_SECONDS = 0.02
+            try:
+                ack_file.write_text("111", encoding="utf-8")
+                self.assertFalse(MicOSDRunner._wait_for_visible_ack(222))
+                ack_file.write_text("222", encoding="utf-8")
+                self.assertTrue(MicOSDRunner._wait_for_visible_ack(222))
+            finally:
+                runner_module.MIC_OSD_VISIBLE_FILE = original
+                MicOSDRunner.SHOW_ACK_TIMEOUT_SECONDS = original_timeout
+
+    def test_orphaned_pid_signal_revalidates_before_sending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = MicOSDRunner()
+            runner._process = types.SimpleNamespace(pid=999, poll=lambda: None)
+            runner._orphaned_daemon_pid = 12345
+
+            with mock.patch.object(
+                    runner_module,
+                    "MIC_OSD_PID_FILE",
+                    Path(tmp) / "mic_osd.pid",
+                ), mock.patch.object(
+                    runner_module,
+                    "MIC_OSD_VISIBLE_FILE",
+                    Path(tmp) / "mic_osd_visible",
+                ), mock.patch.object(
+                    MicOSDRunner, "is_available", return_value=True
+                ), mock.patch.object(
+                    runner, "_is_mic_osd_daemon_pid", return_value=False
+                ), mock.patch.object(runner_module.os, "kill") as kill:
+                self.assertFalse(runner.show())
+
+            kill.assert_not_called()
+            self.assertIsNone(runner._process)
+            self.assertIsNone(runner._orphaned_daemon_pid)
 
     def test_text_extents_support_tuple_and_attribute_shapes(self):
         window_module, _ = self._import_window_with_stubs()
@@ -303,6 +326,96 @@ class MicOSDRunnerTests(unittest.TestCase):
 
         self.assertEqual(text, "averylo…")
         self.assertLessEqual(window._text_advance(AdvanceContext(), text), 40)
+
+    def test_dynamic_preview_wraps_paragraphs_and_long_tokens(self):
+        window_module, _ = self._import_window_with_stubs()
+        window = object.__new__(window_module.OSDWindow)
+        cr = FakeCairoContext()
+
+        lines = window._wrap_preview_lines(
+            cr,
+            "one two three\n\nsupercalifragilistic",
+            40,
+        )
+
+        self.assertEqual(lines[:3], ["one two", "three", ""])
+        self.assertTrue(all(len(line) <= 8 for line in lines[3:]))
+        self.assertEqual("".join(lines[3:]), "supercalifragilistic")
+
+    def test_dynamic_preview_grows_and_shrinks_with_wrapped_lines(self):
+        window_module, _ = self._import_window_with_stubs()
+        config_module = __import__(
+            "mic_osd.osd_config", fromlist=["MicOSDConfig"]
+        )
+        window = object.__new__(window_module.OSDWindow)
+        window._osd_config = config_module.MicOSDConfig(
+            transcript_font_size=20,
+            transcript_max_lines=3,
+            transcript_line_spacing=1.25,
+        )
+        window._width = 100
+        window._height = 86
+        window._meter_height = 86
+        window._visualizer_state = "recording"
+        window._preview_text = "one two three four five six seven eight nine"
+        window.drawing_area = types.SimpleNamespace(
+            set_content_height=mock.Mock(),
+            queue_resize=mock.Mock(),
+        )
+        window.set_default_size = mock.Mock()
+        cr = FakeCairoContext()
+
+        window._draw_dynamic_preview_text(cr, 100)
+
+        self.assertEqual(window._height, 227)
+        window.drawing_area.set_content_height.assert_called_once_with(227)
+        self.assertEqual(
+            cr.shown_text[::2],
+            ["one two", "three four", "five six", "seven eight", "nine"],
+        )
+
+        window._preview_text = ""
+        window._draw_dynamic_preview_text(cr, 100)
+        self.assertEqual(window._height, 86)
+
+    def test_dynamic_preview_limits_growth_to_monitor_space(self):
+        window_module, _ = self._import_window_with_stubs()
+        from mic_osd.osd_config import MicOSDConfig
+
+        window = object.__new__(window_module.OSDWindow)
+        window._osd_config = MicOSDConfig(transcript_font_size=20)
+        window._width = 100
+        window._height = window._meter_height = 86
+        window._visualizer_state = "recording"
+        window._preview_text = "one two three four five six seven eight nine"
+        window._preview_height_limit = mock.Mock(return_value=177)
+        window.drawing_area = mock.Mock()
+        window.set_default_size = mock.Mock()
+        cr = FakeCairoContext()
+
+        window._draw_dynamic_preview_text(cr, 100)
+
+        self.assertEqual(window._height, 177)
+        self.assertEqual(len(cr.shown_text), 6)
+        self.assertTrue(cr.shown_text[0].startswith("… "))
+        self.assertEqual(cr.shown_text[-1], "nine")
+        # Presentation truncation must never discard the source transcript.
+        self.assertTrue(window._preview_text.startswith("one two"))
+
+    def test_preview_height_limit_uses_logical_monitor_geometry(self):
+        window_module, _ = self._import_window_with_stubs()
+        from mic_osd.osd_config import MicOSDConfig
+
+        window = object.__new__(window_module.OSDWindow)
+        window._meter_height = 86
+        window._osd_config = MicOSDConfig(bottom_margin=130)
+        window.get_surface = mock.Mock(return_value=object())
+        window.get_display = mock.Mock()
+        monitor = window.get_display.return_value.get_monitor_at_surface.return_value
+        monitor.get_geometry.return_value.height = 1080
+        self.assertEqual(window._preview_height_limit(), 648)
+        monitor.get_geometry.return_value.height = 300
+        self.assertEqual(window._preview_height_limit(), 146)
 
     def test_preview_text_draws_only_while_recording(self):
         window_module, _ = self._import_window_with_stubs()
@@ -374,138 +487,6 @@ class MicOSDRunnerTests(unittest.TestCase):
             finally:
                 runner_module.TRANSCRIPT_PREVIEW_FILE = original_file
                 MicOSDRunner.PREVIEW_WRITE_INTERVAL_SECONDS = original_interval
-
-    def test_hide_cancels_show_blocked_on_first_feed_frame(self):
-        source_entered = threading.Event()
-        source_release = threading.Event()
-        hidden = threading.Event()
-        signals = []
-        show_results = []
-
-        def blocked_source():
-            source_entered.set()
-            if not source_release.wait(5):
-                raise TimeoutError("test did not release level source")
-            return 0.0, []
-
-        def record_signal(pid, sig):
-            if sig in (signal.SIGUSR1, signal.SIGUSR2):
-                signals.append(sig)
-            if sig == signal.SIGUSR2:
-                hidden.set()
-
-        runner = MicOSDRunner(level_source=blocked_source)
-        runner._process = types.SimpleNamespace(pid=4242, poll=lambda: None)
-        with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.object(runner_module, "MIC_OSD_LEVEL_FEED_FILE", Path(tmp) / "feed"), \
-                mock.patch.object(runner_module, "TRANSCRIPT_PREVIEW_FILE", Path(tmp) / "preview"), \
-                mock.patch.object(runner, "is_available", return_value=True), \
-                mock.patch.object(runner, "_ensure_daemon", return_value=True), \
-                mock.patch.object(runner_module.os, "kill", side_effect=record_signal):
-            showing = threading.Thread(target=lambda: show_results.append(runner.show()))
-            hiding = threading.Thread(target=runner.hide)
-            showing.start()
-            try:
-                self.assertTrue(source_entered.wait(2), "show did not reach level source")
-                hiding.start()
-                self.assertTrue(hidden.wait(2), "hide waited for the blocked level source")
-                self.assertTrue(hiding.is_alive(), "feed teardown should still be blocked")
-            finally:
-                source_release.set()
-                showing.join(5)
-                if hiding.ident is not None:
-                    hiding.join(5)
-                runner._stop_level_feed()
-            self.assertFalse(showing.is_alive())
-            self.assertFalse(hiding.is_alive())
-            self.assertEqual(signals, [signal.SIGUSR2])
-            self.assertEqual(show_results, [False])
-
-            # Cancellation must not prevent the next recording from showing.
-            self.assertTrue(runner.show())
-            runner.hide()
-            self.assertEqual(signals[-2:], [signal.SIGUSR1, signal.SIGUSR2])
-
-    def test_hide_during_daemon_startup_does_not_start_a_feed(self):
-        runner = MicOSDRunner(level_source=lambda: (0.0, []))
-        startup_entered = threading.Event()
-        startup_release = threading.Event()
-        results = []
-        signals = []
-
-        def start_daemon():
-            startup_entered.set()
-            startup_release.wait(5)
-            runner._process = types.SimpleNamespace(pid=4242, poll=lambda: None)
-            return True
-
-        with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.object(runner_module, "MIC_OSD_LEVEL_FEED_FILE", Path(tmp) / "feed"), \
-                mock.patch.object(runner_module, "TRANSCRIPT_PREVIEW_FILE", Path(tmp) / "preview"), \
-                mock.patch.object(runner, "is_available", return_value=True), \
-                mock.patch.object(runner, "_ensure_daemon", side_effect=start_daemon), \
-                mock.patch.object(runner_module.os, "kill", side_effect=lambda pid, sig: signals.append(sig)):
-            worker = threading.Thread(target=lambda: results.append(runner.show()))
-            worker.start()
-            try:
-                self.assertTrue(startup_entered.wait(2))
-                runner.hide()
-                startup_release.set()
-                worker.join(5)
-                self.assertFalse(worker.is_alive())
-                self.assertEqual(results, [False])
-                self.assertNotIn(signal.SIGUSR1, signals)
-                self.assertFalse((Path(tmp) / "feed").exists())
-            finally:
-                startup_release.set()
-                worker.join(5)
-                runner._stop_level_feed()
-
-    def test_new_show_waits_for_previous_hide_teardown(self):
-        runner = MicOSDRunner(level_source=lambda: (0.0, []))
-        runner._process = types.SimpleNamespace(pid=4242, poll=lambda: None)
-        teardown_entered = threading.Event()
-        teardown_release = threading.Event()
-        show_finished = threading.Event()
-        signals = []
-
-        def blocked_teardown():
-            teardown_entered.set()
-            teardown_release.wait(5)
-
-        def show_again():
-            runner.show()
-            show_finished.set()
-
-        def record_signal(pid, sig):
-            if sig in (signal.SIGUSR1, signal.SIGUSR2):
-                signals.append(sig)
-
-        with mock.patch.object(runner, "_stop_level_feed", side_effect=blocked_teardown), \
-                mock.patch.object(runner, "clear_preview_text"), \
-                mock.patch.object(runner, "is_available", return_value=True), \
-                mock.patch.object(runner, "_ensure_daemon", return_value=True), \
-                mock.patch.object(runner_module.os, "kill", side_effect=record_signal):
-            hiding = threading.Thread(target=runner.hide)
-            showing = threading.Thread(target=show_again)
-            hiding.start()
-            try:
-                self.assertTrue(teardown_entered.wait(2))
-                showing.start()
-                self.assertFalse(
-                    show_finished.wait(0.1),
-                    "new show overtook the previous hide teardown",
-                )
-                self.assertNotIn(signal.SIGUSR1, signals)
-            finally:
-                teardown_release.set()
-                hiding.join(5)
-                if showing.ident is not None:
-                    showing.join(5)
-
-            self.assertFalse(hiding.is_alive())
-            self.assertFalse(showing.is_alive())
-            self.assertEqual(signals, [signal.SIGUSR2, signal.SIGUSR1])
 
     def test_high_frequency_preview_updates_are_coalesced(self):
         with tempfile.TemporaryDirectory() as tmp:

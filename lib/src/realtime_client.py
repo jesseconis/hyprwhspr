@@ -4,23 +4,12 @@ Provider-agnostic design, use whatever.
 """
 
 import json
-import uuid
 from collections import deque
 from typing import Optional
 
 try:
-    from .openai_realtime_models import (
-        is_continuous,
-        uses_language_context,
-        uses_manual_commit,
-    )
     from .realtime_base import WebSocketRealtimeClientBase
 except ImportError:
-    from openai_realtime_models import (
-        is_continuous,
-        uses_language_context,
-        uses_manual_commit,
-    )
     from realtime_base import WebSocketRealtimeClientBase
 
 
@@ -29,9 +18,6 @@ class RealtimeClient(WebSocketRealtimeClientBase):
 
     LOG_TAG = '[REALTIME]'
     VALID_TRANSCRIPTION_DELAYS = {'minimal', 'low', 'medium', 'high', 'xhigh'}
-    VALID_CONVERSATION_HISTORY = {'session', 'turn'}
-    VALID_TRANSCRIPTION_SESSION_TYPES = {'transcription', 'realtime'}
-    VALID_SESSION_FORMATS = {'nested', 'flat'}
 
     def __init__(self, mode: str = 'transcribe'):
         """
@@ -41,37 +27,23 @@ class RealtimeClient(WebSocketRealtimeClientBase):
             mode: 'transcribe' for speech-to-text, 'converse' for voice-to-AI
         """
         super().__init__(mode=mode)
-        self.transcription_session_type = 'transcription'
         self.transcription_delay = 'low'
-        self.transcription_prompt = None
-        self.conversation_history = 'turn'
+        self.partial_transcript_callback = None
         self.sample_rate = 24000  # OpenAI Realtime API requires 24kHz
-        # 'flat': servers predating OpenAI's GA schema (NeMo-Speech.cpp) read
-        # sample_rate/language directly under session and only transcribe.
-        self.session_format = 'nested'
 
         # Track if buffer was committed (by VAD or manual)
         # Prevents double-commit error when VAD auto-commits on speech end
         self._buffer_committed = False
 
         # Items from previous/cancelled takes; late transcripts for them are dropped
-        self._take_item_ids = set()
+        self._session_item_ids = set()
         self._retired_item_ids = deque(maxlen=64)
-        self._active_response_request_id = None
-        self._active_response_id = None
-        self._response_output_item_ids = set()
-        self._retired_response_request_ids = deque(maxlen=64)
-        self._retired_response_ids = deque(maxlen=64)
-        self._logged_uncorrelated_response_compatibility = False
 
     # ------------------------------------------------------------------
     # Transport hooks
     # ------------------------------------------------------------------
 
     def _ws_connect_params(self):
-        # Keyless custom endpoints get no header rather than "Bearer None"
-        if not self.api_key:
-            return self.url, None
         return self.url, {'Authorization': f'Bearer {self.api_key}'}
 
     def _on_connect_success(self):
@@ -107,57 +79,32 @@ class RealtimeClient(WebSocketRealtimeClientBase):
 
         # Response events (conversational API)
         elif event_type == 'response.created':
-            if not self._is_active_converse_response(event):
-                return
             self._log('Response created')
             with self.lock:
-                self._active_response_id = self._event_response_id(event)
                 self.current_response_text = ""
                 self.response_complete = False
             self.response_event.clear()
 
         elif event_type == 'response.output_text.delta':
-            if not self._is_active_converse_response(event):
-                return
             # Accumulate text deltas
             delta = event.get('delta', '')
             if delta:
                 with self.lock:
                     self.current_response_text += delta
-                    self._track_output_item_locked(event)
 
         elif event_type == 'response.output_text.done':
-            if not self._is_active_converse_response(event):
-                return
             # Final text available
             text = event.get('text', '')
             with self.lock:
-                self._track_output_item_locked(event)
                 if text:
                     self.current_response_text = text
                 text_len = len(self.current_response_text)
             self._log(f'Response text done ({text_len} chars)')
 
-        elif event_type in ('response.output_item.added', 'response.output_item.done'):
-            if not self._is_active_converse_response(event):
-                return
-            with self.lock:
-                self._track_output_item_locked(event)
-
         elif event_type == 'response.done':
-            if not self._is_active_converse_response(event):
-                return
             # Response complete
             with self.lock:
                 self.response_complete = True
-            self._clear_completed_turn_history(event)
-            with self.lock:
-                if self._active_response_request_id:
-                    self._retired_response_request_ids.append(self._active_response_request_id)
-                if self._active_response_id:
-                    self._retired_response_ids.append(self._active_response_id)
-                self._active_response_request_id = None
-                self._active_response_id = None
             self.response_event.set()
             self._log('Response done')
 
@@ -178,7 +125,7 @@ class RealtimeClient(WebSocketRealtimeClientBase):
                 # Keep legacy fields coherent
                 self.current_response_text = transcript
                 self.response_complete = True
-            self._notify_live_text()
+            self._notify_partial_transcript("")
             self.response_event.set()
             self._log(f'Transcription completed ({len(transcript)} chars)')
 
@@ -189,7 +136,8 @@ class RealtimeClient(WebSocketRealtimeClientBase):
             if delta:
                 with self.lock:
                     self._partial_transcript += delta
-                self._notify_live_text()
+                    partial = self._partial_transcript
+                self._notify_partial_transcript(partial)
 
         elif event_type == 'input_audio_buffer.committed':
             self._log('Audio buffer committed')
@@ -204,7 +152,7 @@ class RealtimeClient(WebSocketRealtimeClientBase):
                 self._buffer_committed = False
                 self._partial_transcript = ""
                 self._track_item_locked(event)
-            self._notify_live_text()
+            self._notify_partial_transcript("")
 
         elif event_type == 'input_audio_buffer.speech_stopped':
             self._log('Speech ended')
@@ -215,7 +163,7 @@ class RealtimeClient(WebSocketRealtimeClientBase):
             self._log(f'Server error: {error_message}')
             with self.lock:
                 self._partial_transcript = ""
-            self._notify_live_text()
+            self._notify_partial_transcript("")
             self.response_complete = True
             self.response_event.set()  # Unblock waiting thread
 
@@ -223,48 +171,7 @@ class RealtimeClient(WebSocketRealtimeClientBase):
         """Record the conversation item id for the current take (call under lock)."""
         item_id = event.get('item_id')
         if item_id:
-            self._take_item_ids.add(item_id)
-
-    def _track_output_item_locked(self, event: dict):
-        """Record an output item seen while handling the active response."""
-        item = event.get('item') or {}
-        item_id = event.get('item_id') or item.get('id')
-        if item_id:
-            self._response_output_item_ids.add(item_id)
-
-    @staticmethod
-    def _event_response_id(event: dict):
-        response = event.get('response') or {}
-        return response.get('id') or event.get('response_id')
-
-    @staticmethod
-    def _event_response_request_id(event: dict):
-        response = event.get('response') or {}
-        metadata = response.get('metadata') or event.get('metadata') or {}
-        return metadata.get('hyprwhspr_request_id')
-
-    def _is_active_converse_response(self, event: dict) -> bool:
-        """Require request metadata or a response ID linked by response.created."""
-        if self.mode != 'converse':
-            return False
-
-        request_id = self._event_response_request_id(event)
-        response_id = self._event_response_id(event)
-        with self.lock:
-            if request_id and request_id == self._active_response_request_id:
-                if self._active_response_id and response_id and response_id != self._active_response_id:
-                    self._log('Dropping response event for a different response')
-                    return False
-                return True
-            if response_id and response_id == self._active_response_id:
-                return True
-            if request_id in self._retired_response_request_ids or response_id in self._retired_response_ids:
-                self._log('Dropping stale response event for retired request')
-                return False
-            if not self._logged_uncorrelated_response_compatibility:
-                self._logged_uncorrelated_response_compatibility = True
-                self._log('Ignoring uncorrelated response event; endpoint must echo response metadata')
-            return False
+            self._session_item_ids.add(item_id)
 
     def _is_retired_item(self, event: dict) -> bool:
         """Whether a transcription event belongs to a previous/cancelled take."""
@@ -280,52 +187,33 @@ class RealtimeClient(WebSocketRealtimeClientBase):
         if not self.connected or not self.ws:
             return
 
-        if self.session_format == 'flat':
-            session_data = {'sample_rate': self.sample_rate}
-            if self.language:
-                session_data['language'] = self.language
-        elif self.mode == 'transcribe':
-            # Dictation; strict proxies need the 'realtime' envelope
+        if self.mode == 'transcribe':
+            # Transcription-only session
             # Build transcription config - omit language for auto-detect
             model = self.model or 'gpt-4o-mini-transcribe'
             transcription_config = {'model': model}
-
-            language_context = uses_language_context(model)
             if self.language:
-                if language_context:
-                    transcription_config['languages'] = [self.language]
-                else:
-                    transcription_config['language'] = self.language
+                transcription_config['language'] = self.language
 
-            if language_context and self.transcription_prompt:
-                transcription_config['prompt'] = self.transcription_prompt
-
-            if is_continuous(model):
+            is_realtime_whisper = model == 'gpt-realtime-whisper'
+            if is_realtime_whisper:
                 transcription_config['delay'] = self._validated_transcription_delay()
 
-            turn_detection = None
-            if not uses_manual_commit(model):
-                turn_detection = {
-                    'type': 'server_vad',
-                    'threshold': 0.5,
-                    'prefix_padding_ms': 300,
-                    'silence_duration_ms': 500
-                }
-                if self.transcription_session_type == 'realtime':
-                    # Realtime sessions reply to every VAD turn by default
-                    turn_detection['create_response'] = False
-                    turn_detection['interrupt_response'] = False
-
             session_data = {
-                'type': self.transcription_session_type,
+                'type': 'transcription',
                 'audio': {
                     'input': {
                         'format': {
                             'type': 'audio/pcm',
-                            'rate': self.sample_rate
+                            'rate': 24000
                         },
                         'transcription': transcription_config,
-                        'turn_detection': turn_detection
+                        'turn_detection': None if is_realtime_whisper else {
+                            'type': 'server_vad',
+                            'threshold': 0.5,
+                            'prefix_padding_ms': 300,
+                            'silence_duration_ms': 500
+                        }
                     }
                 }
             }
@@ -338,7 +226,7 @@ class RealtimeClient(WebSocketRealtimeClientBase):
                     'input': {
                         'format': {
                             'type': 'audio/pcm',
-                            'rate': self.sample_rate
+                            'rate': 24000
                         },
                         'turn_detection': None  # Manual commit on stop
                     }
@@ -352,22 +240,10 @@ class RealtimeClient(WebSocketRealtimeClientBase):
         }
 
         try:
-            with self._ws_send_lock:
-                self.ws.send(json.dumps(event))
+            self.ws.send(json.dumps(event))
             self._log('Sent session.update')
         except Exception as e:
             self._log(f'Failed to send session.update: {e}')
-
-    def update_transcription_config(
-        self,
-        language: Optional[str],
-        prompt: Optional[str],
-    ):
-        """Update new-model transcription language and prompt together."""
-        self.language = language
-        self.transcription_prompt = prompt
-        if self.connected:
-            self._send_session_update()
 
     def update_language(self, language: Optional[str]):
         """Update the language for transcription and resend session.update
@@ -375,96 +251,39 @@ class RealtimeClient(WebSocketRealtimeClientBase):
         Args:
             language: Language code (e.g., 'en', 'it', 'fr') or None for auto-detect
         """
-        self.update_transcription_config(language, self.transcription_prompt)
+        self.language = language
+        if self.connected:
+            self._send_session_update()
 
     def set_transcription_delay(self, delay: str):
-        """Set the OpenAI streaming transcription delay."""
+        """Set gpt-realtime-whisper transcription delay."""
         self.transcription_delay = self._normalize_transcription_delay(delay)
         if self.connected:
             self._send_session_update()
 
-    def set_conversation_history(self, history: str):
-        """Set whether conversational turns retain server-side history."""
-        self.conversation_history = self._normalize_choice(
-            history, self.VALID_CONVERSATION_HISTORY, 'turn', 'realtime_conversation_history'
-        )
-
-    def set_transcription_session_type(self, session_type: str):
-        """Set the transcribe-mode session envelope ('realtime' for strict proxies)."""
-        self.transcription_session_type = self._normalize_choice(
-            session_type, self.VALID_TRANSCRIPTION_SESSION_TYPES, 'transcription',
-            'realtime_transcription_session_type'
-        )
-        if self.connected:
-            self._send_session_update()
-
-    def configure(self, get_setting):
-        self.session_format = self._normalize_choice(
-            get_setting('websocket_session_format', None), self.VALID_SESSION_FORMATS, 'nested',
-            'websocket_session_format'
-        )
-        if self.session_format == 'flat' and self.mode != 'transcribe':
-            self._log('Flat sessions only transcribe; ignoring realtime_mode')
-            self.mode = 'transcribe'
-        super().configure(get_setting)
-        self.set_transcription_session_type(
-            get_setting('realtime_transcription_session_type', 'transcription'))
-        self.set_transcription_delay(get_setting('realtime_transcription_delay', 'low'))
-        self.set_conversation_history(get_setting('realtime_conversation_history', 'turn'))
-
-    def _normalize_choice(self, value, valid: set, default: str, key: str) -> str:
-        """Normalize a config enum; unset falls back quietly, anything invalid (non-strings too) with a log."""
-        if value is None or value == '':
-            return default
-        normalized = value.strip().lower() if isinstance(value, str) else None
-        if normalized not in valid:
-            self._log(f"Invalid {key} {value!r}, using {default!r}")
-            return default
-        return normalized
+    def set_partial_transcript_callback(self, callback):
+        """Register a callback for live transcription deltas."""
+        self.partial_transcript_callback = callback
 
     def _normalize_transcription_delay(self, delay: str) -> str:
-        return self._normalize_choice(delay, self.VALID_TRANSCRIPTION_DELAYS, 'low', 'realtime_transcription_delay')
+        delay = (delay or 'low').strip().lower()
+        if delay not in self.VALID_TRANSCRIPTION_DELAYS:
+            self._log(f"Invalid realtime_transcription_delay '{delay}', using 'low'")
+            return 'low'
+        return delay
 
     def _validated_transcription_delay(self) -> str:
         self.transcription_delay = self._normalize_transcription_delay(self.transcription_delay)
         return self.transcription_delay
 
-    def _notify_live_text(self):
-        """Publish committed segments plus the in-flight delta text."""
-        with self.lock:
-            committed = self._full_committed_text_locked()
-            tail = self._partial_transcript
-        self._publish_live_text(committed, tail)
-
-    def _clear_completed_turn_history(self, event: dict):
-        """Delete this completed conversational turn without closing the socket."""
-        if self.mode != 'converse' or self.conversation_history != 'turn':
+    def _notify_partial_transcript(self, text: str):
+        callback = self.partial_transcript_callback
+        if not callback:
             return
-
-        response = event.get('response') or {}
-        output_items = response.get('output') or []
-        output_ids = {
-            item.get('id')
-            for item in output_items
-            if isinstance(item, dict) and item.get('id')
-        }
-        with self.lock:
-            item_ids = self._take_item_ids | self._response_output_item_ids | output_ids
-            self._take_item_ids.clear()
-            self._response_output_item_ids.clear()
-            self._retired_item_ids.extend(item_ids)
-
-        if not self.connected or not self.ws:
-            return
-        for item_id in item_ids:
-            try:
-                with self._ws_send_lock:
-                    self.ws.send(json.dumps({
-                        'type': 'conversation.item.delete',
-                        'item_id': item_id,
-                    }))
-            except Exception as e:
-                self._log(f'Failed to delete conversation item: {e}')
+        try:
+            callback(text)
+        except Exception as e:
+            self._log(f'Partial transcript callback failed: {e}')
 
     # ------------------------------------------------------------------
     # Commit hooks
@@ -474,20 +293,19 @@ class RealtimeClient(WebSocketRealtimeClientBase):
         """Clear the server-side audio buffer before starting a new recording."""
         with self.lock:
             # Retire the previous take's items so late transcripts are dropped
-            self._retired_item_ids.extend(self._take_item_ids)
-            self._take_item_ids.clear()
+            self._retired_item_ids.extend(self._session_item_ids)
+            self._session_item_ids.clear()
         if not self.connected or not self.ws:
             return
         try:
             event = {'type': 'input_audio_buffer.clear'}
-            with self._ws_send_lock:
-                self.ws.send(json.dumps(event))
+            self.ws.send(json.dumps(event))
             with self.lock:
                 self._reset_stream_state_locked()
                 self._buffer_committed = False  # Reset commit tracking for new recording
                 self._partial_transcript = ""
             self.response_event.clear()
-            self._notify_live_text()
+            self._notify_partial_transcript("")
         except Exception as e:
             self._log(f'Failed to clear buffer: {e}')
 
@@ -501,44 +319,11 @@ class RealtimeClient(WebSocketRealtimeClientBase):
         self._buffer_committed = False
         return {'buffer_was_committed': buffer_was_committed}
 
-    def _on_response_timeout(self):
-        """Cancel and retire a timed-out converse response so it cannot satisfy a later take."""
-        if self.mode != 'converse':
-            return
-
-        with self.lock:
-            request_id = self._active_response_request_id
-            response_id = self._active_response_id
-            if request_id:
-                self._retired_response_request_ids.append(request_id)
-            if response_id:
-                self._retired_response_ids.append(response_id)
-            self._active_response_request_id = None
-            self._active_response_id = None
-            self.current_response_text = ""
-            self.response_complete = False
-        self.response_event.clear()
-
-        self._clear_completed_turn_history({})
-
-        if not request_id or not self.connected or not self.ws:
-            return
-        event = {'type': 'response.cancel'}
-        if response_id:
-            event['response_id'] = response_id
-        try:
-            with self._ws_send_lock:
-                self.ws.send(json.dumps(event))
-            self._log('Cancelled timed-out response')
-        except Exception as e:
-            self._log(f'Failed to cancel timed-out response: {e}')
-
     def _request_transcript(self, ctx: dict):
         # Only send commit if buffer hasn't already been committed by VAD
         if not ctx.get('buffer_was_committed'):
             commit_event = {'type': 'input_audio_buffer.commit'}
-            with self._ws_send_lock:
-                self.ws.send(json.dumps(commit_event))
+            self.ws.send(json.dumps(commit_event))
             self._log('Committed audio buffer')
         else:
             self._log('Skipping commit (VAD already committed)')
@@ -546,20 +331,13 @@ class RealtimeClient(WebSocketRealtimeClientBase):
         # For converse mode, request a response from the model
         # For transcribe mode, transcription happens automatically via VAD
         if self.mode == 'converse':
-            request_id = uuid.uuid4().hex
-            with self.lock:
-                self._active_response_request_id = request_id
-                self._active_response_id = None
-                self._response_output_item_ids.clear()
             response_event = {
                 'type': 'response.create',
                 'response': {
-                    'output_modalities': ['text'],  # Text only, no audio response
-                    'metadata': {'hyprwhspr_request_id': request_id},
+                    'output_modalities': ['text']  # Text only, no audio response
                 }
             }
-            with self._ws_send_lock:
-                self.ws.send(json.dumps(response_event))
+            self.ws.send(json.dumps(response_event))
             self._log('Requested response, waiting...')
         else:
             self._log('Waiting for transcription...')

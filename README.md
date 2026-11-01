@@ -3,11 +3,11 @@
 </h1>
 
 <p align="center">
-    <b>Native speech-to-text for Linux</b> - Fast, accurate, private and hackable system-wide dictation
+    <b>Native speech-to-text for Linux</b> - Fast, accurate and private system-wide dictation
 </p>
 
 <p align="center">
-    instant performance | Cohere / Parakeet / Whisper / Qwen3-ASR / ElevenLabs / REST API | stylish visuals
+    instant performance | Cohere / Parakeet / Whisper / Gemini / ElevenLabs / REST API | stylish visuals
 </p>
 
  <p align="center">
@@ -22,26 +22,23 @@ https://github.com/user-attachments/assets/4c223e85-2916-494f-b7b1-766ce1bdc991
 
 ---
 
-- **Built for Linux** - Native AUR package for Arch, or use Debian/Ubuntu/Fedora/openSUSE/NixOS
-- **Very fast defaults** - Nearly instant and accurate performance via in-memory models
-- **Offline and private** - Transcription never leaves your machine. Cloud APIs are fully optional. 
-- **Latest models** - Cohere Transcribe? Orukeet? Parakeet TDT V3? Qwen3-ASR? Latest and greatest
+- **Built for Linux** - Native AUR package for Arch, or use Debian/Ubuntu/Fedora/openSUSE
+- **Local, very fast defaults** - Instant, private and accurate performance via in-memory models
+- **Latest models** - Cohere Transcribe? Turbo-v3? Parakeet TDT V3? Latest and greatest
 - **GPU memory efficient** - Limit or zero memory usage easily, more for other local models
 - **onnx-asr for wild CPU speeds** - No GPU? Optimized for great speed on any hardware
-- **Strong CJK** - Qwen3-ASR for Chinese, Japanese and Korean
 - **Translation** - Translate non-English to English with a single config
 - **REST API or websockets** - Secure, fast wires to top clouds like Gemini, ElevenLabs
-- **Live streaming** - Self-host NeMo or Phonon: watch words form, or type as you speak (experimental)
 - **Themed visualizer** - Visualizes your voice, will automatch Omarchy and Noctalia themes
 - **Word overrides and prompts** - Custom hot keys, common words, and more
 - **Multi-lingual** - Great performance in many languages
 - **Long form mode with saving** - Pause, think, resume, pause: submit... Bam!
 - **Auto-paste anywhere** - Instant paste into any active buffer, or even auto enter (optional)
-- **Audio ducking 🦆** - Reduces or pauses other audio on record (optional)
+- **Audio ducking 🦆** - Reduces system volume on record (optional)
 
 ---
 
-**Why hyprwhspr?** There are a lotta dictation apps. This one is built ground-up for performance and stability: your hardware will auto-optimize to the **best possible accuracy and speed**. Actively maintained, at the leading edge, fully featured, strictly offline unless you use an API, and works on both Wayland and X11.
+**Why hyprwhspr?** There are a lotta dictation apps. This one is built ground-up for the highest-end machines: a recent Nvidia card gets the **best possible accuracy and speed**, and everything else runs as well as the hardware you bring. Actively maintained, fully featured, and built for both Wayland and X11.
 
 ---
 
@@ -49,8 +46,7 @@ https://github.com/user-attachments/assets/4c223e85-2916-494f-b7b1-766ce1bdc991
 
 ### Prerequisites
 
-- **Linux** with systemd (Arch, Debian, Ubuntu, Fedora, openSUSE, NixOS etc.)
-- **Python 3.11-3.14**
+- **Linux** with systemd (Arch, Debian, Ubuntu, Fedora, openSUSE, etc.)
 - **Wayland or X11 session** (GNOME, KDE Plasma, Sway, Hyprland, Niri, etc.).
 - **Clipboard/window tools:**
     - `wl-clipboard` and `wtype` on Wayland
@@ -61,8 +57,6 @@ https://github.com/user-attachments/assets/4c223e85-2916-494f-b7b1-766ce1bdc991
 - **AMD/Intel GPU / APU** (optional, for Vulkan acceleration)
 
 ### Install
-
----
 
 #### Arch Linux
 
@@ -107,18 +101,9 @@ cd hyprwhspr
 
 </details>
 
-#### Nix and NixOS (beta)
-
-Use the [Nix flake and NixOS module](docs/integrations/NIX.md) for x86_64 Linux
-with Whisper.cpp CPU transcription. 
-
-We'd appreciate [issue reports and requests](https://github.com/goodroot/hyprwhspr/issues)!
-
----
-
 **Setup then walks you through:**
 
-1. ✅ Configure transcription backend (Cohere Transcribe, Parakeet TDT V3, Whisper, Qwen3-ASR, REST API, or Realtime WebSocket)
+1. ✅ Configure transcription backend (Cohere Transcribe, Parakeet TDT V3, Whisper, REST API, or Realtime WebSocket)
 2. ✅ Download models
 3. ✅ Configure themed visualizer for maximum coolness (optional)
 4. ✅ Configure bar integration for your shell -- Waybar or Noctalia (optional)
@@ -136,7 +121,7 @@ We'd appreciate [issue reports and requests](https://github.com/goodroot/hyprwhs
 4. **Press `Super+Alt+D`** again to stop dictation - _boop!_
 5. **Bam!** Text appears in active buffer!
 
-> **What you'll see while recording:** on layer-shell compositors (Hyprland, Sway, niri, KDE) the animated mic OSD overlay -- on Noctalia / Omarchy it auto-matches your live shell theme; on GNOME/Mutter you may need to make additional changes. See [Themed visualizer](docs/usage/FEEDBACK.md#themed-visualizer) for details.
+> **What you'll see while recording:** on layer-shell compositors (Hyprland, Sway, niri, KDE) the animated mic OSD overlay -- on Noctalia / Omarchy it auto-matches your live shell theme; on GNOME/Mutter you may need to make additional changes. See [Themed visualizer](docs/CONFIGURATION.md#themed-visualizer) for details.
 
 Any snags, please [create an issue](https://github.com/goodroot/hyprwhspr/issues/new/choose).
 
@@ -146,28 +131,19 @@ Any snags, please [create an issue](https://github.com/goodroot/hyprwhspr/issues
 # Arch: update via your AUR helper
 yay -Syu hyprwhspr
 
-# Managed release installs
-hyprwhspr update
-
-# Legacy bootstrap installs: re-run the installer
+# Other distros: re-run the installer
 curl -fsSL https://hyprwhspr.com/install.sh | bash
 
 # Either way, setup is idempotent if you need to re-run it
 hyprwhspr setup
 ```
 
-Managed release rollout and recovery: [installation guide](docs/MANAGED_INSTALLATION.md).
-
 ### CLI commands
 
 - `hyprwhspr setup` - Interactive initial setup
-- `hyprwhspr update [--version VERSION]` - Update a managed release
-- `hyprwhspr install status` - Inspect managed installation state
-- `hyprwhspr install repair [--python PATH]` - Repair a managed installation
 - `hyprwhspr config` - Manage configuration (`show` / `show --all` / `edit` / `secondary-shortcut`)
 - `hyprwhspr model` - Manage models (`download` / `list` / `status` / `unload` / `reload`)
-- `hyprwhspr record` - External hotkey control (`start` / `stop` / `toggle` / `cancel` / `capture` / `status` / `copy-last` / `paste-last` / `clear-last`)
-- `hyprwhspr transcribe INPUT` - Transcribe a WAV or MP3 file to stdout (use `-o PATH` to write a file)
+- `hyprwhspr record` - External hotkey control (`start` / `stop` / `toggle` / `cancel` / `capture` / `status`)
 - `hyprwhspr status` - Overall status check
 - `hyprwhspr validate` - Validate installation
 - `hyprwhspr test` - Test microphone and transcription end-to-end
@@ -175,22 +151,27 @@ Managed release rollout and recovery: [installation guide](docs/MANAGED_INSTALLA
 - `hyprwhspr waybar` / `hyprwhspr noctalia` - Manage bar integration
 - `hyprwhspr mic-osd` - Enable/disable the mic OSD (`enable` / `disable` / `status`)
 - `hyprwhspr systemd` - Manage systemd services
-- `hyprwhspr uninstall` - Remove hyprwhspr; preserve settings, credentials and models
-- `hyprwhspr uninstall --purge` - Also remove recorded personal files (`--keep-models` preserves models)
+- `hyprwhspr uninstall` - Remove hyprwhspr and user data
 
 ## Documentation
 
-All of it at **[hyprwhspr.com/docs](https://hyprwhspr.com/docs/)**, or here:
+For full configuration and customization, see the **[Configuration guide](docs/CONFIGURATION.md)**.
 
-- [Configuration](docs/CONFIGURATION.md) -- the config file, validation, minimal setup
-- [Recording modes](docs/usage/RECORDING_MODES.md) · [Hotkeys](docs/usage/HOTKEYS.md) · [Paste](docs/usage/PASTE.md) · [Text processing](docs/usage/TEXT_PROCESSING.md) · [Feedback](docs/usage/FEEDBACK.md)
-- [Backends](docs/backends/OVERVIEW.md) · [Memory](docs/backends/MEMORY.md) -- which model, and freeing it
-- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Minimal configuration](docs/CONFIGURATION.md#minimal-configuration)
+- [Recording modes](docs/CONFIGURATION.md#recording-modes) -- toggle, push-to-talk, auto, long-form
+- [Custom hotkeys](docs/CONFIGURATION.md#custom-hotkeys) -- key support, secondary shortcuts, Hyprland bindings
+- [Backends](docs/CONFIGURATION.md#backends) -- Cohere Transcribe, Parakeet, Whisper, REST API, Realtime WebSocket
+- [GPU resource management](docs/CONFIGURATION.md#gpu-resource-management) -- unload/reload model to free VRAM
+- [Audio and visual feedback](docs/CONFIGURATION.md#audio-and-visual-feedback) -- visualizer, audio feedback, ducking
+- [Text processing](docs/CONFIGURATION.md#text-processing) -- word overrides, filler words, symbol replacements
+- [Paste and clipboard behavior](docs/CONFIGURATION.md#paste-and-clipboard-behavior) -- paste mode, per-app paste keys, non-QWERTY, auto-submit
+- [Integrations](docs/CONFIGURATION.md#integrations) -- Waybar, Noctalia, Hyprland bindings, external hotkey systems
+- [Troubleshooting](docs/CONFIGURATION.md#troubleshooting)
 
 ## Getting help
 
 - **Check logs**: `journalctl --user -u hyprwhspr.service`
-- **[Troubleshooting](docs/TROUBLESHOOTING.md)** covers common issues
+- **[Troubleshooting](docs/CONFIGURATION.md#troubleshooting)** covers common issues
 - **Still stuck?** [Create an issue](https://github.com/goodroot/hyprwhspr/issues/new/choose) - logs helpful!
 
 ## License
@@ -201,7 +182,7 @@ MIT License - see [LICENSE](LICENSE) file.
 
 Start with an issue - happy to help! Pull requests best begin there too.
 
-Upvotes on the AUR and/or GitHub stars are also a nice way to show appreciation.
+If you want, compute credits from [opub.dev](https://opub.dev/github/goodroot/hyprwhspr) are always welcome!
 
 ---
 

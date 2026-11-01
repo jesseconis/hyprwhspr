@@ -1,14 +1,11 @@
 import importlib
 import contextlib
-import io
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
-
-from tests.evdev_stub import modifier_codes
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib" / "src"))
@@ -38,23 +35,13 @@ _stub_if_missing("rich.table", Table=object)
 _stub_if_missing(
     "evdev",
     InputDevice=object,
-    list_devices=lambda: [],
     categorize=lambda *a, **k: None,
-    ecodes=modifier_codes(),
+    ecodes=types.SimpleNamespace(),
     UInput=object,
 )
 
 from cli import config, install, setup, systemd, uninstall  # noqa: E402
 from config_manager import ConfigManager  # noqa: E402
-
-
-def _unredirected_path_globals(module, redirected):
-    """Module-level filesystem paths a sandboxed run would still act on."""
-    return sorted(
-        name
-        for name, value in vars(module).items()
-        if name.isupper() and isinstance(value, Path) and name not in redirected
-    )
 
 
 class SetupCommandScopeTests(unittest.TestCase):
@@ -78,458 +65,6 @@ class SetupCommandScopeTests(unittest.TestCase):
             clear=True,
         ):
             self.assertTrue(setup._is_gnome_or_mutter_session())
-
-    def test_kde_detection_uses_session_desktop_fallback(self):
-        for env in (
-            {"XDG_CURRENT_DESKTOP": "KDE"},
-            {"XDG_SESSION_DESKTOP": "plasma"},
-            {"DESKTOP_SESSION": "plasmawayland"},
-            {"XDG_CURRENT_DESKTOP": "KDE:plasma"},
-        ):
-            with self.subTest(env=env):
-                with mock.patch.dict(setup.os.environ, env, clear=True):
-                    self.assertTrue(setup._is_kde_plasma_session())
-                    self.assertFalse(setup._is_gnome_or_mutter_session())
-
-    def test_non_kde_desktops_are_not_mistaken_for_plasma(self):
-        for env in (
-            {"XDG_CURRENT_DESKTOP": "niri"},
-            {"XDG_CURRENT_DESKTOP": "Hyprland"},
-            {"XDG_CURRENT_DESKTOP": "GNOME"},
-            {},
-        ):
-            with self.subTest(env=env):
-                with mock.patch.dict(setup.os.environ, env, clear=True):
-                    self.assertFalse(setup._is_kde_plasma_session())
-
-    def test_accessibility_bridge_offer_is_not_function_local(self):
-        # Same class of regression as run_command above: the a11y prompt moved out
-        # of the GNOME/Mutter arm into its own step, so it must still resolve to
-        # the module-level helper rather than a function-local rebinding.
-        self.assertNotIn(
-            "_offer_accessibility_bridge", setup.setup_command.__code__.co_varnames
-        )
-        self.assertTrue(callable(setup._offer_accessibility_bridge))
-
-    def test_kde_uses_busctl_even_when_gsettings_is_installed(self):
-        # gsettings is commonly present on KDE (GTK apps pull glib in) but the
-        # org.gnome.desktop.interface schema need not be, and it isn't what the
-        # Plasma session reads. The org.a11y.Status property must be written
-        # directly regardless of gsettings being on PATH.
-        calls = []
-
-        def fake_run_command(cmd, **kwargs):
-            calls.append(cmd)
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        class AcceptDefaultConfirm:
-            @staticmethod
-            def ask(*_args, **_kwargs):
-                return True
-
-        with (
-            mock.patch.object(setup, "Confirm", AcceptDefaultConfirm),
-            mock.patch.object(setup, "_accessibility_bridge_enabled", return_value=False),
-            mock.patch.object(setup, "_check_atspi_availability", return_value=True),
-            mock.patch.object(setup.shutil, "which", return_value="/usr/bin/anything"),
-            mock.patch.object(setup, "run_command", side_effect=fake_run_command),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            enabled = setup._offer_accessibility_bridge("KDE Plasma", desktop_is_gnome=False)
-
-        self.assertTrue(enabled)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(
-            calls[0],
-            ["busctl", "--user", "set-property", "org.a11y.Bus", "/org/a11y/bus",
-             "org.a11y.Status", "IsEnabled", "b", "true"],
-        )
-
-    def test_gnome_falls_back_to_busctl_without_gsettings(self):
-        calls = []
-
-        def fake_run_command(cmd, **kwargs):
-            calls.append(cmd)
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        class AcceptDefaultConfirm:
-            @staticmethod
-            def ask(*_args, **_kwargs):
-                return True
-
-        def fake_which(name):
-            return None if name == "gsettings" else f"/usr/bin/{name}"
-
-        with (
-            mock.patch.object(setup, "Confirm", AcceptDefaultConfirm),
-            mock.patch.object(setup, "_accessibility_bridge_enabled", return_value=False),
-            mock.patch.object(setup, "_check_atspi_availability", return_value=True),
-            mock.patch.object(setup.shutil, "which", side_effect=fake_which),
-            mock.patch.object(setup, "run_command", side_effect=fake_run_command),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            setup._offer_accessibility_bridge("GNOME", desktop_is_gnome=True)
-
-        self.assertEqual(calls[0][0], "busctl")
-
-    def test_kde_x11_does_not_need_the_accessibility_bridge(self):
-        # X11 windows resolve through xdotool, so the bridge buys Plasma nothing
-        # there — but the session is still recognised as KDE.
-        with mock.patch.dict(
-            setup.os.environ,
-            {"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_TYPE": "x11"},
-            clear=True,
-        ):
-            self.assertTrue(setup._is_kde_plasma_session())
-            self.assertTrue(setup._is_x11_session())
-
-        with mock.patch.dict(
-            setup.os.environ,
-            {"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_TYPE": "wayland"},
-            clear=True,
-        ):
-            self.assertTrue(setup._is_kde_plasma_session())
-            self.assertFalse(setup._is_x11_session())
-
-    def test_accessibility_bridge_prefers_gsettings_when_available(self):
-        calls = []
-
-        def fake_run_command(cmd, **kwargs):
-            calls.append(cmd)
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        class AcceptDefaultConfirm:
-            @staticmethod
-            def ask(*_args, **_kwargs):
-                return True
-
-        with (
-            mock.patch.object(setup, "Confirm", AcceptDefaultConfirm),
-            mock.patch.object(setup, "_accessibility_bridge_enabled", return_value=False),
-            mock.patch.object(setup, "_check_atspi_availability", return_value=True),
-            mock.patch.object(setup.shutil, "which", return_value="/usr/bin/gsettings"),
-            mock.patch.object(setup, "run_command", side_effect=fake_run_command),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            setup._offer_accessibility_bridge("GNOME", desktop_is_gnome=True)
-
-        self.assertEqual(
-            calls,
-            [["gsettings", "set", "org.gnome.desktop.interface",
-              "toolkit-accessibility", "true"]],
-        )
-
-    def test_accessibility_bridge_skips_prompt_without_atspi_bindings(self):
-        def refuse(*_args, **_kwargs):
-            raise AssertionError("must not prompt when the bindings are missing")
-
-        output = io.StringIO()
-        with (
-            mock.patch.object(setup, "Confirm", types.SimpleNamespace(ask=refuse)),
-            mock.patch.object(setup, "_accessibility_bridge_enabled", return_value=False),
-            mock.patch.object(setup, "_check_atspi_availability", return_value=False),
-            mock.patch.object(setup, "run_command", side_effect=refuse),
-            contextlib.redirect_stdout(output),
-        ):
-            enabled = setup._offer_accessibility_bridge("KDE Plasma", desktop_is_gnome=False)
-
-        self.assertFalse(enabled)
-        self.assertIn("AT-SPI Python bindings not found", output.getvalue())
-
-    def test_declining_the_bridge_reports_it_as_not_enabled(self):
-        # The caller uses this to decide whether to still print the paste_mode
-        # fallback advice, which is all a declining user has left.
-        class DeclineConfirm:
-            @staticmethod
-            def ask(*_args, **_kwargs):
-                return False
-
-        with (
-            mock.patch.object(setup, "Confirm", DeclineConfirm),
-            mock.patch.object(setup, "_accessibility_bridge_enabled", return_value=False),
-            mock.patch.object(setup, "_check_atspi_availability", return_value=True),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            self.assertFalse(
-                setup._offer_accessibility_bridge("KDE Plasma", desktop_is_gnome=False)
-            )
-
-    def test_failed_enable_reports_it_as_not_enabled(self):
-        class AcceptDefaultConfirm:
-            @staticmethod
-            def ask(*_args, **_kwargs):
-                return True
-
-        with (
-            mock.patch.object(setup, "Confirm", AcceptDefaultConfirm),
-            mock.patch.object(setup, "_accessibility_bridge_enabled", return_value=False),
-            mock.patch.object(setup, "_check_atspi_availability", return_value=True),
-            mock.patch.object(setup.shutil, "which", return_value="/usr/bin/busctl"),
-            mock.patch.object(
-                setup, "run_command",
-                return_value=types.SimpleNamespace(returncode=1, stdout="", stderr=""),
-            ),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            self.assertFalse(
-                setup._offer_accessibility_bridge("KDE Plasma", desktop_is_gnome=False)
-            )
-
-    def test_already_enabled_bridge_still_requires_the_bindings(self):
-        # The property being true says nothing about `import gi` succeeding; the
-        # runtime probe still fails, so this must not report a working route.
-        output = io.StringIO()
-        with (
-            mock.patch.object(setup, "_accessibility_bridge_enabled", return_value=True),
-            mock.patch.object(setup, "_check_atspi_availability", return_value=False),
-            mock.patch.object(setup, "Confirm", types.SimpleNamespace(
-                ask=lambda *a, **k: (_ for _ in ()).throw(AssertionError("no prompt")))),
-            contextlib.redirect_stdout(output),
-        ):
-            self.assertFalse(
-                setup._offer_accessibility_bridge("KDE Plasma", desktop_is_gnome=False)
-            )
-
-        self.assertIn("AT-SPI Python bindings not found", output.getvalue())
-
-    def test_already_enabled_bridge_is_reported_without_prompting(self):
-        # Re-running setup on a configured machine must not warn that window
-        # detection is unavailable just because the user declines a prompt that
-        # has nothing left to do.
-        def refuse(*_args, **_kwargs):
-            raise AssertionError("must not prompt when the bridge is already on")
-
-        output = io.StringIO()
-        with (
-            mock.patch.object(setup, "_accessibility_bridge_enabled", return_value=True),
-            mock.patch.object(setup, "_check_atspi_availability", return_value=True),
-            mock.patch.object(setup, "Confirm", types.SimpleNamespace(ask=refuse)),
-            mock.patch.object(setup, "run_command", side_effect=refuse),
-            contextlib.redirect_stdout(output),
-        ):
-            self.assertTrue(
-                setup._offer_accessibility_bridge("KDE Plasma", desktop_is_gnome=False)
-            )
-
-        self.assertIn("already enabled", output.getvalue())
-
-    def test_openai_transcription_models_use_recommended_setup_order(self):
-        class SelectFirstPrompt:
-            @staticmethod
-            def ask(*_args, **_kwargs):
-                return "1"
-
-        class AcceptDefaultConfirm:
-            @staticmethod
-            def ask(*_args, **_kwargs):
-                return True
-
-        output = io.StringIO()
-        with (
-            mock.patch.object(setup, "Prompt", SelectFirstPrompt),
-            mock.patch.object(setup, "Confirm", AcceptDefaultConfirm),
-            mock.patch.object(setup, "get_credential", return_value="sk-existing-key"),
-            mock.patch.object(setup, "save_credential", return_value=True),
-            contextlib.redirect_stdout(output),
-        ):
-            selection = setup._prompt_realtime_provider_model_selection()
-
-        self.assertEqual(
-            selection,
-            ("openai", "gpt-transcribe", "sk-existing-key", None),
-        )
-        catalog = output.getvalue()
-        transcribe_position = catalog.index("OpenAI: GPT Transcribe")
-        live_position = catalog.index("OpenAI: GPT Live Transcribe")
-        whisper_position = catalog.index("OpenAI: GPT Realtime Whisper")
-        self.assertLess(transcribe_position, live_position)
-        self.assertLess(live_position, whisper_position)
-
-
-class RealtimeSetupCatalogTests(unittest.TestCase):
-    def _catalog(self):
-        class SelectFirstPrompt:
-            @staticmethod
-            def ask(*_args, **_kwargs):
-                return "1"
-
-        class AcceptDefaultConfirm:
-            @staticmethod
-            def ask(*_args, **_kwargs):
-                return True
-
-        output = io.StringIO()
-        with (
-            mock.patch.object(setup, "Prompt", SelectFirstPrompt),
-            mock.patch.object(setup, "Confirm", AcceptDefaultConfirm),
-            mock.patch.object(setup, "get_credential", return_value="sk-existing-key"),
-            mock.patch.object(setup, "save_credential", return_value=True),
-            contextlib.redirect_stdout(output),
-        ):
-            setup._prompt_realtime_provider_model_selection()
-        return output.getvalue()
-
-    def test_transcription_models_are_listed_before_conversational_ones(self):
-        catalog = self._catalog()
-        last_transcription = catalog.index("OpenAI: GPT Realtime Whisper")
-        first_converse = catalog.index("OpenAI: GPT-Realtime-2.1")
-        self.assertLess(last_transcription, first_converse)
-
-    def test_rest_only_models_stay_out_of_the_realtime_catalog(self):
-        catalog = self._catalog()
-        self.assertNotIn("Whisper 1", catalog)
-        self.assertNotIn("GPT-4o Transcribe", catalog)
-
-    def test_selecting_a_conversational_model_configures_converse_mode(self):
-        self.assertEqual(
-            setup.get_realtime_mode("openai", "gpt-realtime-2.1"), "converse"
-        )
-        self.assertEqual(
-            setup.get_realtime_mode("openai", "gpt-transcribe"), "transcribe"
-        )
-
-
-class RemoteConfigSwitchTests(unittest.TestCase):
-    """setup_config merges into the existing config, so a switch must
-    overwrite every remote key an earlier setup may have left behind."""
-
-    def _switch(self, stale, *args, **kwargs):
-        config = dict(stale)
-        config.update(setup._generate_remote_config(*args, **kwargs))
-        return config
-
-    def test_realtime_switch_clears_a_custom_websocket_url(self):
-        stale = {'websocket_url': 'ws://old.example/v1/realtime'}
-        config = self._switch(stale, 'openai', 'gpt-transcribe', 'sk', backend_type='realtime-ws')
-        self.assertIsNone(config['websocket_url'])
-
-    def test_realtime_custom_keeps_its_websocket_url(self):
-        url = 'ws://127.0.0.1:8080/v1/realtime'
-        config = self._switch({}, 'custom', 'model', None, {'websocket_url': url}, backend_type='realtime-ws')
-        self.assertEqual(config['websocket_url'], url)
-
-    def test_realtime_switch_turns_live_typing_off(self):
-        config = self._switch({'realtime_live_typing': True}, 'openai', 'gpt-transcribe', 'sk',
-                              backend_type='realtime-ws')
-        self.assertFalse(config['realtime_live_typing'])
-
-    def test_realtime_switch_clears_self_hosted_options(self):
-        stale = {'websocket_protocol': 'phonon', 'websocket_session_format': 'flat',
-                 'websocket_sample_rate': 16000, 'websocket_live_text': 'append_only'}
-        config = self._switch(stale, 'openai', 'gpt-transcribe', 'sk', backend_type='realtime-ws')
-        for key in stale:
-            self.assertIsNone(config[key], key)
-
-    def test_realtime_nemo_preset_fills_the_server_shape(self):
-        class Answers:
-            @staticmethod
-            def ask(_prompt, choices=None, default=None, **_kwargs):
-                answer = next(answers)
-                return answer or default
-
-        class Confirms:
-            @staticmethod
-            def ask(prompt, default=None, **_kwargs):
-                return default
-
-        catalog = [(p, m) for p, prov in setup.PROVIDERS.items() if prov.get('websocket_endpoint')
-                   for m in setup.get_models_for_backend(p, 'realtime-ws')]
-        # NeMo (first entry after the cloud catalog), default URL, default model
-        answers = iter([str(len(catalog) + 1), '', ''])
-        with (
-            mock.patch.object(setup, "Prompt", Answers),
-            mock.patch.object(setup, "Confirm", Confirms),
-            mock.patch.object(setup, "save_credential"),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            provider_id, model_id, api_key, custom_config = setup._prompt_realtime_provider_model_selection()
-        config = setup._generate_remote_config(provider_id, model_id, api_key, custom_config,
-                                               backend_type='realtime-ws')
-        self.assertEqual((provider_id, model_id, api_key), ('custom', 'nemotron-speech-streaming-en-0.6b', None))
-        self.assertEqual(config['websocket_url'], 'ws://127.0.0.1:8080/v1/realtime')
-        self.assertEqual(config['websocket_session_format'], 'flat')
-        self.assertEqual(config['websocket_sample_rate'], 16000)
-        self.assertEqual(config['websocket_live_text'], 'append_only')
-        self.assertIsNone(config['websocket_protocol'])
-        self.assertTrue(config['realtime_live_typing'])
-
-    def test_rest_custom_without_key_drops_the_previous_provider(self):
-        stale = {'rest_api_provider': 'openai'}
-        config = self._switch(stale, 'custom', None, None, {'endpoint': 'http://localhost:9000/asr'})
-        self.assertIsNone(config['rest_api_provider'])
-
-    def test_rest_switch_clears_the_legacy_plaintext_key(self):
-        # With no provider, the backend falls back to rest_api_key.
-        stale = {'rest_api_key': 'sk-openai-legacy'}
-        for args in (('custom', None, None, {'endpoint': 'http://localhost:9000/asr'}),
-                     ('openai', 'whisper-1', 'sk')):
-            with self.subTest(provider=args[0]):
-                self.assertIsNone(self._switch(stale, *args)['rest_api_key'])
-
-    def test_rest_custom_rerun_keeps_the_saved_key_on_enter(self):
-        class Answers:
-            @staticmethod
-            def ask(prompt, choices=None, default=None, **_kwargs):
-                if choices:
-                    return choices[-1]  # "Customize your own backend"
-                return 'http://localhost:9000/asr' if prompt == 'Endpoint URL' else ''
-
-        class AcceptDefaults:
-            @staticmethod
-            def ask(_prompt, default=None, **_kwargs):
-                return default
-
-        with (
-            mock.patch.object(setup, "Prompt", Answers),
-            mock.patch.object(setup, "Confirm", AcceptDefaults),
-            mock.patch.object(setup, "get_credential", return_value="sk-custom-saved"),
-            mock.patch.object(setup, "save_credential") as save,
-            mock.patch.object(setup.getpass, "getpass") as getpass,
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            provider_id, model_id, api_key, custom_config = setup._prompt_remote_provider_selection()
-        getpass.assert_not_called()
-        save.assert_not_called()
-        config = setup._generate_remote_config(provider_id, model_id, api_key, custom_config)
-        self.assertEqual(config['rest_api_provider'], 'custom')
-
-    def test_rest_known_provider_drops_custom_headers(self):
-        stale = {'rest_headers': {'Authorization': 'Bearer custom-secret'}}
-        config = self._switch(stale, 'openai', 'whisper-1', 'sk')
-        self.assertEqual(config['rest_headers'], {})
-
-    def test_rest_custom_without_body_drops_the_previous_body(self):
-        stale = {'rest_body': {'model': 'whisper-1'}}
-        config = self._switch(stale, 'custom', None, 'key', {'endpoint': 'http://localhost:9000/asr'})
-        self.assertEqual(config['rest_body'], {})
-
-    def test_rest_custom_switch_clears_stale_fallback_endpoints(self):
-        # A fallback left from a previous provider would receive the new
-        # provider's credential; setup_config merges, so it must be reset.
-        stale = {'rest_fallback_endpoint_urls': ['https://old.example/v1/audio/transcriptions']}
-        config = self._switch(stale, 'custom', None, 'key', {'endpoint': 'http://localhost:9000/asr'})
-        self.assertEqual(config['rest_fallback_endpoint_urls'], [])
-
-    def test_rest_rerun_on_same_endpoint_keeps_fallbacks(self):
-        fallbacks = ['https://mirror.example/v1/audio/transcriptions']
-        stale = {'rest_endpoint_url': 'http://localhost:9000/asr', 'rest_api_provider': 'custom',
-                 'rest_fallback_endpoint_urls': fallbacks}
-        config = self._switch(stale, 'custom', None, 'key', {'endpoint': 'http://localhost:9000/asr'},
-                              existing_cfg=stale)
-        self.assertEqual(config['rest_fallback_endpoint_urls'], fallbacks)
-
-    def test_rest_endpoint_change_clears_fallbacks_with_warning(self):
-        stale = {'rest_endpoint_url': 'http://localhost:9000/asr', 'rest_api_provider': 'custom',
-                 'rest_fallback_endpoint_urls': ['https://mirror.example/v1/audio/transcriptions']}
-        with mock.patch.object(setup, 'log_warning') as warn:
-            config = self._switch(stale, 'openai', 'whisper-1', 'sk', existing_cfg=stale)
-        self.assertEqual(config['rest_fallback_endpoint_urls'], [])
-        warn.assert_called_once()
-
-    def test_rest_known_provider_switch_clears_stale_fallback_endpoints(self):
-        stale = {'rest_fallback_endpoint_urls': ['https://old.example/v1/audio/transcriptions']}
-        config = self._switch(stale, 'openai', 'whisper-1', 'sk')
-        self.assertEqual(config['rest_fallback_endpoint_urls'], [])
 
 
 class ConfigDefaultTests(unittest.TestCase):
@@ -573,36 +108,23 @@ class UninstallYdotoolOwnershipTests(unittest.TestCase):
             calls.append(cmd)
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        redirected_paths = {
-            "USER_SYSTEMD_DIR": user_systemd,
-            "USER_HOME": root / "missing-home",
-            "USER_CONFIG_DIR": root / "missing-config",
-            "VENV_DIR": root / "missing-venv",
-            "PYWHISPERCPP_SRC_DIR": root / "missing-src",
-            "PYWHISPERCPP_MODELS_DIR": root / "missing-models",
-            "STATE_DIR": root / "missing-state",
-            "CREDENTIALS_FILE": root / "missing-creds",
-            "USER_BASE": root / "missing-user-base",
-        }
-        self.assertEqual(
-            _unredirected_path_globals(uninstall, redirected_paths),
-            [],
-            "uninstall gained a filesystem path this test does not redirect; it "
-            "would operate on the real machine",
-        )
-
         patches = [
-            mock.patch.object(uninstall, name, value)
-            for name, value in redirected_paths.items()
-        ]
-        patches += [
+            mock.patch.object(uninstall, "USER_SYSTEMD_DIR", user_systemd),
+            mock.patch.object(uninstall, "USER_HOME", root / "missing-home"),
+            mock.patch.object(uninstall, "USER_CONFIG_DIR", root / "missing-config"),
+            mock.patch.object(uninstall, "VENV_DIR", root / "missing-venv"),
+            mock.patch.object(uninstall, "PYWHISPERCPP_SRC_DIR", root / "missing-src"),
+            mock.patch.object(uninstall, "PYWHISPERCPP_MODELS_DIR", root / "missing-models"),
+            mock.patch.object(uninstall, "STATE_DIR", root / "missing-state"),
+            mock.patch.object(uninstall, "CREDENTIALS_FILE", root / "missing-creds"),
+            mock.patch.object(uninstall, "USER_BASE", root / "missing-user-base"),
+            mock.patch.object(uninstall, "setup_waybar"),
+            mock.patch.object(uninstall, "_detect_current_backend", return_value=None),
             mock.patch.object(uninstall, "run_command", side_effect=fake_run_command),
-            mock.patch.object(systemd, "run_command", side_effect=fake_run_command),
         ]
         with contextlib.ExitStack() as stack:
             for patch in patches:
                 stack.enter_context(patch)
-            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             uninstall.uninstall_command(skip_permissions=True, yes=True)
 
         return ydotool_unit, calls
@@ -684,58 +206,6 @@ class HyprlandBindingSetupTests(unittest.TestCase):
             content = bindings_file.read_text(encoding="utf-8")
             self.assertIn("/opt/hyprwhspr/config/hyprland/hyprwhspr-tray.sh record", content)
             self.assertIn(["hyprctl", "reload"], calls)
-
-    def test_lua_config_gets_snippet_instead_of_unloaded_conf_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            hypr_dir = root / ".config" / "hypr"
-            hypr_dir.mkdir(parents=True)
-            lua_config = hypr_dir / "hyprland.lua"
-            lua_config.write_text('hl.bind("SUPER + Q", hl.dsp.exec_cmd("kitty"))\n', encoding="utf-8")
-            hyprland_conf = hypr_dir / "hyprland.conf"
-            hyprland_conf.write_text("", encoding="utf-8")
-            output = io.StringIO()
-
-            with mock.patch.object(install, "USER_HOME", root), \
-                    mock.patch.object(install, "HYPRWHSPR_ROOT", "/opt/hyprwhspr"), \
-                    mock.patch.object(install.shutil, "which", return_value="/usr/bin/hyprctl"), \
-                    mock.patch.dict(install.os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "abc"}, clear=True), \
-                    mock.patch.object(install, "run_command") as run_command, \
-                    contextlib.redirect_stdout(output):
-                self.assertFalse(install._setup_hyprland_bindings())
-
-            run_command.assert_not_called()
-            self.assertFalse((hypr_dir / "bindings.conf").exists())
-            self.assertEqual(hyprland_conf.read_text(encoding="utf-8"), "")
-            self.assertIn(
-                'hl.bind("SUPER + ALT + D", hl.dsp.exec_cmd("/opt/hyprwhspr/config/hyprland/hyprwhspr-tray.sh record")',
-                output.getvalue())
-
-    def test_existing_lua_binding_still_gets_manual_instructions(self):
-        # Text matches cannot prove Lua code runs, so never report success.
-        binding = 'hl.bind("SUPER + ALT + D", hl.dsp.exec_cmd("/opt/hyprwhspr/config/hyprland/hyprwhspr-tray.sh record")'
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            hypr_dir = root / "xdg" / "hypr"
-            hypr_dir.mkdir(parents=True)
-            main = hypr_dir / "hyprland.lua"
-            main.write_text(binding + ")\n", encoding="utf-8")
-            output = io.StringIO()
-
-            with mock.patch.object(install, "USER_HOME", root), \
-                    mock.patch.object(install, "HYPRWHSPR_ROOT", "/opt/hyprwhspr"), \
-                    mock.patch.dict(install.os.environ, {"XDG_CONFIG_HOME": str(root / "xdg")}, clear=True), \
-                    mock.patch.object(install, "run_command") as run_command, \
-                    contextlib.redirect_stdout(output):
-                self.assertTrue(install._hyprland_uses_lua())
-                self.assertFalse(install._setup_hyprland_bindings())
-
-            run_command.assert_not_called()
-            self.assertFalse((hypr_dir / "bindings.conf").exists())
-            self.assertFalse((root / ".config").exists())
-            self.assertEqual(main.read_text(encoding="utf-8"), binding + ")\n")
-            self.assertIn("The shortcut stays off", output.getvalue())
-            self.assertIn(binding, output.getvalue())
 
 
 if __name__ == "__main__":

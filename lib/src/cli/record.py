@@ -3,7 +3,6 @@ Recording control commands for hyprwhspr (external hotkey integration)
 """
 
 import os
-import json
 import sys
 import socket
 
@@ -15,9 +14,9 @@ except ImportError:
                        SOCKET_FILE)
 
 try:
-    from ..output_control import log_info, log_success, log_error
+    from ..output_control import log_info, log_success, log_warning, log_error
 except ImportError:
-    from output_control import log_info, log_success, log_error
+    from output_control import log_info, log_success, log_warning, log_error
 
 
 def record_command(action: str, language: str = None):
@@ -31,7 +30,7 @@ def record_command(action: str, language: str = None):
     - Multiple keyboard tools that conflict with grab_keys
 
     Args:
-        action: The action to perform (start, stop, release, cancel, toggle, status)
+        action: The action to perform (start, stop, cancel, toggle, status)
         language: Optional language code for transcription (e.g., 'en', 'it', 'de')
     """
     import stat
@@ -99,37 +98,27 @@ def record_command(action: str, language: str = None):
     # Build start command with optional language
     start_cmd = f'start:{language}' if language else 'start'
 
-    # The status file lags the daemon, so it never gates these; the daemon
-    # ignores a start while recording and a stop/cancel while idle.
     if action == 'start':
-        expected = not is_recording()
+        if is_recording():
+            log_warning("Already recording")
+            return
         if send_control(start_cmd):
-            if expected:
-                msg = f"Recording started (language: {language})" if language else "Recording started"
-                log_success(msg)
-            else:
-                log_info("Start sent")
+            msg = f"Recording started (language: {language})" if language else "Recording started"
+            log_success(msg)
 
     elif action == 'stop':
-        expected = is_recording()
+        if not is_recording():
+            log_warning("Not currently recording")
+            return
         if send_control('stop'):
-            if expected:
-                log_success("Recording stopped")
-            else:
-                log_info("Stop sent")
-
-    elif action == 'release':
-        # A long push-to-talk hold may latch rather than stop, so don't claim either
-        if send_control('release'):
-            log_info("Release sent")
+            log_success("Recording stopped")
 
     elif action == 'cancel':
-        expected = is_recording()
+        if not is_recording():
+            log_warning("Not currently recording")
+            return
         if send_control('cancel'):
-            if expected:
-                log_success("Recording cancelled (audio discarded)")
-            else:
-                log_info("Cancel sent")
+            log_success("Recording cancelled (audio discarded)")
 
     elif action == 'toggle':
         if is_recording():
@@ -148,46 +137,10 @@ def record_command(action: str, language: str = None):
 
     else:
         log_error(f"Unknown action: {action}")
-        log_info("Available actions: start, stop, release, cancel, toggle, status")
+        log_info("Available actions: start, stop, cancel, toggle, status")
 
 
-def record_recovery_command(action: str):
-    """Request recovery once; never retry a potentially dispatched paste."""
-    if action not in ('copy-last', 'paste-last', 'clear-last'):
-        log_error('Unknown recovery action')
-        sys.exit(1)
-    request_sent = False
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(15.0)
-            client.connect(str(SOCKET_FILE))
-            client.sendall(json.dumps({'verb': action.replace('-', '_')}).encode('utf-8') + b'\n')
-            request_sent = True
-            response = bytearray()
-            while b'\n' not in response:
-                chunk = client.recv(4096)
-                if not chunk:
-                    raise ValueError('No complete response; update or restart the daemon')
-                response.extend(chunk)
-                if len(response) > 65536:
-                    raise ValueError('Invalid oversized daemon response')
-            result = json.loads(response.split(b'\n', 1)[0])
-            if not isinstance(result, dict) or not isinstance(result.get('ok'), bool):
-                raise ValueError('Invalid daemon response; update or restart the daemon')
-            if not result['ok']:
-                raise ValueError(result.get('error', 'Recovery unavailable; update or restart the daemon'))
-            log_success(result.get('message', 'Recovery completed'))
-    except TimeoutError:
-        log_error('Recovery timed out. No automatic retry was attempted.')
-        if request_sent and action == 'paste-last':
-            log_error('The paste may already have been dispatched; check the destination before retrying.')
-        sys.exit(1)
-    except (OSError, ValueError) as exc:
-        log_error(f'Recovery failed: {exc}. Check that the daemon is running and up to date.')
-        sys.exit(1)
-
-
-def record_capture_command(language: str = None, trace_processing: bool = False):
+def record_capture_command(language: str = None):
     """
     Connect to the capture socket, trigger a recording, stream the transcription to stdout.
 
@@ -196,7 +149,6 @@ def record_capture_command(language: str = None, trace_processing: bool = False)
 
     Args:
       language: Language code (e.g., 'en', 'it', 'fr') or None for auto-detect
-      trace_processing: Request daemon-side preprocessing diagnostics as JSON
     """
 
     if not SOCKET_FILE.exists():
@@ -208,7 +160,7 @@ def record_capture_command(language: str = None, trace_processing: bool = False)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.connect(str(SOCKET_FILE))
-            request = "capture_trace" if trace_processing else "capture"
+            request = "capture"
             if language:
                 request += f":{language}"
             request += "\n"

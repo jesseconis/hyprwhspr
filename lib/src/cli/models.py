@@ -4,9 +4,8 @@ ONNX-ASR, faster-whisper and Cohere transcribe model families
 """
 
 import os
+import subprocess
 from pathlib import Path
-
-from .onnx import resolve_model, prepare_model, orukeet_needs_onnx
 
 try:
     from ..config_manager import ConfigManager
@@ -19,25 +18,14 @@ except ImportError:
     from paths import RECORDING_CONTROL_FILE, MODEL_UNLOADED_FILE
 
 try:
-    from ..backend_installer import (VENV_DIR, PYWHISPERCPP_MODELS_DIR,
-                                     download_cohere_transcribe_model as _download_cohere,
-                                     download_qwen3_asr_model as _download_qwen,
-                                     set_install_state)
+    from ..backend_installer import VENV_DIR, PYWHISPERCPP_MODELS_DIR
 except ImportError:
-    from backend_installer import (VENV_DIR, PYWHISPERCPP_MODELS_DIR,
-                                   download_cohere_transcribe_model as _download_cohere,
-                                   download_qwen3_asr_model as _download_qwen,
-                                   set_install_state)
+    from backend_installer import VENV_DIR, PYWHISPERCPP_MODELS_DIR
 
 try:
-    from ..qwen3_asr_runtime import QWEN3_ASR_MODELS
+    from ..backend_utils import normalize_backend
 except ImportError:
-    from qwen3_asr_runtime import QWEN3_ASR_MODELS
-
-try:
-    from ..backend_utils import normalize_backend, COHERE_LANGUAGES
-except ImportError:
-    from backend_utils import normalize_backend, COHERE_LANGUAGES
+    from backend_utils import normalize_backend
 
 try:
     from ..credential_manager import get_credential
@@ -114,141 +102,76 @@ def _send_model_control(command: str) -> bool:
         return False
 
 
-def model_command(action: str, model_name: str = None) -> bool:
+def model_command(action: str, model_name: str = 'base'):
     """Handle model subcommands"""
     config = ConfigManager()
     backend = normalize_backend(config.get_setting('transcription_backend', 'pywhispercpp'))
-
-    explicit_model = model_name
-    model_name = model_name or 'base'
-
-    if action == 'download' and orukeet_needs_onnx(explicit_model, backend):
-        return False
 
     # unload / reload are valid for any local-model backend
     if action == 'unload':
         if backend in ('rest-api', 'realtime-ws'):
             log_error(f"Model unload not applicable for backend: {backend}")
-            log_info("Only local backends (pywhispercpp, faster-whisper, onnx-asr, cohere-transcribe, qwen3-asr) hold GPU memory.")
-            return False
+            log_info("Only local backends (pywhispercpp, faster-whisper, onnx-asr, cohere-transcribe) hold GPU memory.")
+            return
         if MODEL_UNLOADED_FILE.exists():
             log_warning("Model is already unloaded.")
             log_info("Reload it with: hyprwhspr model reload")
-            return True
+            return
         log_info("Sending model unload request to service...")
-        success = _send_model_control('model_unload')
-        if success:
+        if _send_model_control('model_unload'):
             log_success("Model unload requested — GPU resources will be freed.")
-        return success
+        return
 
     if action == 'reload':
         if backend in ('rest-api', 'realtime-ws'):
             log_error(f"Model reload not applicable for backend: {backend}")
-            return False
+            return
         if not MODEL_UNLOADED_FILE.exists():
             log_warning("Model does not appear to be unloaded.")
             log_info("Use this after: hyprwhspr model unload")
-            return False
+            return
         log_info("Sending model reload request to service...")
-        success = _send_model_control('model_reload')
-        if success:
+        if _send_model_control('model_reload'):
             log_success("Model reload requested — service will load model back into memory.")
-        return success
-
-    if backend == 'parakeet-cpp':
-        try:
-            from ..parakeet_cpp_runtime import MODEL_ID
-            from ..parakeet_cpp_installer import download_model as download_parakeet_model
-        except ImportError:
-            from parakeet_cpp_runtime import MODEL_ID
-            from parakeet_cpp_installer import download_model as download_parakeet_model
-        if explicit_model and explicit_model != MODEL_ID:
-            log_error(f'Parakeet.cpp supports only {MODEL_ID}')
-            return False
-        if action == 'download':
-            return download_parakeet_model(explicit_model or MODEL_ID)
-        if action == 'list':
-            print(f'Parakeet.cpp (experimental): {MODEL_ID}')
-            return True
-        if action == 'status':
-            parakeet_cpp_model_status(config)
-            return True
-        log_error(f'Unknown model action: {action}')
-        return False
-
-    if backend == 'qwen3-asr':
-        selected = explicit_model or config.get_setting('qwen3_asr_model', '1.7b-q8_0')
-        if action == 'download':
-            return _download_qwen(selected)
-        if action == 'list':
-            print("Available Qwen3-ASR models (decoder + projector):")
-            for name in QWEN3_ASR_MODELS:
-                marker = " (recommended)" if name == '1.7b-q8_0' else ""
-                print(f"  - {name}{marker}")
-            return True
-        if action == 'status':
-            qwen3_asr_model_status(config)
-            return True
-        log_error(f"Unknown model action: {action}")
-        return False
+        return
 
     if backend == 'faster-whisper':
         if action == 'download':
-            return download_faster_whisper_model(model_name)
+            download_faster_whisper_model(model_name)
         elif action == 'list':
             list_faster_whisper_models()
-            return True
         elif action == 'status':
             faster_whisper_model_status()
-            return True
         else:
             log_error(f"Unknown model action: {action}")
-            return False
     elif backend == 'onnx-asr':
         if action == 'list':
             list_onnx_asr_models()
-            return True
         elif action == 'status':
-            onnx_asr_model_status(config)
-            return True
+            onnx_asr_model_status()
         elif action == 'download':
-            settings = config.get_all_settings()
-            selection = resolve_model(settings, explicit_model)
-            if not prepare_model(selection):
-                return False
-            if selection[0] != resolve_model(settings)[0]:
-                log_info(f"{selection[0]} is ready but not selected; switch with 'hyprwhspr setup'.")
-            return True
+            log_info("Parakeet model is downloaded during setup.")
+            log_info("If the model is missing, re-run: hyprwhspr setup")
         else:
             log_error(f"Unknown model action: {action}")
-            return False
     elif backend == 'cohere-transcribe':
         if action == 'list':
             list_cohere_transcribe_models()
-            return True
         elif action == 'status':
-            cohere_transcribe_model_status(config)
-            return True
+            cohere_transcribe_model_status()
         elif action == 'download':
-            return download_cohere_transcribe_model()
+            download_cohere_transcribe_model()
         else:
             log_error(f"Unknown model action: {action}")
-            return False
-    elif backend in ('pywhispercpp', 'cpu', 'nvidia', 'amd', 'vulkan'):
+    else:
         if action == 'download':
-            return download_model(model_name)
+            download_model(model_name)
         elif action == 'list':
             list_models()
-            return True
         elif action == 'status':
             model_status()
-            return True
         else:
             log_error(f"Unknown model action: {action}")
-            return False
-    else:
-        log_error(f"Model {action} not applicable for backend: {backend}")
-        return False
 
 
 def download_model(model_name: str = 'base'):
@@ -292,80 +215,43 @@ def model_status():
         print(f"  - {model.name} ({size:.1f} MB)")
 
 
-def qwen3_asr_model_status(config=None):
-    """Report the Qwen3-ASR sidecar runtime and the configured model pair.
-
-    Takes an existing ConfigManager like cohere_transcribe_model_status does;
-    constructing its own printed a second "Configuration loaded" banner into
-    `hyprwhspr status`.
-    """
-    try:
-        from ..qwen3_asr_runtime import (DEFAULT_MODEL, LLAMA_CPP_RELEASE,
-                                         QWEN3_ASR_DEVICES, model_installed,
-                                         runtime_installed)
-    except ImportError:
-        from qwen3_asr_runtime import (DEFAULT_MODEL, LLAMA_CPP_RELEASE,
-                                       QWEN3_ASR_DEVICES, model_installed,
-                                       runtime_installed)
-    devices = [d for d in QWEN3_ASR_DEVICES if runtime_installed(d)]
-    if devices:
-        log_success(f"llama.cpp runtime {LLAMA_CPP_RELEASE}: {', '.join(devices)}")
-    else:
-        log_warning(f"llama.cpp runtime {LLAMA_CPP_RELEASE} is not installed")
-        log_info("Run 'hyprwhspr setup' to install the Qwen3-ASR sidecar.")
-
-    # Only the configured pair is a health signal; the others are alternatives,
-    # so warning about them made every healthy install look broken.
-    config = config or ConfigManager()
-    configured = config.get_setting('qwen3_asr_model', DEFAULT_MODEL)
-    if model_installed(configured):
-        log_success(f"Model installed: {configured}")
-    else:
-        log_warning(f"Configured model not installed: {configured}")
-        log_info("Run 'hyprwhspr model download' to fetch the decoder/projector pair.")
-    others = [n for n in QWEN3_ASR_MODELS if n != configured and model_installed(n)]
-    if others:
-        log_info(f"Also present: {', '.join(others)}")
-
-
-def onnx_asr_model_status(config=None):
-    """Check the configured ONNX model's local cache without downloading."""
-    config = config or ConfigManager()
-    selected = config.get_setting('onnx_asr_model', 'nemo-parakeet-tdt-0.6b-v3')
-    log_info(f'Configured ONNX model: {selected}')
-    try:
-        from ..orukeet import hub_cache_dir, cache_state
-    except ImportError:
-        from orukeet import hub_cache_dir, cache_state
-    # Status only reads the cache; hashing and repair belong to model download.
-    if selected == 'orukeet':
-        state = cache_state()
-        if state == 'verified':
-            log_success("Orukeet model present and verified")
-        elif state == 'unverified':
-            log_info("Orukeet present, not yet verified: hyprwhspr model download")
-        else:
-            log_warning("Orukeet not downloaded: hyprwhspr model download")
+def onnx_asr_model_status():
+    """Check Parakeet/onnx-asr model in Hugging Face cache (~/.cache/huggingface/hub/)"""
+    hf_hub_dir = Path.home() / '.cache' / 'huggingface' / 'hub'
+    if not hf_hub_dir.exists():
+        log_warning("Hugging Face cache directory does not exist (~/.cache/huggingface/hub/)")
+        log_info("Parakeet model is downloaded on first use when the backend starts.")
         return
-    root = hub_cache_dir()
-    # onnx-asr aliases mostly resolve to istupakov/<name without nemo->-onnx.
-    repo = selected if '/' in selected else f"istupakov/{selected.removeprefix('nemo-')}-onnx"
-    cache = root / ('models--' + repo.replace('/', '--'))
-    if (cache / 'snapshots').is_dir():
-        log_info(f'Cache files present (initialization not checked): {cache}')
-    elif '/' in selected or selected == 'nemo-parakeet-tdt-0.6b-v3':
-        log_warning(f'No matching cache found for {selected} in {root}')
-    else:
-        # A few aliases share or rename their repo, so a miss is not proof of absence.
-        log_info(f'No cache folder found for {selected} (looked for {cache.name})')
-    log_info("Verify readiness with: hyprwhspr model download")
+
+    # Parakeet TDT 0.6B v3: HF repo is nvidia/parakeet-tdt-0.6b-v3 -> cache: models--nvidia--parakeet-tdt-0.6b-v3
+    parakeet_patterns = ['models--nvidia--parakeet-tdt-0.6b-v3', 'models--*parakeet*']
+    found = []
+    seen = set()
+    for pattern in parakeet_patterns:
+        for model_dir in sorted(hf_hub_dir.glob(pattern)):
+            if model_dir.is_dir() and model_dir.resolve() not in seen:
+                seen.add(model_dir.resolve())
+                found.append(model_dir)
+    if not found:
+        log_warning("No Parakeet model found in ~/.cache/huggingface/hub/")
+        log_info("Model not found. Re-run: hyprwhspr setup to download it.")
+        return
+
+    print("Parakeet (onnx-asr) model cache:")
+    for model_dir in found:
+        total_bytes = sum(f.stat().st_size for f in model_dir.rglob('*') if f.is_file())
+        size_mb = total_bytes / (1024 * 1024)
+        if size_mb >= 1024:
+            size_str = f"{size_mb / 1024:.1f} GB"
+        else:
+            size_str = f"{size_mb:.0f} MB"
+        log_success(f"  {model_dir.name} ({size_str})")
 
 
 def list_onnx_asr_models():
-    """List supported onnx-asr model choices."""
+    """List Parakeet/onnx-asr model option (single supported model for now)."""
     print("Parakeet (onnx-asr) model:\n")
     print("  - nemo-parakeet-tdt-0.6b-v3  (~1 GB, downloaded during setup)")
-    print("  - orukeet  (~672 MB INT8, optional; select under Parakeet in setup)")
     print()
     print("Storage: ~/.cache/huggingface/hub/")
     print("To check if the model is cached: hyprwhspr model status")
@@ -374,7 +260,7 @@ def list_onnx_asr_models():
 
 # ==================== Cohere Transcribe Model Commands ====================
 
-def cohere_transcribe_model_status(config=None):
+def cohere_transcribe_model_status():
     """Check Cohere Transcribe model in Hugging Face cache (~/.cache/huggingface/hub/)"""
     hf_hub_dir = Path.home() / '.cache' / 'huggingface' / 'hub'
     model_cache = hf_hub_dir / 'models--CohereLabs--cohere-transcribe-03-2026'
@@ -387,18 +273,6 @@ def cohere_transcribe_model_status(config=None):
     total_bytes = sum(f.stat().st_size for f in model_cache.rglob('*') if f.is_file())
     size_gb = total_bytes / (1024 ** 3)
     log_success(f"  {model_cache.name} ({size_gb:.1f} GB)")
-
-    # This model has no language detection, so the effective language is worth
-    # showing: it is otherwise only visible in the journal.
-    config = config or ConfigManager(verbose=False)
-    language = (config.get_setting('language', None) or '').lower()
-    if not language:
-        log_info("  Language: en (default; this model cannot auto-detect)")
-    elif language in COHERE_LANGUAGES:
-        log_info(f"  Language: {language}")
-    else:
-        log_warning(f"  Language: {language} - unsupported, transcription will fail")
-        log_info(f"  Supported: {' '.join(COHERE_LANGUAGES)}")
 
 
 def list_cohere_transcribe_models():
@@ -418,25 +292,44 @@ def download_cohere_transcribe_model():
         log_warning("No HuggingFace token found.")
         log_info("Run hyprwhspr setup to provide your token, or accept the model license at:")
         log_info("  https://huggingface.co/CohereLabs/cohere-transcribe-03-2026")
-        return False
+        return
+
+    from backend_installer import install_backend
 
     venv_python = VENV_DIR / 'bin' / 'python'
     if not venv_python.exists():
         log_error("Cohere Transcribe venv not found. Run: hyprwhspr setup")
-        return False
+        return
 
+    import subprocess, os
+    download_script = '''
+try:
+    from huggingface_hub import enable_progress_bars
+    enable_progress_bars()
+except ImportError:
+    pass
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+import torch, os, sys
+model_id = "CohereLabs/cohere-transcribe-03-2026"
+token = os.environ.get("HF_TOKEN") or None
+print("Downloading processor...", flush=True)
+AutoProcessor.from_pretrained(model_id, trust_remote_code=True, token=token)
+print("Downloading model weights (~4 GB)...", flush=True)
+sys.stdout.flush()
+model = AutoModelForSpeechSeq2Seq.from_pretrained(
+    model_id, trust_remote_code=True, dtype=torch.bfloat16,
+    low_cpu_mem_usage=True, token=token,
+)
+del model
+print("Done.", flush=True)
+'''
+    env = {**os.environ, 'HF_TOKEN': hf_token, 'PYTHONUNBUFFERED': '1'}
     log_info("Downloading Cohere Transcribe model (~4 GB)...")
-    success, diagnostic = _download_cohere(hf_token)
-    if success:
+    result = subprocess.run([str(venv_python), '-c', download_script], env=env)
+    if result.returncode == 0:
         log_success("Model downloaded and cached successfully")
-        set_install_state('completed')
-        return True
     else:
-        error = diagnostic or "Download failed — check your HuggingFace token and license acceptance"
-        log_error(error)
-        set_install_state('failed', error)
-        log_info("Run this command again to resume the cached download.")
-        return False
+        log_error("Download failed — check your HuggingFace token and license acceptance")
 
 
 # ==================== faster-whisper Model Commands ====================
@@ -501,21 +394,14 @@ def faster_whisper_model_status():
         log_warning("No faster-whisper models downloaded yet.")
         return
 
-    # faster-whisper resolves model names across HF namespaces: the classic
-    # Systran/faster-whisper-* family and the newer mobiuslabsgmbh/
-    # faster-whisper-* family (large-v3-turbo, turbo). Scan the whole
-    # 'models--*--faster-whisper-*' pattern instead of hardcoding Systran.
-    model_dirs = sorted(
-        hf_hub_dir.glob('models--*--faster-whisper-*'),
-        key=lambda d: d.name)
+    model_dirs = sorted(hf_hub_dir.glob('models--Systran--faster-whisper-*'))
     if not model_dirs:
         log_warning("No faster-whisper models found in ~/.cache/huggingface/hub/")
         return
 
     print("Installed faster-whisper models:")
     for model_dir in model_dirs:
-        model_name = model_dir.name.split('--', 2)[-1]
-        model_name = model_name.replace('faster-whisper-', '', 1)
+        model_name = model_dir.name.replace('models--Systran--faster-whisper-', '')
         # Calculate total size
         total_bytes = sum(f.stat().st_size for f in model_dir.rglob('*') if f.is_file())
         size_mb = total_bytes / (1024 * 1024)
@@ -524,21 +410,3 @@ def faster_whisper_model_status():
         else:
             size_str = f"{size_mb:.0f} MB"
         print(f"  - {model_name} ({size_str})")
-
-
-def parakeet_cpp_model_status(config=None):
-    try:
-        from .. import parakeet_cpp_runtime as runtime
-    except ImportError:
-        import parakeet_cpp_runtime as runtime
-    config = config or ConfigManager()
-    print(f'Parakeet.cpp {runtime.RELEASE} (experimental), ABI {runtime.ABI_VERSION}')
-    print(f'Model: {runtime.MODEL_ID} — {"present" if runtime.model_installed() else "missing"}')
-    try:
-        device = runtime.resolve_device(config, probe=False)
-        path = runtime.library_path(device)
-        ok, detail = runtime.probe_library(path) if path.is_file() else (False, 'missing')
-        print(f'Runtime: {device} — {"ready" if ok else detail}')
-    except (RuntimeError, ValueError, OSError) as exc:
-        print(f'Runtime unavailable: {exc}')
-    print('Repair with hyprwhspr setup → Parakeet → Parakeet.cpp → reinstall.')

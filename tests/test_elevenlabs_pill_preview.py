@@ -1,7 +1,6 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,17 +67,6 @@ class ElevenLabsClientPreviewTests(unittest.TestCase):
         self.client._emit_partial_transcript()
 
         self.assertEqual(previews[-1], "This is already committed and live")
-
-    def test_cjk_preview_matches_what_gets_injected(self):
-        previews = []
-        self.client.set_partial_transcript_callback(previews.append)
-        with self.client.lock:
-            self.client._committed_segments = ["你好"]
-            self.client._partial_transcript = "世界"
-
-        self.client._emit_partial_transcript()
-
-        self.assertEqual(previews[-1], "你好世界")
 
     def test_callback_survives_connection_replacement(self):
         previews = []
@@ -167,29 +155,6 @@ class ElevenLabsRealtimePreviewTests(unittest.TestCase):
 
         self.assertIsNotNone(self.client.callback)
 
-    def test_gpt_live_transcribe_preview_is_enabled_for_waveform(self):
-        self.manager.config.values.update({
-            "websocket_provider": "openai",
-            "websocket_model": "gpt-live-transcribe",
-            "mic_osd_style": "waveform",
-        })
-
-        self._apply()
-
-        self.assertIsNotNone(self.client.callback)
-
-    def test_gpt_transcribe_preview_is_not_enabled_for_waveform(self):
-        self.manager.config.values.update({
-            "websocket_provider": "openai",
-            "websocket_model": "gpt-transcribe",
-            "mic_osd_style": "waveform",
-        })
-
-        previews = self._apply()
-
-        self.assertIsNone(self.client.callback)
-        self.assertEqual(previews, [""])
-
     def test_openai_preview_is_also_shown_in_pill(self):
         self.manager.config.values.update({
             "websocket_provider": "openai",
@@ -227,79 +192,6 @@ class ElevenLabsRealtimePreviewTests(unittest.TestCase):
         previews = self._apply()
 
         self.assertEqual(previews, [""])
-
-
-class OpenAIRealtimeModeTests(unittest.TestCase):
-    def test_dedicated_transcription_models_reject_converse_mode(self):
-        for model in (
-            "gpt-transcribe",
-            "gpt-live-transcribe",
-            "gpt-realtime-whisper",
-        ):
-            with self.subTest(model=model):
-                config = FakeConfig({
-                    "websocket_provider": "openai",
-                    "websocket_model": model,
-                    "realtime_mode": "converse",
-                })
-                backend = RealtimeWsBackend(FakeManager(config))
-
-                with mock.patch(
-                    "backends.realtime_ws_backend.get_credential",
-                    return_value="sk-test-openai-key",
-                ):
-                    self.assertFalse(backend.initialize())
-
-                self.assertIsNone(backend._realtime_client)
-
-
-class OpenAIRealtimePromptTests(unittest.TestCase):
-    def test_active_language_selects_existing_whisper_prompt_fallback(self):
-        cases = (
-            (
-                "language-specific prompt",
-                {
-                    "whisper_prompt": "Global prompt",
-                    "whisper_prompt_de": "German prompt",
-                },
-                "German prompt",
-            ),
-            (
-                "global fallback",
-                {"whisper_prompt": "Global prompt"},
-                "Global prompt",
-            ),
-            (
-                "empty language-specific fallback",
-                {
-                    "whisper_prompt": "Global prompt",
-                    "whisper_prompt_de": "",
-                },
-                "Global prompt",
-            ),
-            ("omitted", {"whisper_prompt": ""}, None),
-        )
-
-        for model in ("gpt-transcribe", "gpt-live-transcribe"):
-            for name, prompt_config, expected_prompt in cases:
-                with self.subTest(model=model, name=name):
-                    config = FakeConfig({
-                        "websocket_provider": "openai",
-                        "websocket_model": model,
-                        **prompt_config,
-                    })
-                    backend = RealtimeWsBackend(FakeManager(config))
-                    client = mock.Mock()
-                    client.model = model
-                    backend._realtime_client = client
-
-                    backend.update_language("de")
-
-                    client.update_transcription_config.assert_called_once_with(
-                        "de",
-                        expected_prompt,
-                    )
-                    client.update_language.assert_not_called()
 
 
 if __name__ == "__main__":

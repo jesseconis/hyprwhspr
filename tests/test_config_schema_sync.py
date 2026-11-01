@@ -1,15 +1,9 @@
 import json
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
-
-try:
-    import jsonschema
-except ImportError:  # optional here: only the validator cases need it
-    jsonschema = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,53 +33,6 @@ class ConfigSchemaSyncTests(unittest.TestCase):
         )
         cls.schema_properties = schema["properties"]
         cls.schema_keys = set(cls.schema_properties) - {"$schema"}
-        # Exercise the full bundled schema contract, including declared URI
-        # formats, rather than only checking default-key synchronization.
-        cls.validator = jsonschema and jsonschema.Draft202012Validator(
-            schema, format_checker=jsonschema.FormatChecker()
-        )
-
-    def _errors(self, instance):
-        if self.validator is None:
-            self.skipTest('jsonschema is not installed')
-        return list(self.validator.iter_errors(instance))
-
-    def test_rest_endpoint_url_is_not_pattern_validated(self):
-        # The runtime supports environment-token indirection and normalizes the
-        # URL at use, so the schema must not reject the primary by pattern.
-        for value in (
-            None,
-            "http://example.com/transcribe",
-            "https://example.com/transcribe",
-            "example.com/transcribe",
-            "not a url",
-            "ftp://example.com/transcribe",
-            "env:MY_TRANSCRIBE_ENDPOINT",
-            "",
-        ):
-            with self.subTest(value=value):
-                self.assertEqual(self._errors({"rest_endpoint_url": value}), [], value)
-
-    def test_rest_fallback_endpoint_urls_accept_http_scheme(self):
-        instance = {
-            "rest_fallback_endpoint_urls": [
-                "http://a.example/v1/audio/transcriptions",
-                "https://b.example/v1/audio/transcriptions",
-            ]
-        }
-        self.assertEqual(self._errors(instance), [])
-
-    def test_rest_fallback_endpoint_urls_reject_invalid_entries(self):
-        for value in (
-            ["example.com/v1/audio/transcriptions"],   # scheme-less
-            ["ftp://example.com/v1/audio/transcriptions"],  # wrong scheme
-            ["not a url"],                              # invalid
-            [""],                                       # minLength
-            [None],                                     # explicit null is a type error
-            ["https://a.example/v1", "https://a.example/v1"],  # uniqueItems
-        ):
-            with self.subTest(value=value):
-                self.assertTrue(self._errors({"rest_fallback_endpoint_urls": value}), value)
 
     def test_every_default_has_a_schema_entry(self):
         self.assertEqual(sorted(self.defaults - self.schema_keys), [])
@@ -117,22 +64,6 @@ class ConfigSchemaSyncTests(unittest.TestCase):
             if json_type == "integer" and "number" in accepted:
                 json_type = "number"
             self.assertIn(json_type, accepted, key)
-
-    def test_realtime_client_conversation_history_default_matches_schema(self):
-        # RealtimeClient carries its own fallback, so a schema-only change would
-        # otherwise ship green while the client kept the previous behaviour.
-        sys.path.insert(0, str(ROOT / "lib" / "src"))
-        from realtime_client import RealtimeClient
-
-        expected = self.schema_properties["realtime_conversation_history"]["default"]
-        # websocket-client is optional; this checks defaults, not the transport.
-        stub = types.SimpleNamespace(WebSocketApp=object)
-        with mock.patch.dict(sys.modules, {"websocket": stub}):
-            self.assertEqual(RealtimeClient(mode="converse").conversation_history, expected)
-
-            client = RealtimeClient(mode="converse")
-            client.set_conversation_history("nonsense")
-            self.assertEqual(client.conversation_history, expected)
 
 
 if __name__ == "__main__":

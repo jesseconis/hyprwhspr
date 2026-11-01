@@ -1,17 +1,9 @@
 import ast
-import functools
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-@functools.lru_cache(maxsize=None)
-def _app_trees():
-    """main.py plus the lib/src/app/ mixins that make up hyprwhsprApp."""
-    paths = [ROOT / "lib" / "main.py", *sorted((ROOT / "lib" / "src" / "app").glob("*.py"))]
-    return [ast.parse(path.read_text(encoding="utf-8")) for path in paths]
 
 
 class MainStartupSafetyTests(unittest.TestCase):
@@ -21,14 +13,15 @@ class MainStartupSafetyTests(unittest.TestCase):
                 return node
         return None
 
-    def _find_app_function(self, name):
-        """The one definition of an app method, wherever it lives."""
-        found = [
-            node for tree in _app_trees() for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == name
-        ]
-        self.assertEqual(len(found), 1, f"expected one definition of {name}")
-        return found[0]
+    def test_shutdown_does_not_overwrite_external_config_edits(self):
+        tree = ast.parse((ROOT / "lib" / "main.py").read_text(encoding="utf-8"))
+        cleanup = self._find_function(tree, "_cleanup")
+        self.assertIsNotNone(cleanup)
+        for node in ast.walk(cleanup):
+            if isinstance(node, ast.Attribute):
+                self.assertNotEqual(node.attr, "save_config")
+            if isinstance(node, ast.Constant):
+                self.assertNotEqual(node.value, "save_config")
 
     def test_realtime_partial_callback_registration_is_guarded(self):
         tree = ast.parse((ROOT / "lib" / "main.py").read_text(encoding="utf-8"))
@@ -57,7 +50,9 @@ class MainStartupSafetyTests(unittest.TestCase):
         self.assertTrue(guarded)
 
     def test_show_mic_osd_clears_preview_before_showing(self):
-        show_func = self._find_app_function("_show_mic_osd")
+        tree = ast.parse((ROOT / "lib" / "main.py").read_text(encoding="utf-8"))
+
+        show_func = self._find_function(tree, "_show_mic_osd")
         self.assertIsNotNone(show_func)
 
         clear_line = None
@@ -75,7 +70,9 @@ class MainStartupSafetyTests(unittest.TestCase):
         self.assertLess(clear_line, show_line)
 
     def test_stop_recording_clears_preview_before_processing_state(self):
-        stop_func = self._find_app_function("_stop_recording")
+        tree = ast.parse((ROOT / "lib" / "main.py").read_text(encoding="utf-8"))
+
+        stop_func = self._find_function(tree, "_stop_recording")
         self.assertIsNotNone(stop_func)
 
         clear_line = None
@@ -99,7 +96,9 @@ class MainStartupSafetyTests(unittest.TestCase):
         self.assertLess(clear_line, processing_line)
 
     def test_reset_stale_state_scrubs_transcript_preview(self):
-        reset_func = self._find_app_function("_reset_stale_state")
+        tree = ast.parse((ROOT / "lib" / "main.py").read_text(encoding="utf-8"))
+
+        reset_func = self._find_function(tree, "_reset_stale_state")
         self.assertIsNotNone(reset_func)
 
         references_preview_file = any(
@@ -111,7 +110,7 @@ class MainStartupSafetyTests(unittest.TestCase):
     def test_migrate_legacy_state_files_creates_compat_symlinks(self):
         tree = ast.parse((ROOT / "lib" / "main.py").read_text(encoding="utf-8"))
 
-        migrate_func = self._find_app_function("_migrate_legacy_state_files")
+        migrate_func = self._find_function(tree, "_migrate_legacy_state_files")
         self.assertIsNotNone(migrate_func)
 
         calls_symlink = any(
@@ -145,7 +144,9 @@ class MainStartupSafetyTests(unittest.TestCase):
         self.assertTrue(called_from_init)
 
     def test_cancel_cleanup_clears_transcript_preview(self):
-        cleanup_func = self._find_app_function("_cleanup_recording_state")
+        tree = ast.parse((ROOT / "lib" / "main.py").read_text(encoding="utf-8"))
+
+        cleanup_func = self._find_function(tree, "_cleanup_recording_state")
         self.assertIsNotNone(cleanup_func)
 
         clears_preview = any(
@@ -157,7 +158,9 @@ class MainStartupSafetyTests(unittest.TestCase):
         self.assertTrue(clears_preview)
 
     def test_process_audio_finally_clears_transcript_preview(self):
-        process_func = self._find_app_function("_process_audio")
+        tree = ast.parse((ROOT / "lib" / "main.py").read_text(encoding="utf-8"))
+
+        process_func = self._find_function(tree, "_process_audio")
         self.assertIsNotNone(process_func)
 
         clears_in_finally = False
@@ -176,27 +179,30 @@ class MainStartupSafetyTests(unittest.TestCase):
         self.assertTrue(clears_in_finally)
 
     def test_inject_text_checks_injector_result_before_success_log(self):
-        inject_func = self._find_app_function("_inject_text")
+        tree = ast.parse((ROOT / "lib" / "main.py").read_text(encoding="utf-8"))
+
+        inject_func = self._find_function(tree, "_inject_text")
         self.assertIsNotNone(inject_func)
 
         result_checked_line = None
         success_log_line = None
         for node in ast.walk(inject_func):
             if (
-                isinstance(node, ast.Assign)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Attribute)
-                and node.value.func.attr == "inject_text"
+                isinstance(node, ast.UnaryOp)
+                and isinstance(node.op, ast.Not)
+                and isinstance(node.operand, ast.Call)
+                and isinstance(node.operand.func, ast.Attribute)
+                and node.operand.func.attr == "inject_text"
             ):
                 result_checked_line = node.lineno
             elif (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id in ("print", "log")
+                and node.func.id == "print"
                 and node.args
                 and isinstance(node.args[0], ast.JoinedStr)
                 and any(
-                    isinstance(part, ast.Constant) and "[INJECT] Injection dispatched" in str(part.value)
+                    isinstance(part, ast.Constant) and "[INJECT] Text injected" in str(part.value)
                     for part in node.args[0].values
                 )
             ):
@@ -205,78 +211,6 @@ class MainStartupSafetyTests(unittest.TestCase):
         self.assertIsNotNone(result_checked_line)
         self.assertIsNotNone(success_log_line)
         self.assertLess(result_checked_line, success_log_line)
-
-    def test_process_audio_success_reflects_injection_outcome(self):
-        process_func = self._find_app_function("_process_audio")
-        self.assertIsNotNone(process_func)
-
-        hardcoded_success_after_injection = False
-        success_compares_outcome = False
-        for node in ast.walk(process_func):
-            if not (isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "success" for t in node.targets
-            )):
-                continue
-            if isinstance(node.value, ast.Constant) and node.value.value is True:
-                hardcoded_success_after_injection = True
-            if (
-                isinstance(node.value, ast.Compare)
-                and isinstance(node.value.left, ast.Name)
-                and node.value.left.id == "outcome"
-            ):
-                success_compares_outcome = True
-
-        self.assertFalse(
-            hardcoded_success_after_injection,
-            "success must be derived from _inject_text's outcome, not hardcoded True",
-        )
-        self.assertTrue(
-            success_compares_outcome,
-            "success should compare the injection outcome (e.g. against InjectionOutcome.FAILED)",
-        )
-
-    def test_capture_completion_is_centralized_for_trace_json(self):
-        trees = _app_trees()
-        direct_calls = []
-        for function in (
-            node for tree in trees for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef)
-        ):
-            for node in ast.walk(function):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "notify_capture"
-                    and isinstance(node.func.value, ast.Attribute)
-                    and node.func.value.attr == "_recording_control_server"
-                ):
-                    direct_calls.append(function.name)
-        self.assertEqual(direct_calls, ["_notify_capture"])
-
-        attributes = {
-            node.attr for tree in trees for node in ast.walk(tree)
-            if isinstance(node, ast.Attribute)
-        }
-        self.assertNotIn("current_transcription", attributes)
-
-    def test_continuous_flush_distinguishes_consumed_from_injected(self):
-        flush_func = self._find_app_function("_continuous_flush_audio")
-        self.assertIsNotNone(flush_func)
-
-        references_consumed = any(
-            isinstance(node, ast.Attribute) and node.attr == "CONSUMED"
-            for node in ast.walk(flush_func)
-        )
-        references_injected = any(
-            isinstance(node, ast.Attribute) and node.attr == "INJECTED"
-            for node in ast.walk(flush_func)
-        )
-
-        self.assertTrue(
-            references_consumed and references_injected,
-            "continuous-mode flush should branch on InjectionOutcome instead of "
-            "unconditionally logging every transcription as pasted",
-        )
 
 
 if __name__ == "__main__":

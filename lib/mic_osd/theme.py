@@ -33,6 +33,12 @@ DEFAULT_COLORS = {
     'bar-color-right': (0.0, 1.0, 0.6),     # Green
     'recording-dot': (1.0, 0.2, 0.33),      # Red
     'text-color': (0.8, 0.84, 0.96, 1.0),   # Light gray
+    # Spectrum gradient: center/base -> outer peak. The neon default remains
+    # CSS-overridable through the same theme boundary as every other style.
+    'spectrum-base': (57 / 255, 1.0, 20 / 255),
+    'spectrum-middle': (0.0, 217 / 255, 1.0),
+    'spectrum-high': (157 / 255, 78 / 255, 221 / 255),
+    'spectrum-peak': (1.0, 43 / 255, 214 / 255),
     # State-specific colors for visualizer
     'paused-dot': (1.0, 0.75, 0.0),         # Amber
     'processing-dot': (0.2, 0.9, 0.4),      # Green
@@ -220,6 +226,15 @@ class Theme:
         return color
 
     @property
+    def spectrum_colors(self):
+        return (
+            self.get('spectrum-base'),
+            self.get('spectrum-middle'),
+            self.get('spectrum-high'),
+            self.get('spectrum-peak'),
+        )
+
+    @property
     def paused_dot(self):
         color = self.get('paused-dot')
         if len(color) == 3:
@@ -256,8 +271,8 @@ class ThemeWatcher:
     """
     Watches for theme changes and reloads the theme.
 
-    Two signals are polled every second, only while the OSD is visible
-    (resume() catches up on anything that changed while hidden):
+    Two signals are polled every second (negligible overhead, theme changes
+    are rare):
     - The shell-rendered CSS (SHELL_THEME_CSS) mtime — rewritten by e.g.
       Noctalia's template engine whenever its palette changes.
     - The Omarchy theme symlink target — Omarchy uses `ln -nsf` to atomically
@@ -300,17 +315,8 @@ class ThemeWatcher:
         self._timer_id = GLib.timeout_add(1000, self._check_theme)
         return True
 
-    def resume(self):
-        """Apply any change made while paused, then poll again."""
-        from gi.repository import GLib
-
-        if self._timer_id:
-            return
-        self._check_theme()
-        self._timer_id = GLib.timeout_add(1000, self._check_theme)
-
     def stop(self):
-        """Stop polling; the baseline is kept, so resume() sees what changed."""
+        """Stop polling."""
         from gi.repository import GLib
 
         if self._timer_id:

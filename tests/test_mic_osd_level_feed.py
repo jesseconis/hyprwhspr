@@ -19,6 +19,8 @@ sys.path.insert(0, str(ROOT / "lib"))
 
 from unittest import mock
 
+# Keep this dependency-free suite from probing PortAudio during module import.
+sys.modules.setdefault("sounddevice", mock.Mock())
 from mic_osd.audio import FeedLevelSource, AudioMonitor
 from mic_osd.runner import MicOSDRunner
 import mic_osd.runner as runner_module
@@ -153,17 +155,13 @@ class GetVizFrameTests(unittest.TestCase):
 
     def _make_capture(self):
         sys.path.insert(0, str(ROOT / "lib" / "src"))
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "_viz_audio_capture", ROOT / "lib" / "src" / "audio_capture.py")
-        audio_capture = importlib.util.module_from_spec(spec)
-        with mock.patch.dict(sys.modules, {"sounddevice": mock.Mock()}):
-            spec.loader.exec_module(audio_capture)
+        import audio_capture
         capture = object.__new__(audio_capture.AudioCapture)
         capture.lock = threading.Lock()
         capture._viz_chunk = None
         capture._viz_chunk_time = 0.0
         capture.current_level = 0.0
+        capture.sample_rate = 16000
         return capture
 
     def test_returns_none_without_chunk(self):
@@ -215,6 +213,34 @@ class GetVizFrameTests(unittest.TestCase):
         self.assertEqual(len(buckets), 2)
         self.assertAlmostEqual(buckets[0], 0.2, places=5)
 
+    def test_spectrum_frame_uses_log_frequency_buckets(self):
+        capture = self._make_capture()
+        sample_count = 2048
+        times = np.arange(sample_count, dtype=np.float64) / capture.sample_rate
+        capture._viz_chunk = (
+            0.2 * np.sin(2 * np.pi * 440.0 * times)
+        ).astype(np.float32)
+        capture._viz_chunk_time = time.monotonic()
+        capture.current_level = 0.1
+
+        frame = capture.get_spectrum_frame(num_buckets=48)
+
+        self.assertIsNotNone(frame)
+        level, buckets = frame
+        self.assertEqual(level, 1.0)
+        self.assertEqual(len(buckets), 48)
+        peak_index = int(np.argmax(buckets))
+        edges = np.geomspace(70.0, 8000.0, 49)
+        self.assertLessEqual(edges[peak_index], 440.0)
+        self.assertGreaterEqual(edges[peak_index + 1], 440.0)
+
+    def test_spectrum_frame_rejects_stale_audio(self):
+        capture = self._make_capture()
+        capture._viz_chunk = np.ones(1024, dtype=np.float32)
+        capture._viz_chunk_time = time.monotonic() - 2.0
+
+        self.assertIsNone(capture.get_spectrum_frame())
+
 
 class AudioMonitorSampleRateTests(unittest.TestCase):
     """The fallback monitor must use the device's native rate, not a hardcoded
@@ -248,60 +274,6 @@ class AudioMonitorSampleRateTests(unittest.TestCase):
         with mock.patch.object(audio_module, "sd", fake_sd):
             AudioMonitor(samplerate=44100).start()
         self.assertEqual(opened["samplerate"], 44100)
-
-
-class AudioMonitorPortAudioLifecycleTests(unittest.TestCase):
-    """PortAudio stream teardown and shutdown must not crash the helper (#282)."""
-
-    def test_feed_only_import_does_not_load_portaudio(self):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "_lazy_sd_audio", ROOT / "lib" / "mic_osd" / "audio.py")
-        module = importlib.util.module_from_spec(spec)
-        with mock.patch.dict(sys.modules):
-            sys.modules.pop("sounddevice", None)
-            spec.loader.exec_module(module)
-            self.assertNotIn("sounddevice", sys.modules)
-        self.assertIsNone(module.sd)
-
-    def test_stop_closes_even_when_stop_raises(self):
-        stream = mock.Mock()
-        stream.stop.side_effect = RuntimeError("device disconnected")
-        monitor = AudioMonitor()
-        monitor.stream = stream
-        monitor.running = True
-
-        monitor.stop()
-
-        stream.close.assert_called_once_with()
-        self.assertIsNone(monitor.stream)
-        self.assertFalse(monitor.running)
-
-    def test_stop_closes_only_after_stop_returns(self):
-        events = []
-
-        class SlowStopStream:
-            def start(self_):
-                pass
-
-            def stop(self_):
-                events.append("stop begin")
-                time.sleep(0.2)
-                events.append("stop end")
-
-            def close(self_):
-                events.append("close")
-
-        fake_sd = mock.Mock(
-            query_devices=lambda device=None, kind=None: {"default_samplerate": 48000},
-            InputStream=lambda **kwargs: SlowStopStream(),
-        )
-        with mock.patch.object(audio_module, "sd", fake_sd):
-            monitor = AudioMonitor()
-            monitor.start()
-            monitor.stop()
-        self.assertEqual(events, ["stop begin", "stop end", "close"])
-        self.assertIsNone(monitor.stream)
 
 
 if __name__ == "__main__":

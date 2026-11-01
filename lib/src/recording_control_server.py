@@ -1,12 +1,9 @@
 """Daemon-side transports for recording control and capture clients."""
 
-import errno
-import json
 import os
 import select
 import socket
 import threading
-import time
 from pathlib import Path
 
 
@@ -14,18 +11,14 @@ class RecordingControlServer:
     """Own the recording-control FIFO and single-subscriber capture socket."""
 
     _VALID_COMMANDS = {
-        "start", "stop", "release", "cancel", "submit", "model_unload", "model_reload",
+        "start", "stop", "cancel", "submit", "model_unload", "model_reload",
     }
 
-    def __init__(self, fifo_path, socket_path, on_command, is_recording,
-                 on_file_transcribe=None, on_recover=None, on_diagnostics=None):
+    def __init__(self, fifo_path, socket_path, on_command, is_recording):
         self.fifo_path = Path(fifo_path)
         self.socket_path = Path(socket_path)
         self._on_command = on_command
         self._is_recording = is_recording
-        self._on_file_transcribe = on_file_transcribe
-        self._on_recover = on_recover
-        self._on_diagnostics = on_diagnostics
 
         self._lifecycle_lock = threading.Lock()
         self._stop_event = None
@@ -34,8 +27,6 @@ class RecordingControlServer:
         self._listening_socket = None
 
         self._capture_subscriber = None
-        self._capture_subscriber_mode = None
-        self._capture_payload_sent = False
         self._capture_subscriber_lock = threading.Lock()
         self._capture_subscriber_done = threading.Event()
 
@@ -152,8 +143,6 @@ class RecordingControlServer:
         self._capture_subscriber_done.set()
         with self._capture_subscriber_lock:
             subscriber = self._capture_subscriber
-            self._capture_subscriber_mode = None
-            self._capture_payload_sent = False
         if subscriber is not None:
             try:
                 subscriber.shutdown(socket.SHUT_RDWR)
@@ -184,27 +173,15 @@ class RecordingControlServer:
 
     def has_capture_subscriber(self):
         with self._capture_subscriber_lock:
-            return self._capture_subscriber_mode is not None
-
-    def is_trace_capture(self):
-        with self._capture_subscriber_lock:
-            return self._capture_subscriber_mode == "trace"
+            return self._capture_subscriber is not None
 
     def notify_capture(self, text, final):
         """Stream transcription text and signal completion to the subscriber."""
         with self._capture_subscriber_lock:
             subscriber = self._capture_subscriber
-            if text and self._capture_subscriber_mode == "trace":
-                if self._capture_payload_sent:
-                    text = ""
-                else:
-                    self._capture_payload_sent = True
             if subscriber is None:
                 if final:
                     self._capture_subscriber_done.set()
-                    if not self._is_recording():
-                        self._capture_subscriber_mode = None
-                        self._capture_payload_sent = False
                 return
             if text:
                 try:
@@ -213,19 +190,6 @@ class RecordingControlServer:
                     print(f"[CAPTURE] Subscriber write failed: {exc}", flush=True)
             if final:
                 self._capture_subscriber_done.set()
-                if not self._is_recording():
-                    self._capture_subscriber_mode = None
-                    self._capture_payload_sent = False
-
-    def _dispatch_fifo(self, raw_data, stop_event):
-        command = self.parse_commands(raw_data)
-        if command is None:
-            lines = [line.strip() for line in raw_data.splitlines() if line.strip()]
-            if lines:
-                print(f"[CONTROL] No valid commands in: {lines}", flush=True)
-            return
-        if not stop_event.is_set() and stop_event is self._stop_event:
-            self._on_command(*command)
 
     def _fifo_listener(self, stop_event):
         while not stop_event.is_set():
@@ -239,6 +203,7 @@ class RecordingControlServer:
                     os.mkfifo(str(self.fifo_path))
                     print("[CONTROL] Recreated recording control FIFO", flush=True)
                 fd = os.open(str(self.fifo_path), os.O_RDONLY | os.O_NONBLOCK)
+                raw_data = None
                 while not stop_event.is_set():
                     if not self.fifo_path.exists() or not self.fifo_path.is_fifo():
                         raise FileNotFoundError(self.fifo_path)
@@ -254,14 +219,24 @@ class RecordingControlServer:
                         if not chunk:
                             break
                         chunks.append(chunk)
-                    if not chunks:
-                        # EOF remains readable until this descriptor is replaced.
-                        # Reopen it so an empty writer cannot leave the daemon spinning.
+                    if chunks:
+                        raw_data = b"".join(chunks).decode("utf-8", errors="replace")
                         break
-                    # Dispatch with the read end still open. A command written while
-                    # this one runs (a start takes up to ~2s) stays buffered; closing
-                    # the last reader would silently discard it.
-                    self._dispatch_fifo(b"".join(chunks).decode("utf-8", errors="replace"), stop_event)
+                    # EOF remains readable until this descriptor is replaced.
+                    # Reopen it so an empty writer cannot leave the daemon spinning.
+                    break
+                else:
+                    break
+                if raw_data is None:
+                    continue
+                command = self.parse_commands(raw_data)
+                if command is None:
+                    lines = [line.strip() for line in raw_data.splitlines() if line.strip()]
+                    if lines:
+                        print(f"[CONTROL] No valid commands in: {lines}", flush=True)
+                    continue
+                if not stop_event.is_set() and stop_event is self._stop_event:
+                    self._on_command(*command)
             except FileNotFoundError:
                 if not stop_event.is_set():
                     print("[CONTROL] FIFO deleted, will recreate on next iteration", flush=True)
@@ -288,28 +263,16 @@ class RecordingControlServer:
         except OSError:
             pass
 
-    FIFO_WRITE_WAIT_SECS = 1.0
-
-    def _write_fifo(self, command, wait=None):
-        # A non-blocking open fails with ENXIO while no reader holds the FIFO:
-        # before the listener first opens it, and as it reopens after EOF.
-        # Retry briefly rather than drop the command.
-        deadline = time.monotonic() + (self.FIFO_WRITE_WAIT_SECS if wait is None else wait)
-        while True:
-            try:
-                fd = os.open(str(self.fifo_path), os.O_WRONLY | os.O_NONBLOCK)
-            except OSError as exc:
-                if exc.errno == errno.ENXIO and time.monotonic() < deadline:
-                    time.sleep(0.02)
-                    continue
-                return False
+    def _write_fifo(self, command):
+        try:
+            fd = os.open(str(self.fifo_path), os.O_WRONLY | os.O_NONBLOCK)
             try:
                 os.write(fd, command.encode())
-                return True
-            except OSError:
-                return False
             finally:
                 os.close(fd)
+            return True
+        except OSError:
+            return False
 
     def _setup_capture_socket(self):
         try:
@@ -369,24 +332,15 @@ class RecordingControlServer:
         stop_event = stop_event or self._stop_event or threading.Event()
         try:
             conn.settimeout(1.0)
-            try:
-                line = self._recv_request_line(conn)
-            except (UnicodeDecodeError, ValueError) as exc:
-                conn.sendall(json.dumps({
-                    'ok': False, 'error': f'invalid request: {exc}'
-                }, separators=(',', ':')).encode('utf-8') + b'\n')
-                return
-            if line.startswith('{'):
-                self._handle_json_request(conn, line, stop_event)
-                return
+            line = conn.recv(256).split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
             verb, _, language = line.partition(":")
             language = language.strip() or None
-            if verb not in ("capture", "capture_trace"):
+            if verb != "capture":
                 print(f"[CAPTURE] Unknown request: {line!r}", flush=True)
                 return
             conn.settimeout(None)
             with self._capture_subscriber_lock:
-                if self._capture_subscriber is not None or self._capture_subscriber_mode is not None:
+                if self._capture_subscriber is not None:
                     print("[CAPTURE] Rejecting — slot occupied", flush=True)
                     try:
                         conn.sendall(b"ERROR:slot_occupied\n")
@@ -396,8 +350,6 @@ class RecordingControlServer:
                 if stop_event.is_set() or stop_event is not self._stop_event:
                     return
                 self._capture_subscriber = conn
-                self._capture_subscriber_mode = "trace" if verb == "capture_trace" else "raw"
-                self._capture_payload_sent = False
                 self._capture_subscriber_done.clear()
 
             if not self._is_recording():
@@ -439,91 +391,3 @@ class RecordingControlServer:
                 conn.close()
             except OSError:
                 pass
-
-    @staticmethod
-    def _recv_request_line(conn, limit=65536):
-        data = bytearray()
-        while len(data) <= limit:
-            chunk = conn.recv(min(4096, limit + 1 - len(data)))
-            if not chunk:
-                break
-            data.extend(chunk)
-            if b'\n' in chunk:
-                break
-        if len(data) > limit:
-            # Consume the rest of this request before replying. Closing a Unix
-            # socket with unread client data resets it and discards our error.
-            while b'\n' not in chunk:
-                try:
-                    chunk = conn.recv(4096)
-                except socket.timeout:
-                    break
-                if not chunk:
-                    break
-            raise ValueError('request too large')
-        return bytes(data).split(b'\n', 1)[0].decode(
-            'utf-8', errors='strict'
-        ).strip()
-
-    def _handle_json_request(self, conn, line, stop_event):
-        """Handle request/response operations without changing capture semantics."""
-        try:
-            request = json.loads(line)
-            if isinstance(request, dict) and request.get('verb') == 'diagnostics':
-                response = {'ok': False}
-                if (not stop_event.is_set() and stop_event is self._stop_event
-                        and self._on_diagnostics is not None):
-                    try:
-                        from diagnostics import sanitize_snapshot
-                        snapshot = sanitize_snapshot(self._on_diagnostics())
-                        if snapshot is not None and not stop_event.is_set():
-                            response = {'ok': True, 'snapshot': snapshot}
-                    except Exception:
-                        pass  # Never return or log diagnostic exception contents.
-                try:
-                    # Match other JSON replies; the diagnostic client owns
-                    # the bounded wait and closes the connection on timeout.
-                    conn.settimeout(None)
-                    conn.sendall(json.dumps(response).encode('utf-8') + b'\n')
-                except OSError:
-                    pass
-                return
-            elif isinstance(request, dict) and request.get('verb') in ('copy_last', 'paste_last', 'clear_last'):
-                if stop_event.is_set() or stop_event is not self._stop_event:
-                    raise RuntimeError('daemon is shutting down')
-                if self._on_recover is None:
-                    raise RuntimeError('recovery is unavailable; update or restart the daemon')
-                ok, payload = self._on_recover(request['verb'])
-                response = {'ok': bool(ok)}
-                response['message' if ok else 'error'] = str(payload)
-            else:
-                if not isinstance(request, dict) or request.get('verb') != 'transcribe_file':
-                    raise ValueError('unknown request')
-                path = request.get('path')
-                language = request.get('language')
-                clean = request.get('clean', False)
-                if not isinstance(path, str) or not path:
-                    raise ValueError('path must be a non-empty string')
-                if language is not None and not isinstance(language, str):
-                    raise ValueError('language must be a string or null')
-                if not isinstance(clean, bool):
-                    raise ValueError('clean must be a boolean')
-                if stop_event.is_set() or stop_event is not self._stop_event:
-                    raise RuntimeError('daemon is shutting down')
-                if self._on_file_transcribe is None:
-                    raise RuntimeError('file transcription is unavailable')
-                ok, payload = self._on_file_transcribe(path, language, clean)
-                response = {'ok': bool(ok)}
-                response['text' if ok else 'error'] = str(payload)
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-            response = {'ok': False, 'error': f'invalid request: {exc}'}
-        except Exception as exc:
-            print(f"[CONTROL] Request failed: {exc}", flush=True)
-            response = {'ok': False, 'error': str(exc)}
-        try:
-            conn.settimeout(None)
-            conn.sendall(json.dumps(
-                response, ensure_ascii=False, separators=(',', ':')
-            ).encode('utf-8') + b'\n')
-        except OSError:
-            pass

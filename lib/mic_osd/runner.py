@@ -18,23 +18,14 @@ from pathlib import Path
 try:
     from ..src.paths import (
         MIC_OSD_PID_FILE, VISUALIZER_STATE_FILE, TRANSCRIPT_PREVIEW_FILE,
-        MIC_OSD_LEVEL_FEED_FILE,
+        MIC_OSD_LEVEL_FEED_FILE, MIC_OSD_VISIBLE_FILE,
     )
 except ImportError:
     # Fallback for direct execution
     from src.paths import (
         MIC_OSD_PID_FILE, VISUALIZER_STATE_FILE, TRANSCRIPT_PREVIEW_FILE,
-        MIC_OSD_LEVEL_FEED_FILE,
+        MIC_OSD_LEVEL_FEED_FILE, MIC_OSD_VISIBLE_FILE,
     )
-
-try:
-    from ..src import visualizer_runtime
-except ImportError:
-    from src import visualizer_runtime
-
-
-class LayerShellResolutionError(RuntimeError):
-    pass
 
 
 class MicOSDRunner:
@@ -46,10 +37,9 @@ class MicOSDRunner:
 
     PREVIEW_WRITE_INTERVAL_SECONDS = 0.05
     LEVEL_FEED_INTERVAL_SECONDS = 1.0 / 30
-    OSD_STYLES = ('waveform', 'vu_meter', 'pill')
-    _bundled_availability = None
-    _bundled_availability_lock = threading.Lock()
-    _layer_shell_preload = None  # probe-confirmed path; fallbacks aren't cached
+    SHOW_ACK_TIMEOUT_SECONDS = 1.0
+    SHOW_ACK_POLL_SECONDS = 0.01
+    OSD_STYLES = ('waveform', 'vu_meter', 'pill', 'spectrum')
 
     def __init__(self, level_source=None, style='waveform'):
         """
@@ -66,28 +56,20 @@ class MicOSDRunner:
         self._mic_osd_dir = Path(__file__).parent
         self._orphaned_daemon_pid = None  # Track PID when reusing orphaned daemon
         self._preview_lock = threading.Lock()
-        self._last_preview_write_at = None
+        self._last_preview_write_at = 0.0
         self._pending_preview_text = None
         self._preview_flush_timer = None
         self._preview_generation = 0
         self._level_source = level_source
         self._level_feed_thread = None
         self._level_feed_stop = threading.Event()
-        self._level_feed_lock = threading.RLock()
+        self._level_feed_lock = threading.Lock()
         self._last_level_feed_error_at = 0.0
-        self._visibility_condition = threading.Condition()
-        self._hide_generation = 0
-        self._hide_teardowns = 0
+        self._stderr_thread = None
     
     @staticmethod
     def is_available() -> bool:
         """Check if mic-osd can run."""
-        if MicOSDRunner._system_dependencies_available():
-            return True
-        return MicOSDRunner._bundled_dependencies_available()
-
-    @staticmethod
-    def _system_dependencies_available() -> bool:
         try:
             import cairo  # noqa: F401
             import gi
@@ -96,97 +78,14 @@ class MicOSDRunner:
             return True
         except (ImportError, ValueError):
             return False
-
-    @staticmethod
-    def _bundled_dependencies_available() -> bool:
-        with MicOSDRunner._bundled_availability_lock:
-            if MicOSDRunner._bundled_availability is not None:
-                return MicOSDRunner._bundled_availability
-            available = False
-            if visualizer_runtime.is_complete():
-                probe = (
-                    "import cairo, gi;"
-                    "gi.require_version('Gtk', '4.0');"
-                    "gi.require_version('Gtk4LayerShell', '1.0');"
-                    "from gi.repository import Gtk, Gtk4LayerShell"
-                )
-                try:
-                    result = subprocess.run(
-                        [sys.executable or 'python3', '-c', probe],
-                        env=visualizer_runtime.bundled_environment(),
-                        capture_output=True, timeout=5,
-                    )
-                    available = result.returncode == 0
-                except Exception:
-                    pass
-            MicOSDRunner._bundled_availability = available
-            return available
-
-    @staticmethod
-    def runtime_source() -> str:
-        """Return the selected layer-shell runtime source for status output."""
-        if MicOSDRunner._system_dependencies_available():
-            return "system"
-        if MicOSDRunner._bundled_dependencies_available():
-            return f"bundled {visualizer_runtime.GTK4_LAYER_SHELL_VERSION}"
-        return "unavailable"
     
     @staticmethod
     def _layer_shell_ld_preload() -> str:
-        """Resolve the gtk4-layer-shell library that the Gtk4LayerShell typelib loads.
+        """Resolve the gtk4-layer-shell .so to LD_PRELOAD.
 
-        The preload must be that exact file. A second copy elsewhere on the
-        system (Ghostty's package, for one, installs /usr/lib/libgtk4-layer-shell.so)
-        keeps its own state, so the typelib's copy never hooks libwayland,
-        init_for_window() fails, and the OSD becomes an ordinary toplevel that
-        takes keyboard focus from the window dictation should paste into.
-
-        The library is loaded lazily, so the probe calls into it before reading
-        its own mappings. Inherited layer-shell preloads are dropped so the probe
-        sees only the typelib's copy. A failed probe falls back to the path
-        search rather than disabling the overlay.
+        Searches common library paths including lib64 (Fedora/RHEL) and versioned
+        .so files (distros that only ship the unversioned symlink in -devel).
         """
-        cached = MicOSDRunner._layer_shell_preload
-        if cached and os.path.isfile(cached):
-            return cached
-        probe = (
-            "import gi; gi.require_version('Gtk4LayerShell', '1.0');"
-            "from gi.repository import Gtk4LayerShell;"
-            "Gtk4LayerShell.get_major_version();"
-            "print(*{line.split(None, 5)[5].strip() for line in open('/proc/self/maps')"
-            " if 'libgtk4-layer-shell' in line}, sep='\\n')"
-        )
-        env = os.environ.copy()
-        env['LD_PRELOAD'] = MicOSDRunner._without_layer_shell_preload(env.get('LD_PRELOAD', ''))
-        try:
-            result = subprocess.run(
-                [sys.executable or 'python3', '-c', probe],
-                env=env, capture_output=True, text=True, errors='replace', timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError) as e:
-            print(f"[MIC-OSD] layer-shell library probe failed: {e}", flush=True)
-            return MicOSDRunner._layer_shell_path_search()
-        libraries = [line for line in result.stdout.splitlines() if line.strip()]
-        if result.returncode != 0 or not libraries:
-            detail = (result.stderr.strip().splitlines() or ['no library mapped'])[-1]
-            print(f"[MIC-OSD] layer-shell library probe failed: {detail}", flush=True)
-            return MicOSDRunner._layer_shell_path_search()
-        if len(libraries) > 1:
-            raise LayerShellResolutionError(
-                f"expected one mapped gtk4-layer-shell library, found {libraries}"
-            )
-        MicOSDRunner._layer_shell_preload = libraries[0]
-        return libraries[0]
-
-    @staticmethod
-    def _without_layer_shell_preload(value: str) -> str:
-        """Drop gtk4-layer-shell entries from an LD_PRELOAD value."""
-        entries = value.replace(':', ' ').split()
-        return ' '.join(e for e in entries if 'libgtk4-layer-shell' not in os.path.basename(e))
-
-    @staticmethod
-    def _layer_shell_path_search() -> str:
-        """Fallback: first gtk4-layer-shell .so in common library paths."""
         for pattern in [
             '/usr/lib64/libgtk4-layer-shell.so*',
             '/usr/lib/libgtk4-layer-shell.so*',
@@ -199,19 +98,6 @@ class MicOSDRunner:
                 if os.path.isfile(resolved):
                     return resolved
         return ""
-
-    @staticmethod
-    def _layer_shell_environment() -> dict:
-        """Build the child-only environment for the selected runtime."""
-        env = os.environ.copy()
-        if MicOSDRunner._system_dependencies_available():
-            preload = MicOSDRunner._layer_shell_ld_preload()
-            if preload:
-                current = MicOSDRunner._without_layer_shell_preload(env.get('LD_PRELOAD', ''))
-                env['LD_PRELOAD'] = f"{preload} {current}".strip()
-        elif visualizer_runtime.is_complete():
-            env = visualizer_runtime.bundled_environment(env)
-        return env
 
     @staticmethod
     def layer_shell_active() -> bool:
@@ -228,11 +114,10 @@ class MicOSDRunner:
             "Gtk.init();"
             "print('1' if Gtk4LayerShell.is_supported() else '0')"
         )
-        try:
-            env = MicOSDRunner._layer_shell_environment()
-        except LayerShellResolutionError as e:
-            print(f"[MIC-OSD] Layer shell unusable: {e}", flush=True)
-            return False
+        env = os.environ.copy()
+        preload = MicOSDRunner._layer_shell_ld_preload()
+        if preload:
+            env['LD_PRELOAD'] = preload
         try:
             result = subprocess.run(
                 [sys.executable or 'python3', '-c', probe],
@@ -282,12 +167,10 @@ class MicOSDRunner:
         try:
             gi.require_version('Gtk4LayerShell', '1.0')
         except (ImportError, ValueError):
-            if MicOSDRunner._bundled_dependencies_available():
-                return ""
             return f"gtk4-layer-shell not installed. Install: {layer_pkg}"
         return ""
     
-    def _ensure_daemon(self) -> bool:
+    def _ensure_daemon(self):
         """Ensure the daemon process is running."""
         # Check in-memory reference first
         if self._process is not None and self._process.poll() is None:
@@ -335,11 +218,11 @@ sys.argv = ['mic-osd', '--daemon', '--viz', '{self._style}']
 sys.exit(main())
 """
 
-        try:
-            env = self._layer_shell_environment()
-        except LayerShellResolutionError as e:
-            print(f"[MIC-OSD] Not starting daemon: {e}", flush=True)
-            return False
+        # Set LD_PRELOAD for gtk4-layer-shell.
+        env = os.environ.copy()
+        lib_path = self._layer_shell_ld_preload()
+        if lib_path:
+            env['LD_PRELOAD'] = lib_path
         env['HYPRWHSPR_MIC_OSD_DAEMON'] = '1'
 
         try:
@@ -369,11 +252,35 @@ sys.exit(main())
                 self._process = None
                 return False
 
-            # Daemon survived startup - detach stderr so it doesn't block
-            try:
-                self._process.stderr.close()
-            except Exception:
-                pass
+            # Keep draining stderr for the daemon's lifetime. Closing the only
+            # reader hid GTK/layer-shell warnings and made runtime draw callback
+            # failures impossible to diagnose from the service journal.
+            stderr_stream = self._process.stderr
+            if stderr_stream is not None:
+                def _drain_stderr():
+                    try:
+                        for raw_line in iter(stderr_stream.readline, b''):
+                            line = raw_line.decode(
+                                'utf-8', errors='replace'
+                            ).rstrip()
+                            if line:
+                                print(
+                                    f"[MIC-OSD daemon] {line}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                    finally:
+                        try:
+                            stderr_stream.close()
+                        except Exception:
+                            pass
+
+                self._stderr_thread = threading.Thread(
+                    target=_drain_stderr,
+                    daemon=True,
+                    name='mic-osd-stderr',
+                )
+                self._stderr_thread.start()
 
             # Write PID file
             MIC_OSD_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -446,7 +353,37 @@ sys.exit(main())
                 MIC_OSD_PID_FILE.unlink()
         except Exception:
             pass
-    
+
+    @staticmethod
+    def _clear_visible_ack():
+        try:
+            MIC_OSD_VISIBLE_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    @classmethod
+    def _wait_for_visible_ack(cls, pid: int) -> bool:
+        deadline = time.monotonic() + cls.SHOW_ACK_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                if MIC_OSD_VISIBLE_FILE.read_text(encoding='utf-8').strip() == str(pid):
+                    return True
+            except OSError:
+                pass
+            time.sleep(cls.SHOW_ACK_POLL_SECONDS)
+        return False
+
+    def _signal_show_and_wait(self) -> bool:
+        pid = (
+            self._orphaned_daemon_pid
+            if self._orphaned_daemon_pid is not None
+            else self._process.pid
+        )
+        self._clear_visible_ack()
+        if not self._signal_daemon(signal.SIGUSR1):
+            return False
+        return self._wait_for_visible_ack(pid)
+
     def _start_level_feed(self):
         """Stream capture levels to the OSD's runtime feed file. Writes the
         first frame synchronously so it's fresh before the daemon's SIGUSR1
@@ -504,56 +441,52 @@ sys.exit(main())
 
     def show(self) -> bool:
         """Show the mic-osd overlay (instant via signal)."""
-        with self._visibility_condition:
-            while self._hide_teardowns:
-                self._visibility_condition.wait()
-            generation = self._hide_generation
-
         if not self.is_available():
             return False
 
         if not self._ensure_daemon():
             return False
 
+        self._start_level_feed()  # before signaling; first frame must be ready
+
         try:
-            with self._level_feed_lock:
-                with self._visibility_condition:
-                    if generation != self._hide_generation:
-                        return False
-                self._start_level_feed()  # first frame must be ready before SIGUSR1
-                with self._visibility_condition:
-                    # A hide during the first frame cancels this show. Keep
-                    # teardown serialized until we have decided whether to signal.
-                    if generation != self._hide_generation:
-                        return False
-                    return self._signal_daemon(signal.SIGUSR1)
+            if self._signal_show_and_wait():
+                return True
+            if self._process is None:
+                self._stop_level_feed()
+                return False
+
+            # A live PID with no acknowledgement means its GTK/GLib loop is
+            # wedged. Replace it once instead of silently succeeding forever.
+            print(
+                "[MIC-OSD] Daemon did not acknowledge show; restarting it",
+                flush=True,
+            )
+            self.stop()
+            if not self._ensure_daemon():
+                return False
+            self._start_level_feed()
+            if self._signal_show_and_wait():
+                return True
+            print(
+                "[MIC-OSD] Replacement daemon did not acknowledge show",
+                flush=True,
+            )
+            self._stop_level_feed()
+            return False
         except (ProcessLookupError, OSError):
             self._stop_level_feed()
             self._process = None
             self._orphaned_daemon_pid = None
+            self._clear_visible_ack()
             return False
 
     def hide(self):
         """Hide the mic-osd overlay (instant via signal)."""
-        # Do not wait for a blocked level source to hide the window. The
-        # generation check prevents an in-flight show from undoing this signal,
-        # while the teardown counter keeps a newer show from overtaking cleanup.
-        try:
-            with self._visibility_condition:
-                self._hide_generation += 1
-                self._hide_teardowns += 1
-                self._signal_hide()
-        finally:
-            try:
-                self._stop_level_feed()
-                self.clear_preview_text()
-            finally:
-                with self._visibility_condition:
-                    self._hide_teardowns -= 1
-                    self._visibility_condition.notify_all()
+        self._stop_level_feed()
+        self.clear_preview_text()
+        self._clear_visible_ack()
 
-    def _signal_hide(self):
-        """Send SIGUSR2 to the daemon, dropping references to a dead one."""
         if self._process is None:
             return
         
@@ -571,6 +504,7 @@ sys.exit(main())
                 self._orphaned_daemon_pid = None
                 # Clean up stale PID file
                 self._unlink_pid_file()
+                self.clear_preview_text()
                 return
         
         # For normal daemons, verify process is actually alive before signaling
@@ -581,6 +515,7 @@ sys.exit(main())
             self._orphaned_daemon_pid = None
             # Clean up stale PID file
             self._unlink_pid_file()
+            self.clear_preview_text()
             return
         
         # Verify process is actually alive before sending signal
@@ -593,6 +528,7 @@ sys.exit(main())
             self._orphaned_daemon_pid = None
             # Clean up stale PID file
             self._unlink_pid_file()
+            self.clear_preview_text()
             return
         
         # Process is alive, send hide signal
@@ -602,6 +538,7 @@ sys.exit(main())
             print(f"[MIC-OSD] Failed to send SIGUSR2 to daemon (PID {self._process.pid}): {e}", flush=True)
             self._process = None
             self._orphaned_daemon_pid = None
+            self.clear_preview_text()
 
     def set_state(self, state: str):
         """
@@ -636,13 +573,8 @@ sys.exit(main())
                 return
 
             now = time.monotonic()
-            # No baseline yet means nothing has been written, so the first
-            # frame goes out immediately. monotonic() is an arbitrary epoch
-            # (uptime on Linux), so it can never be compared against a fixed
-            # sentinel like 0.0 to make that call.
-            last = self._last_preview_write_at
-            elapsed = None if last is None else now - last
-            if elapsed is None or elapsed >= self.PREVIEW_WRITE_INTERVAL_SECONDS:
+            elapsed = now - self._last_preview_write_at
+            if elapsed >= self.PREVIEW_WRITE_INTERVAL_SECONDS:
                 self._cancel_pending_preview_flush()
                 self._last_preview_write_at = now
                 self._write_preview_text_file(text)
@@ -732,6 +664,7 @@ sys.exit(main())
     def stop(self):
         """Stop the daemon completely."""
         self._stop_level_feed()
+        self._clear_visible_ack()
         if self._process is None:
             return
 

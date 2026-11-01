@@ -1,9 +1,7 @@
-import io
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from contextlib import redirect_stdout
 from unittest import mock
 
 
@@ -79,119 +77,6 @@ class MaintenanceDependencyRepairTests(unittest.TestCase):
             ):
                 self.assertTrue(maintenance.backend_repair_command())
             repair.assert_called_once_with(config, 'realtime-ws')
-
-    def test_import_check_survives_unresolvable_manifest(self):
-        """A missing requirements file must not silence the import check."""
-        config = mock.Mock()
-        config.get_setting.side_effect = lambda key, default=None: {
-            'transcription_backend': 'realtime-ws',
-            'websocket_provider': 'elevenlabs',
-        }.get(key, default)
-        healthy = mock.Mock(returncode=0)
-        missing = mock.Mock(returncode=1)
-        with tempfile.TemporaryDirectory() as tmp:
-            venv = Path(tmp) / 'venv'
-            (venv / 'bin').mkdir(parents=True)
-            (venv / 'bin' / 'python').touch()
-            with (
-                mock.patch.object(maintenance, 'VENV_DIR', venv),
-                mock.patch.object(maintenance, 'ConfigManager', return_value=config),
-                mock.patch.object(maintenance, 'resolve_dependency_plan',
-                                  side_effect=OSError('no manifest')),
-                mock.patch.object(maintenance.subprocess, 'run', side_effect=[healthy, missing]),
-                mock.patch.object(maintenance.Prompt, 'ask', return_value='1'),
-                mock.patch.object(maintenance, '_reinstall_configured_dependencies', return_value=True) as repair,
-            ):
-                self.assertTrue(maintenance.backend_repair_command())
-            repair.assert_called_once_with(config, 'realtime-ws')
-
-
-class MaintenanceUinputValidationTests(unittest.TestCase):
-    def _path(self, exists):
-        path = mock.Mock()
-        path.exists.return_value = exists
-        return path
-
-    def test_accessible_uinput_passes(self):
-        with (
-            mock.patch.object(maintenance, 'Path', return_value=self._path(True)),
-            mock.patch.object(maintenance.os, 'geteuid', return_value=1000),
-            mock.patch.object(maintenance.os, 'access', return_value=True),
-            mock.patch.object(maintenance, 'log_success') as success,
-        ):
-            self.assertTrue(maintenance._validate_uinput_access(True))
-        success.assert_called_once_with("✓ /dev/uinput is readable and writable")
-
-    def test_nix_uinput_advice_uses_host_specific_hint(self):
-        for nixos in (False, True):
-            output = io.StringIO()
-            with (
-                mock.patch.object(maintenance, 'Path', return_value=self._path(False)),
-                mock.patch.object(maintenance.os, 'geteuid', return_value=1000),
-                mock.patch.object(maintenance, '_has_non_ydotool_injection_path', return_value=False),
-                mock.patch.object(maintenance, 'is_nix_install', return_value=True),
-                mock.patch('installation.is_nixos', return_value=nixos),
-                redirect_stdout(output),
-            ):
-                self.assertFalse(maintenance._validate_uinput_access(True))
-            if nixos:
-                self.assertIn('services.hyprwhspr.users', output.getvalue())
-                self.assertNotIn('usermod', output.getvalue())
-            else:
-                self.assertIn('sudo usermod -aG input $USER', output.getvalue())
-                self.assertNotIn('services.hyprwhspr.users', output.getvalue())
-
-    def test_missing_uinput_is_error_when_ydotool_is_only_path(self):
-        output = io.StringIO()
-        with (
-            mock.patch.object(maintenance, 'Path', return_value=self._path(False)),
-            mock.patch.object(maintenance.os, 'geteuid', return_value=1000),
-            mock.patch.object(maintenance, '_has_non_ydotool_injection_path', return_value=False),
-            mock.patch.object(maintenance, 'log_error') as error,
-            redirect_stdout(output),
-        ):
-            self.assertFalse(maintenance._validate_uinput_access(True))
-        self.assertIn("does not exist", error.call_args.args[0])
-        self.assertIn("log out and back in (or reboot)", output.getvalue())
-
-    def test_inaccessible_uinput_warns_when_another_path_exists(self):
-        with (
-            mock.patch.object(maintenance, 'Path', return_value=self._path(True)),
-            mock.patch.object(maintenance.os, 'geteuid', return_value=1000),
-            mock.patch.object(maintenance.os, 'access', return_value=False),
-            mock.patch.object(maintenance, '_has_non_ydotool_injection_path', return_value=True),
-            mock.patch.object(maintenance, 'log_warning') as warning,
-            mock.patch('builtins.print'),
-        ):
-            self.assertTrue(maintenance._validate_uinput_access(True))
-        self.assertIn("not readable and writable", warning.call_args.args[0])
-        self.assertIn("Other detected injection paths", warning.call_args.args[0])
-
-    def test_missing_ydotool_and_no_alternative_does_not_claim_fallback(self):
-        with (
-            mock.patch.object(maintenance, 'Path', return_value=self._path(False)),
-            mock.patch.object(maintenance.os, 'geteuid', return_value=1000),
-            mock.patch.object(maintenance, '_has_non_ydotool_injection_path', return_value=False),
-            mock.patch.object(maintenance, 'log_warning') as warning,
-            mock.patch('builtins.print'),
-        ):
-            self.assertTrue(maintenance._validate_uinput_access(False))
-        self.assertIn("No other injection path was detected", warning.call_args.args[0])
-
-    def test_root_validation_warns_instead_of_claiming_user_access(self):
-        with (
-            mock.patch.object(maintenance, 'Path', return_value=self._path(True)),
-            mock.patch.object(maintenance.os, 'geteuid', return_value=0),
-            mock.patch.object(maintenance.os, 'access') as access,
-            mock.patch.object(maintenance, 'log_success') as success,
-            mock.patch.object(maintenance, 'log_warning') as warning,
-            mock.patch('builtins.print') as output,
-        ):
-            self.assertTrue(maintenance._validate_uinput_access(True))
-        access.assert_not_called()
-        success.assert_not_called()
-        self.assertIn("cannot verify", warning.call_args.args[0])
-        output.assert_called_once_with("  Re-run 'hyprwhspr validate' without sudo.")
 
 
 if __name__ == '__main__':

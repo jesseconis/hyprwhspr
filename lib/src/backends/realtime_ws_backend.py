@@ -1,18 +1,13 @@
 """
 Realtime WebSocket transcription backend.
 
-Streams audio to a provider WebSocket during capture via the streaming
-callback; transcribe() then commits the buffered audio and waits for the
-final transcript. The wire protocol comes from realtime_protocols.
+Streams audio to a provider WebSocket (OpenAI, Gemini Live, ElevenLabs)
+during capture via the streaming callback; transcribe() then commits the
+buffered audio and waits for the final transcript.
 """
 
 import time
 from typing import Callable, Optional
-
-try:
-    from ..service_log import log
-except ImportError:
-    from service_log import log
 
 try:
     from ..dependencies import require_package
@@ -22,17 +17,13 @@ except ImportError:
 np = require_package('numpy')
 
 try:
-    from ..backend_utils import is_valid_websocket_url, normalize_backend
+    from ..backend_utils import normalize_backend
     from ..credential_manager import get_credential
-    from ..openai_realtime_models import uses_language_context
-    from ..provider_registry import get_provider, get_realtime_capabilities
-    from ..realtime_protocols import live_text_mode, live_typing_conflict, load_client_class, resolve_protocol
+    from ..provider_registry import get_provider
 except ImportError:
-    from backend_utils import is_valid_websocket_url, normalize_backend
+    from backend_utils import normalize_backend
     from credential_manager import get_credential
-    from openai_realtime_models import uses_language_context
-    from provider_registry import get_provider, get_realtime_capabilities
-    from realtime_protocols import live_text_mode, live_typing_conflict, load_client_class, resolve_protocol
+    from provider_registry import get_provider
 
 from .base import TranscriptionBackend
 
@@ -43,10 +34,6 @@ class RealtimeWsBackend(TranscriptionBackend):
     name = 'realtime-ws'
     is_local = False
     reinit_on_resume = True
-    streams_audio = True
-
-    # Don't rebuild a torn-down client on every keypress while an endpoint is down.
-    REBUILD_COOLDOWN_SECS = 5.0
 
     def __init__(self, manager):
         super().__init__(manager)
@@ -56,179 +43,295 @@ class RealtimeWsBackend(TranscriptionBackend):
         # Connection parameters used for reconnect-on-demand.
         # (Stored in-memory only; do not log API keys.)
         self._realtime_connect_params = None
-        # Why the last recovery attempt failed, for an honest user-facing message:
-        # 'connecting' | 'cooldown' | 'failed' | None
-        self._last_connect_failure = None
-        self._last_rebuild_attempt = None
 
     @property
     def _realtime_partial_callback(self):
         # Owned by the manager so it survives backend re-creation on resume
         return self._manager._realtime_partial_callback
 
-    def _update_client_language(
-        self,
-        language: Optional[str],
-        model_id: Optional[str] = None,
-    ) -> None:
-        """Keep new-model transcription language hints and prompts in sync."""
-        if not self._realtime_client:
-            return
-
-        active_model = model_id or getattr(self._realtime_client, 'model', None)
-        if uses_language_context(active_model):
-            self._realtime_client.update_transcription_config(
-                language,
-                self.resolve_whisper_prompt(language)[0],
-            )
-        else:
-            self._realtime_client.update_language(language)
-
     def initialize(self) -> bool:
         """Configure the Realtime WebSocket backend and connect the client"""
+        # Validate WebSocket configuration
         provider_id = self.config.get_setting('websocket_provider')
         model_id = self.config.get_setting('websocket_model')
 
         if not provider_id:
-            log('ERROR: Realtime WebSocket backend selected but websocket_provider not configured')
+            print('ERROR: Realtime WebSocket backend selected but websocket_provider not configured')
             return False
 
-        if not model_id:
-            log('ERROR: Realtime WebSocket backend selected but websocket_model not configured')
+        provider = get_provider(provider_id)
+        if not model_id and provider_id != 'realtimestt':
+            print('ERROR: Realtime WebSocket backend selected but websocket_model not configured')
             return False
 
-        try:
-            protocol = resolve_protocol(provider_id, self.config.get_setting('websocket_protocol'))
-        except ValueError as e:
-            log(f'ERROR: {e}')
+        # Local/protocol adapters can explicitly opt out of credentials. Custom
+        # OpenAI-compatible endpoints retain the existing credential behavior.
+        requires_api_key = bool(
+            provider.get('requires_api_key', True) if provider else True
+        )
+        api_key = get_credential(provider_id) if requires_api_key else None
+        if requires_api_key and not api_key:
+            print(f'ERROR: Provider {provider_id} configured but API key not found in credential store')
             return False
 
-        # Custom endpoints may be self-hosted and keyless; known providers need a key
-        api_key = get_credential(provider_id)
-        if not api_key and provider_id != 'custom':
-            log(f'ERROR: Provider {provider_id} configured but API key not found in credential store')
-            return False
+        # Select appropriate client based on provider/protocol.
+        if provider_id == 'realtimestt':
+            try:
+                from ..realtimestt_realtime_client import RealtimeSTTRealtimeClient
+            except ImportError:
+                from realtimestt_realtime_client import RealtimeSTTRealtimeClient
 
-        realtime_mode = self.config.get_setting('realtime_mode', 'transcribe')
-        if realtime_mode not in protocol.modes:
-            log(f'[REALTIME] {protocol.id} supports realtime_mode {"/".join(protocol.modes)}; '
-                f'using transcribe instead of {realtime_mode!r}')
-            realtime_mode = 'transcribe'
-        if (
-            realtime_mode != 'transcribe'
-            and get_realtime_capabilities(provider_id, model_id).get('transcription_only')
-        ):
-            log(f'ERROR: {model_id} is supported only with realtime_mode="transcribe"')
-            return False
-
-        if (
-            protocol.per_recording_session
-            and self.config.get_setting('recording_mode', 'toggle') in ('continuous', 'long_form')
-        ):
-            log(f'ERROR: {protocol.id} streams one recording at a time; use toggle, push_to_talk or auto')
-            return False
-
-        client = load_client_class(protocol)(mode=realtime_mode)
-        client.configure(self._client_setting_reader(provider_id))
-
-        websocket_url = self.config.get_setting('websocket_url')
-        if websocket_url and not is_valid_websocket_url(websocket_url):
-            log(f'ERROR: websocket_url must be a ws:// or wss:// URL with a host: {websocket_url!r}')
-            return False
-        if not websocket_url:
-            if provider_id == 'custom':
-                log('ERROR: Custom realtime backend requires websocket_url to be configured')
+            realtime_mode = self.config.get_setting('realtime_mode', 'transcribe')
+            if realtime_mode != 'transcribe':
+                print('ERROR: RealtimeSTT supports realtime_mode="transcribe" only', flush=True)
                 return False
-            if protocol.derives_url:
-                # Derived transcribe URLs carry ?intent=transcription, which a realtime session contradicts
-                if (
-                    realtime_mode == 'transcribe'
-                    and getattr(client, 'transcription_session_type', None) == 'realtime'
-                ):
-                    log('ERROR: realtime_transcription_session_type "realtime" requires websocket_url')
+
+            self._realtime_client = RealtimeSTTRealtimeClient()
+            websocket_url = self.config.get_setting('websocket_url')
+            if not websocket_url:
+                websocket_url = provider['websocket_endpoint']
+
+            language = self.config.get_setting('language', None)
+            self._realtime_client.language = language
+            buffer_max = self.config.get_setting('realtime_buffer_max_seconds', 5)
+            self._realtime_client.set_max_buffer_seconds(buffer_max)
+            if self._is_partial_preview_enabled(provider_id, model_id, realtime_mode):
+                self._realtime_client.set_partial_transcript_callback(
+                    self._realtime_partial_callback
+                )
+
+            self._realtime_connect_params = {
+                'websocket_url': websocket_url,
+                'api_key': None,
+                'model_id': model_id or 'server',
+                'instructions': None,
+            }
+            if not self._realtime_client.connect(
+                websocket_url, None, model_id or 'server', None
+            ):
+                print('ERROR: Failed to connect to RealtimeSTT WebSocket')
+                try:
+                    self._realtime_client.close()
+                except Exception:
+                    pass
+                self._realtime_client = None
+                return False
+
+            def _send_direct(audio_chunk: np.ndarray):
+                try:
+                    self._realtime_client.append_audio(audio_chunk)
+                except Exception as e:
+                    print(f'[REALTIMESTT] Streaming error: {e}', flush=True)
+
+            _send_direct.set_input_sample_rate = self._realtime_client.set_input_sample_rate
+            self._realtime_streaming_callback = _send_direct
+
+        elif provider_id == 'google':
+            # Use Gemini Live API client
+            try:
+                from ..gemini_realtime_client import GeminiRealtimeClient
+            except ImportError:
+                from gemini_realtime_client import GeminiRealtimeClient
+
+            realtime_mode = self.config.get_setting('realtime_mode', 'transcribe')
+            self._realtime_client = GeminiRealtimeClient(mode=realtime_mode)
+
+            # Get WebSocket URL
+            websocket_url = self.config.get_setting('websocket_url')
+            if not websocket_url:
+                provider = get_provider(provider_id)
+                if provider and 'websocket_endpoint' in provider:
+                    websocket_url = provider['websocket_endpoint']
+                else:
+                    websocket_url = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent'
+
+            # Build instructions
+            instructions_parts = []
+            whisper_prompt = self.config.get_setting('whisper_prompt', None)
+            if whisper_prompt:
+                instructions_parts.append(whisper_prompt)
+
+            language = self.config.get_setting('language', None)
+            if language:
+                instructions_parts.append(f"Transcribe in {language} language.")
+
+            instructions = ' '.join(instructions_parts) if instructions_parts else None
+
+            # Set language
+            self._realtime_client.language = language
+
+            # Set buffer max seconds
+            buffer_max = self.config.get_setting('realtime_buffer_max_seconds', 5)
+            self._realtime_client.set_max_buffer_seconds(buffer_max)
+
+            # Connect (API key goes in URL query param, handled by client)
+            self._realtime_connect_params = {
+                'websocket_url': websocket_url,
+                'api_key': api_key,
+                'model_id': model_id,
+                'instructions': instructions,
+            }
+            if not self._realtime_client.connect(websocket_url, api_key, model_id, instructions):
+                print('ERROR: Failed to connect to Gemini Live API')
+                try:
+                    self._realtime_client.close()
+                except Exception:
+                    pass
+                self._realtime_client = None
+                return False
+
+            def _send_direct(audio_chunk: np.ndarray):
+                """Send audio directly to Gemini; client resamples if needed."""
+                try:
+                    self._realtime_client.append_audio(audio_chunk)
+                except Exception as e:
+                    print(f'[GEMINI] Streaming error: {e}', flush=True)
+
+            _send_direct.set_input_sample_rate = self._realtime_client.set_input_sample_rate
+            self._realtime_streaming_callback = _send_direct
+
+        elif provider_id == 'elevenlabs':
+            # Use ElevenLabs-specific client (Scribe v2 Realtime)
+            try:
+                from ..elevenlabs_realtime_client import ElevenLabsRealtimeClient
+            except ImportError:
+                from elevenlabs_realtime_client import ElevenLabsRealtimeClient
+
+            self._realtime_client = ElevenLabsRealtimeClient()
+
+            # Get WebSocket URL
+            websocket_url = self.config.get_setting('websocket_url')
+            if not websocket_url:
+                provider = get_provider(provider_id)
+                if provider and 'websocket_endpoint' in provider:
+                    websocket_url = provider['websocket_endpoint']
+                else:
+                    websocket_url = 'wss://api.elevenlabs.io/v1/speech-to-text/realtime'
+
+            # Set language (used at connection time via query params)
+            language = self.config.get_setting('language', None)
+            self._realtime_client.language = language
+
+            # Set buffer max seconds
+            buffer_max = self.config.get_setting('realtime_buffer_max_seconds', 5)
+            self._realtime_client.set_max_buffer_seconds(buffer_max)
+
+            # Connect (ElevenLabs doesn't use instructions)
+            self._realtime_connect_params = {
+                'websocket_url': websocket_url,
+                'api_key': api_key,
+                'model_id': model_id,
+                'instructions': None,
+            }
+            if not self._realtime_client.connect(websocket_url, api_key, model_id, None):
+                print('ERROR: Failed to connect to ElevenLabs Realtime WebSocket')
+                try:
+                    self._realtime_client.close()
+                except Exception:
+                    pass
+                self._realtime_client = None
+                return False
+
+            def _send_direct(audio_chunk: np.ndarray):
+                """Send audio directly to ElevenLabs; client resamples if needed."""
+                try:
+                    self._realtime_client.append_audio(audio_chunk)
+                except Exception as e:
+                    print(f'[ELEVENLABS] Streaming error: {e}', flush=True)
+
+            _send_direct.set_input_sample_rate = self._realtime_client.set_input_sample_rate
+            self._realtime_streaming_callback = _send_direct
+
+        else:
+            # Use OpenAI-compatible client (default)
+            try:
+                from ..realtime_client import RealtimeClient
+            except ImportError:
+                from realtime_client import RealtimeClient
+
+            # Initialize RealtimeClient with mode
+            realtime_mode = self.config.get_setting('realtime_mode', 'transcribe')
+            if provider_id == 'openai' and model_id == 'gpt-realtime-whisper' and realtime_mode != 'transcribe':
+                print('ERROR: gpt-realtime-whisper is supported only with realtime_mode="transcribe"', flush=True)
+                return False
+            self._realtime_client = RealtimeClient(mode=realtime_mode)
+
+            # Get WebSocket URL
+            websocket_url = self.config.get_setting('websocket_url')
+            if not websocket_url:
+                # For custom providers, websocket_url must be explicitly set
+                if provider_id == 'custom':
+                    print('ERROR: Custom realtime backend requires websocket_url to be configured')
                     return False
+
+                # For known providers, derive from provider registry
                 try:
                     websocket_url = self._get_websocket_url(provider_id, model_id, realtime_mode)
                 except Exception as e:
-                    log(f'ERROR: Failed to derive WebSocket URL: {e}')
+                    print(f'ERROR: Failed to derive WebSocket URL: {e}')
                     return False
+
+            # Build instructions from whisper_prompt and language
+            instructions_parts = []
+            whisper_prompt = self.config.get_setting('whisper_prompt', None)
+            if whisper_prompt:
+                instructions_parts.append(whisper_prompt)
+
+            language = self.config.get_setting('language', None)
+            if language:
+                instructions_parts.append(f"Transcribe in {language} language.")
+
+            instructions = ' '.join(instructions_parts) if instructions_parts else None
+
+            # Set language in realtime client (for session.update)
+            self._realtime_client.language = language
+
+            delay = self.config.get_setting('realtime_transcription_delay', 'low')
+            self._realtime_client.set_transcription_delay(delay)
+            if self._is_partial_preview_enabled(provider_id, model_id, realtime_mode):
+                self._realtime_client.set_partial_transcript_callback(self._realtime_partial_callback)
             else:
-                websocket_url = (get_provider(provider_id) or {}).get('websocket_endpoint')
-                if not websocket_url:
-                    log(f'ERROR: Provider {provider_id} has no websocket_endpoint')
-                    return False
+                self._realtime_client.set_partial_transcript_callback(None)
+                self._clear_realtime_partial_preview()
 
-        language = self.config.get_setting('language', None)
-        instructions = self._build_instructions(language) if protocol.uses_instructions else None
+            # Set buffer max seconds
+            buffer_max = self.config.get_setting('realtime_buffer_max_seconds', 5)
+            self._realtime_client.set_max_buffer_seconds(buffer_max)
 
-        self._realtime_client = client
-        try:
-            self._update_client_language(language, model_id=model_id)
-        except ValueError as e:
-            log(f'ERROR: {e}')
-            self._realtime_client = None
-            return False
-        client.set_max_buffer_seconds(self.config.get_setting('realtime_buffer_max_seconds', 5))
-        self.apply_partial_callback(self._realtime_partial_callback)
-        self.apply_live_listener(getattr(self._manager, '_realtime_live_listener', None))
-        if self.config.get_setting('realtime_live_typing', False):
-            conflict = live_typing_conflict(self.config.get_setting)
-            if conflict:
-                log(f'[REALTIME] Live typing off: {conflict}; text pastes at stop')
+            # Connect
+            self._realtime_connect_params = {
+                'websocket_url': websocket_url,
+                'api_key': api_key,
+                'model_id': model_id,
+                'instructions': instructions,
+            }
+            if not self._realtime_client.connect(websocket_url, api_key, model_id, instructions):
+                print('ERROR: Failed to connect to Realtime WebSocket')
+                # Clean up failed client
+                try:
+                    self._realtime_client.close()
+                except Exception:
+                    pass
+                self._realtime_client = None
+                return False
 
-        self._realtime_connect_params = {
-            'websocket_url': websocket_url,
-            'api_key': api_key,
-            'model_id': model_id,
-            'instructions': instructions,
-        }
-        if not client.connect(websocket_url, api_key, model_id, instructions):
-            log(f'ERROR: Failed to connect to realtime WebSocket ({protocol.id})')
-            try:
-                client.close()
-            except Exception:
-                pass
-            self._realtime_client = None
-            return False
+            def _send_direct(audio_chunk: np.ndarray):
+                """Send audio to realtime client; client handles resampling/queueing."""
+                try:
+                    self._realtime_client.append_audio(audio_chunk)
+                except Exception as e:
+                    print(f'[REALTIME] Streaming error: {e}', flush=True)
 
-        def _send_direct(audio_chunk: np.ndarray):
-            """Queue audio on the client; it resamples and sends off-thread."""
-            try:
-                client.append_audio(audio_chunk)
-            except Exception as e:
-                log(f'{client.LOG_TAG} Streaming error: {e}')
+            _send_direct.set_input_sample_rate = self._realtime_client.set_input_sample_rate
+            self._realtime_streaming_callback = _send_direct
 
-        _send_direct.set_input_sample_rate = client.set_input_sample_rate
-        self._realtime_streaming_callback = _send_direct
-
-        log(f'[BACKEND] Using Realtime WebSocket: {websocket_url}')
-        log(f'[REALTIME] Model: {model_id}, Provider: {provider_id}, Protocol: {protocol.id}')
+        print(f'[BACKEND] Using Realtime WebSocket: {websocket_url}')
+        print(f'[REALTIME] Model: {model_id or "server-managed"}, Provider: {provider_id}')
 
         # Explicitly set to None to avoid confusion with top-level model setting
         self.current_model = None
         self.ready = True
         return True
-
-    # Server-shape options that only make sense for a custom endpoint
-    CUSTOM_ONLY_SETTINGS = ('websocket_sample_rate', 'websocket_session_format')
-
-    def _client_setting_reader(self, provider_id: str):
-        """get_setting for the client; built-in providers never see custom-only options."""
-        def get_setting(key, default=None):
-            if provider_id != 'custom' and key in self.CUSTOM_ONLY_SETTINGS:
-                return default
-            return self.config.get_setting(key, default)
-        return get_setting
-
-    def _build_instructions(self, language: Optional[str]) -> Optional[str]:
-        """Session instructions from the whisper prompt and language."""
-        parts = []
-        whisper_prompt, _ = self.resolve_whisper_prompt(language)
-        if whisper_prompt:
-            parts.append(whisper_prompt)
-        if language:
-            parts.append(f"Transcribe in {language} language.")
-        return ' '.join(parts) if parts else None
 
     def _get_websocket_url(self, provider_id: str, model_id: str, mode: str = 'transcribe') -> str:
         """
@@ -286,11 +389,11 @@ class RealtimeWsBackend(TranscriptionBackend):
             Transcribed text string
         """
         if not self._realtime_client:
-            log('[REALTIME] Client not initialized')
+            print('[REALTIME] Client not initialized')
             return ""
         
-        if not (self._realtime_client.connected or self._realtime_client.commit_after_disconnect):
-            log('[REALTIME] Client not connected')
+        if not self._realtime_client.connected:
+            print('[REALTIME] Client not connected')
             return ""
         
         try:
@@ -300,10 +403,13 @@ class RealtimeWsBackend(TranscriptionBackend):
             # doing so would trigger a reconnect and silently drop the audio.
             if language_override is not None:
                 if getattr(self._realtime_client, 'supports_mid_session_language_update', True):
-                    self.update_language(language_override)
+                    self._realtime_client.update_language(language_override)
                 else:
-                    log(f'[REALTIME] Provider does not support mid-session language override '
-                        f'(requested: {language_override}); change will take effect on next session')
+                    print(
+                        f'[REALTIME] Provider does not support mid-session language override '
+                        f'(requested: {language_override}); change will take effect on next session',
+                        flush=True,
+                    )
             
             # Get timeout from config
             timeout = self.config.get_setting('realtime_timeout', 30)
@@ -314,7 +420,7 @@ class RealtimeWsBackend(TranscriptionBackend):
             return transcription.strip()
             
         except Exception as e:
-            log(f'[REALTIME] Transcription failed: {e}')
+            print(f'[REALTIME] Transcription failed: {e}')
             return ""
 
     def get_streaming_callback(self) -> Optional[Callable]:
@@ -327,30 +433,25 @@ class RealtimeWsBackend(TranscriptionBackend):
         backend = self.config.get_setting('transcription_backend', 'pywhispercpp')
         backend = normalize_backend(backend)
         
-        if backend != 'realtime-ws':
-            return None
+        if backend == 'realtime-ws' and self._realtime_client:
+            # If the server closed the socket while idle, reconnect on-demand here
+            # (before we start capturing audio) to avoid dropping the first chunks.
+            if not self._realtime_client.connected:
+                if not self._reconnect_realtime_client():
+                    return None
 
-        # Recover here — before we start capturing audio — so the first chunks
-        # aren't dropped, whether the socket went idle or the client was torn
-        # down entirely by an earlier failure.
-        if not self._ensure_client():
-            return None
-
-        # Clear server buffer before starting new recording
-        try:
-            self._realtime_client.clear_audio_buffer()
-        except RuntimeError as e:
-            # A one-stream-per-recording socket can close between the readiness
-            # check and here. Capture hasn't started, so one fresh attempt is safe.
-            log(f'[REALTIME] {e}; reconnecting before capture')
-            if not self._reconnect_realtime_client():
-                return None
-            try:
-                self._realtime_client.clear_audio_buffer()
-            except RuntimeError:
-                return None
-        self._clear_realtime_partial_preview()
-        return self._realtime_streaming_callback
+            # Start a fresh provider-side take before capture begins. Protocol
+            # adapters may need more than a generic buffer clear (RealtimeSTT
+            # sends clear + start on the same session-owned socket).
+            start_stream = getattr(
+                self._realtime_client,
+                'start_audio_stream',
+                self._realtime_client.clear_audio_buffer,
+            )
+            start_stream()
+            self._clear_realtime_partial_preview()
+            return self._realtime_streaming_callback
+        return None
 
     def apply_partial_callback(self, callback: Optional[Callable[[str], None]]) -> None:
         """Apply the partial-preview callback to the active realtime provider."""
@@ -373,16 +474,6 @@ class RealtimeWsBackend(TranscriptionBackend):
         if not enabled:
             self._clear_realtime_partial_preview()
 
-    def apply_live_listener(self, listener) -> None:
-        """Route structured live text (committed, tail) to `listener`."""
-        if self._realtime_client:
-            self._realtime_client.set_live_text_listener(listener)
-
-    @property
-    def live_typing_supported(self) -> bool:
-        """Config allows typing live text early (append-only model, whole-dictation consumers off)."""
-        return live_typing_conflict(self.config.get_setting) is None
-
     def _is_partial_preview_enabled(
         self,
         provider_id: str,
@@ -404,11 +495,18 @@ class RealtimeWsBackend(TranscriptionBackend):
                 and self.config.get_setting('mic_osd_pill_transcript_enabled', False)
             )
 
-        # Waveform: only models whose text streams mid-utterance.
-        return live_text_mode(
-            provider_id, model_id, self.config.get_setting('websocket_live_text'),
-            self.config.get_setting('websocket_protocol'),
-        ) != 'none'
+        # Full-size styles can display provider partials without the pill's
+        # opt-in animation. Keep the established OpenAI gate, and enable the
+        # native RealtimeSTT adapter whose protocol always supplies interim text.
+        if provider_id == 'openai':
+            return model_id == 'gpt-realtime-whisper'
+        if provider_id == 'realtimestt':
+            return bool(
+                self._realtime_client is not None
+                and hasattr(self._realtime_client, 'set_partial_transcript_callback')
+            )
+
+        return False
 
     def _clear_realtime_partial_preview(self) -> None:
         if not self._realtime_partial_callback:
@@ -416,58 +514,7 @@ class RealtimeWsBackend(TranscriptionBackend):
         try:
             self._realtime_partial_callback("")
         except Exception as e:
-            log(f'[REALTIME] Failed to clear partial transcript preview: {e}')
-
-    @property
-    def last_connect_failure(self) -> Optional[str]:
-        """Why the last recovery attempt failed: 'connecting', 'cooldown', 'failed', or None."""
-        return self._last_connect_failure
-
-    def _ensure_client(self) -> bool:
-        """Make the realtime client usable for a new recording.
-
-        Single recovery entry point for the three states a client can be in:
-        connected, disconnected (idle close), or gone entirely — the last one
-        happens whenever close_realtime_connection() runs on a recording failure
-        or suspend, and nothing outside the resume path rebuilds it.
-        """
-        if self._realtime_client:
-            if self._realtime_client.busy:
-                log('[REALTIME] Previous recording is still awaiting its transcript')
-                self._last_connect_failure = 'processing'
-                return False
-            if self._realtime_client.connected and not self._realtime_client.needs_fresh_session:
-                self._last_connect_failure = None
-                return True
-            return self._reconnect_realtime_client()
-
-        now = time.monotonic()
-        last = self._last_rebuild_attempt
-        if last is not None and (now - last) < self.REBUILD_COOLDOWN_SECS:
-            log('[REALTIME] Rebuild failed recently; waiting before retry')
-            self._last_connect_failure = 'cooldown'
-            return False
-
-        # initialize() can block on the connect timeout, so don't retry it on
-        # every keypress while the endpoint is down.
-        self._last_rebuild_attempt = now
-        log('[REALTIME] Rebuilding client after teardown')
-        try:
-            rebuilt = self.initialize()
-        except Exception as e:
-            log(f'[REALTIME] Rebuild failed: {e}')
-            self._last_connect_failure = 'failed'
-            return False
-
-        if not rebuilt or not self._realtime_client:
-            self._last_connect_failure = 'failed'
-            return False
-
-        # Only failures should hold the cooldown, or a teardown shortly after a
-        # good rebuild would be stalled by the previous success.
-        self._last_rebuild_attempt = None
-        self._last_connect_failure = None
-        return True
+            print(f'[REALTIME] Failed to clear partial transcript preview: {e}', flush=True)
 
     def _reconnect_realtime_client(self) -> bool:
         """Reconnect realtime client using stored connect params."""
@@ -485,12 +532,10 @@ class RealtimeWsBackend(TranscriptionBackend):
                     break
                 time.sleep(0.1)
             if self._realtime_client.connected:
-                log('[REALTIME] In-flight connection landed; proceeding')
-                self._last_connect_failure = None
+                print('[REALTIME] In-flight connection landed; proceeding', flush=True)
                 return True
             if getattr(self._realtime_client, 'connecting', False):
-                log('[REALTIME] Still connecting; try again in a moment')
-                self._last_connect_failure = 'connecting'
+                print('[REALTIME] Still connecting; try again in a moment', flush=True)
                 return False
             # Attempt finished without connecting; fall through to reconnect.
 
@@ -500,46 +545,40 @@ class RealtimeWsBackend(TranscriptionBackend):
         model_id = params.get('model_id')
         instructions = params.get('instructions')
 
-        # api_key may be None: custom endpoints can be keyless
-        if not (websocket_url and model_id):
-            log('[REALTIME] Missing connection parameters; cannot reconnect')
-            self._last_connect_failure = 'failed'
+        if not websocket_url:
+            print('[REALTIME] Missing connection parameters; cannot reconnect', flush=True)
             return False
 
         try:
-            # Best-effort: drop stale socket/thread state first. Use reset() where
-            # available — close() latches the client shut and would make every
-            # reconnect from here fail instantly (issue #229). ElevenLabs has no
-            # reset(); its close() is already a transient teardown.
+            # Best-effort: close any stale connection first
             try:
-                teardown = getattr(self._realtime_client, 'reset', None)
-                if teardown is None:
-                    teardown = self._realtime_client.close
-                teardown()
+                self._realtime_client.close()
             except Exception:
                 pass
 
             if not self._realtime_client.connect(websocket_url, api_key, model_id, instructions):
-                log('[REALTIME] Reconnect failed')
-                self._last_connect_failure = 'failed'
+                print('[REALTIME] Reconnect failed', flush=True)
                 return False
 
-            log('[REALTIME] Reconnected on-demand')
-            self._last_connect_failure = None
+            print('[REALTIME] Reconnected on-demand', flush=True)
             return True
         except Exception as e:
-            log(f'[REALTIME] Reconnect failed: {e}')
-            self._last_connect_failure = 'failed'
+            print(f'[REALTIME] Reconnect failed: {e}', flush=True)
             return False
 
     def discard_audio(self) -> None:
         """Drop buffered audio client- and server-side; keep the connection alive."""
         if self._realtime_client:
             try:
-                self._realtime_client.discard_audio()
+                discard = getattr(
+                    self._realtime_client,
+                    'discard_audio_buffer',
+                    self._realtime_client.clear_audio_buffer,
+                )
+                discard()
                 self._clear_realtime_partial_preview()
             except Exception as e:
-                log(f'[REALTIME] Failed to discard audio: {e}')
+                print(f'[REALTIME] Failed to discard audio: {e}', flush=True)
 
     def close(self) -> None:
         """Cleanup Realtime WebSocket client"""
@@ -550,14 +589,12 @@ class RealtimeWsBackend(TranscriptionBackend):
                 self._realtime_streaming_callback = None
                 self._clear_realtime_partial_preview()
             except Exception as e:
-                log(f"[WARN] Failed to cleanup realtime client: {e}")
+                print(f"[WARN] Failed to cleanup realtime client: {e}")
 
     def update_language(self, language: Optional[str]) -> None:
         """Apply a language override to a connected client (no-op otherwise)."""
-        try:
-            self._update_client_language(language)
-        except ValueError as e:
-            log(f'[REALTIME] Language override ignored: {e}')
+        if self._realtime_client:
+            self._realtime_client.update_language(language)
 
     def reinitialize(self) -> bool:
         """Re-establish the connection after suspend/resume (full re-init)."""
@@ -565,11 +602,6 @@ class RealtimeWsBackend(TranscriptionBackend):
 
     def cleanup(self) -> None:
         self.close()
-
-    @property
-    def is_busy(self) -> bool:
-        """A one-stream-per-recording client is still finishing the last recording."""
-        return bool(self._realtime_client and self._realtime_client.busy)
 
     @property
     def is_loaded(self) -> bool:

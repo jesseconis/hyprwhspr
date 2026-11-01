@@ -17,7 +17,7 @@ import base64
 import threading
 import time
 from typing import Optional
-from queue import Queue
+from queue import Queue, Empty
 from collections import deque
 
 try:
@@ -26,54 +26,17 @@ except ImportError:
     from audio_resampler import resample_audio
 
 try:
-    from .text_script import join_segments
-except ImportError:
-    from text_script import join_segments
-
-try:
     import numpy as np
 except (ImportError, ModuleNotFoundError) as e:
     print("ERROR: python-numpy is not available in this Python environment.", file=sys.stderr)
     print(f"ImportError: {e}", file=sys.stderr)
     sys.exit(1)
 
-def running_text(committed: str, tail: str) -> str:
-    """Committed text plus the live tail, keeping the tail's trailing space.
-
-    The OSD renders partials as they grow; a trailing space marks a finished
-    word, so it survives here while segment joins stay CJK-aware.
-    """
-    head = (committed or '').strip()
-    if not head:
-        return tail or ''
-    if not (tail or '').strip():
-        return head
-    return join_segments([head, tail]) + tail[len(tail.rstrip()):]
-
-
 class RealtimeAudioClientBase:
     """Audio queueing, backpressure and format conversion shared by all realtime clients."""
 
     LOG_TAG = '[REALTIME]'
     IDLE_CLOSE_SECS = 10.0
-
-    # Session lifecycle. Most protocols keep one connection and clear it between
-    # recordings; a protocol that can't (Phonon) reports a used session through
-    # needs_fresh_session, stays busy until its transcript is consumed, and may
-    # finish a commit after the server has closed the socket.
-    commit_after_disconnect = False
-
-    @property
-    def needs_fresh_session(self) -> bool:
-        return False
-
-    @property
-    def busy(self) -> bool:
-        return False
-
-    def discard_audio(self):
-        """Drop the current recording's audio; the connection stays when it can."""
-        self.clear_audio_buffer()
 
     def __init__(self):
         self.api_key = None
@@ -86,12 +49,6 @@ class RealtimeAudioClientBase:
 
         # Connection state (transport managed by subclass)
         self.connected = False
-
-        # Live text: the OSD gets the whole running transcript as one string;
-        # the listener gets (committed, tail) with the tail unstripped, so it
-        # can tell whether the last word is finished.
-        self.partial_transcript_callback = None
-        self._live_text_listener = None
 
         # Audio streaming
         # IMPORTANT: append_audio() is called from the sounddevice callback thread.
@@ -144,39 +101,6 @@ class RealtimeAudioClientBase:
             return
         if sample_rate > 0:
             self.input_sample_rate = sample_rate
-
-    def set_partial_transcript_callback(self, callback):
-        """Register the OSD preview callback (whole running transcript)."""
-        self.partial_transcript_callback = callback
-
-    def set_live_text_listener(self, listener):
-        """Register listener(committed, tail) for structured live text."""
-        self._live_text_listener = listener
-
-    def _publish_live_text(self, committed: str, tail: str):
-        """Publish the running transcript to both consumers. Call without self.lock."""
-        callback = self.partial_transcript_callback
-        if callback:
-            try:
-                callback(running_text(committed, tail))
-            except Exception as e:
-                self._log(f'Partial transcript callback failed: {e}')
-        listener = self._live_text_listener
-        if listener:
-            try:
-                listener(committed, tail)
-            except Exception as e:
-                self._log(f'Live text listener failed: {e}')
-
-    def configure(self, get_setting):
-        """Read protocol-specific settings before connecting (get_setting(key, default))."""
-        rate = get_setting('websocket_sample_rate', None)
-        if rate is None:
-            return
-        if isinstance(rate, int) and not isinstance(rate, bool) and 8000 <= rate <= 96000:
-            self.sample_rate = rate
-        else:
-            self._log(f'Invalid websocket_sample_rate {rate!r}, using {self.sample_rate}')
 
     def set_max_buffer_seconds(self, seconds: float):
         """Set maximum buffer size in seconds for backpressure handling"""
@@ -264,9 +188,6 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
         self.instructions = None
         self.mode = mode
 
-        # Serializes ws.send() across threads (websocket-client isn't safe for concurrent sends).
-        self._ws_send_lock = threading.Lock()
-
         # Connection state
         self.connecting = False
         self.receiver_thread = None
@@ -275,8 +196,6 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
         self._reconnect_threads = set()
         self._stop_event = threading.Event()
         self._closed = False
-        # Set by the transport callbacks when the in-flight attempt dies.
-        self._attempt_failed = None
         self._connection_generation = 0
         self._active_generation = 0
 
@@ -312,6 +231,16 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
         """Build the provider-specific JSON message for one audio chunk."""
         raise NotImplementedError
 
+    def _send_audio_payload(self, ws, pcm_bytes: bytes):
+        """Encode and send one PCM chunk.
+
+        Most providers use base64 inside JSON. Protocol adapters with binary
+        framing (for example RealtimeSTT) override this at the transport
+        boundary instead of duplicating the queue/backpressure machinery.
+        """
+        base64_audio = base64.b64encode(pcm_bytes).decode('utf-8')
+        ws.send(json.dumps(self._audio_ws_message(base64_audio)))
+
     def _handle_event(self, event: dict):
         """Handle a single event from the server."""
         raise NotImplementedError
@@ -326,9 +255,6 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
     def _request_transcript(self, ctx: dict):
         """Signal end of input to the server (commit / turn complete)."""
         raise NotImplementedError
-
-    def _on_response_timeout(self):
-        """Hook for providers which need to cancel an unfinished response."""
 
     # ------------------------------------------------------------------
     # Transport
@@ -389,9 +315,7 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
             try:
                 resampled = self._resample_for_output(audio_chunk)
                 pcm_bytes = self._float32_to_pcm16(resampled)
-                base64_audio = base64.b64encode(pcm_bytes).decode('utf-8')
-                with self._ws_send_lock:
-                    ws.send(json.dumps(self._audio_ws_message(base64_audio)))
+                self._send_audio_payload(ws, pcm_bytes)
             except Exception as e:
                 self._log(f'Failed to send queued audio: {e}')
 
@@ -412,12 +336,6 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
         self.api_key = api_key
         self.model = model
         self.instructions = instructions
-
-        with self.lock:
-            # An explicit connect() reopens a client that close() latched shut;
-            # the backend's on-demand reconnect closes stale state first.
-            self._closed = False
-            self._stop_event.clear()
 
         return self._connect_internal()
 
@@ -451,18 +369,12 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
                 on_close=lambda ws, code, message: self._on_close(ws, code, message, generation),
                 **kwargs,
             )
-            # Lets the transport's error/close callbacks end this attempt's wait
-            # early instead of burning the full timeout on an endpoint that has
-            # already refused us.
-            attempt_failed = threading.Event()
-
             abandon_closed_attempt = False
             with self.lock:
                 if self._closed or generation != self._active_generation:
                     abandon_closed_attempt = True
                 else:
                     self.ws = attempt_ws
-                    self._attempt_failed = attempt_failed
             if abandon_closed_attempt:
                 attempt_ws.close()
                 return False
@@ -479,8 +391,6 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
             while not self.connected and (time.time() - start_time) < timeout:
                 if self._stop_event.wait(0.1):
                     break
-                if attempt_failed.is_set():
-                    break
 
             if self.connected:
                 self._log('Connected successfully')
@@ -488,7 +398,7 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
                 self._on_connect_success()
                 return True
             else:
-                self._log('Connection failed' if attempt_failed.is_set() else 'Connection timeout')
+                self._log('Connection timeout')
                 self._abandon_attempt(attempt_ws)
                 return False
 
@@ -527,10 +437,9 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
             if not self.receiver_running:
                 self.receiver_running = True
                 start_receiver = True
-                events = self.event_queue
 
         if start_receiver:
-            self.receiver_thread = threading.Thread(target=self._receiver_loop, args=(events,), daemon=True)
+            self.receiver_thread = threading.Thread(target=self._receiver_loop, daemon=True)
             self.receiver_thread.start()
 
         self._after_open(ws)
@@ -552,13 +461,7 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
         with self.lock:
             if not self._is_active_connection(ws, generation):
                 return
-            self._fail_pending_attempt_locked()
         self._log(f'WebSocket error: {error}')
-
-    def _fail_pending_attempt_locked(self):
-        """Mark the in-flight connect attempt dead (no-op once connected)."""
-        if not self.connected and self._attempt_failed is not None:
-            self._attempt_failed.set()
 
     def _on_close(self, ws, close_status_code, _close_msg, generation=None):
         """Handle WebSocket close"""
@@ -569,9 +472,6 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
             if not self._is_active_connection(ws, generation):
                 self._log(f'Ignoring close from obsolete WebSocket (code: {close_status_code})')
                 return
-            # A close before the handshake lands is a failed attempt, not an
-            # idle drop — don't make the caller wait out the connect timeout.
-            self._fail_pending_attempt_locked()
             was_connected = self.connected
             self.connected = False
             # Stop sender thread on disconnect; it will be restarted on next connect.
@@ -598,20 +498,15 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
                     self._reconnect_threads.add(reconnect_thread)
                 reconnect_thread.start()
 
-    def _receiver_loop(self, events):
-        """Background thread to process incoming events.
-
-        Blocks rather than polls: an idle connection can stay open for hours.
-        Teardown hands the next session a fresh queue and wakes this one with None.
-        Ownership is the queue, not receiver_running: a quick reopen sets that
-        flag again while this thread may still be draining the old session.
-        """
-        while True:
-            event = events.get()
-            if event is None or events is not self.event_queue:
-                return
+    def _receiver_loop(self):
+        """Background thread to process incoming events"""
+        while self.receiver_running:
             try:
+                # Get event with timeout
+                event = self.event_queue.get(timeout=0.1)
                 self._handle_event(event)
+            except Empty:
+                continue
             except Exception as e:
                 self._log(f'Error in receiver loop: {e}')
 
@@ -629,12 +524,8 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
                     self._log('Reconnection cancelled (closing)')
                     return False
 
-                # Abort if the client was closed or torn down while we were waiting.
-                # Read under the lock: _closed can flip both ways now that an
-                # explicit connect() reopens a latched client.
-                with self.lock:
-                    cancelled = self._closed or not self.receiver_running
-                if cancelled:
+                # Abort if the client was closed while we were waiting
+                if self._closed or not self.receiver_running:
                     self._log('Reconnection cancelled (closing)')
                     return False
 
@@ -648,37 +539,15 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
             self._reconnect_lock.release()
 
     def close(self):
-        """Close WebSocket connection and cleanup (permanent: latches the client shut)."""
-        self._shutdown(latch=True)
-
-    def reset(self):
-        """Tear the connection down without latching, so connect() can reopen it.
-
-        close() latches `_closed` so background reconnect loops stand down during
-        a real shutdown. Reconnect paths want the same teardown *without* that
-        latch — see issue #229, where closing before reconnecting left the client
-        permanently unusable.
-        """
-        self._shutdown(latch=False)
-
-    def _shutdown(self, latch: bool):
-        """Shared teardown. `_closed` is mutated only under self.lock."""
+        """Close WebSocket connection and cleanup"""
         with self.lock:
-            if self._closed and latch:
+            if self._closed:
                 return
-            if latch:
-                self._closed = True
-                self._stop_event.set()
+            self._closed = True
+            self._stop_event.set()
             self._active_generation += 1
-            # Any in-flight attempt is abandoned by the generation bump, and its
-            # own finally clause won't clear this flag once generations diverge.
-            self.connecting = False
-            # reset() sets no stop signal, so wake a waiting attempt explicitly.
-            self._fail_pending_attempt_locked()
             self._sender_running = False
             self.receiver_running = False
-            events, self.event_queue = self.event_queue, Queue()
-            events.put(None)
             self._audio_queue.clear()
             self.audio_buffer_seconds = 0.0
             self._queue_cond.notify_all()
@@ -706,20 +575,16 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
 
         with self.lock:
             self.connected = False
-            if not latch and not self._closed:
-                # Leave the client usable: no latch, and no lingering stop signal
-                # for the next attempt's wait loops to trip over. A client that
-                # was already closed for good keeps its stop signal.
-                self._stop_event.clear()
 
-        self._log('Connection closed' if latch else 'Connection reset for reconnect')
+        self._log('Connection closed')
 
     # ------------------------------------------------------------------
     # Transcript assembly / commit
     # ------------------------------------------------------------------
 
     def _full_committed_text_locked(self) -> str:
-        return join_segments(self._committed_segments)
+        parts = [p for p in self._committed_segments if p]
+        return ' '.join(parts).strip()
 
     def _reset_stream_state_locked(self):
         """Reset per-recording state (call under lock)."""
@@ -816,7 +681,11 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
             if self.mode == 'transcribe':
                 deadline = time.time() + max(0.0, timeout)
                 best_generation = existing_generation
-                best_text = ""
+                # A provider may acknowledge stop without producing another
+                # segment (for example, when VAD finalized just before key-up).
+                # Preserve the best transcript already received while still
+                # allowing a later generation to replace/extend it.
+                best_text = existing_transcript
 
                 while time.time() < deadline:
                     remaining = max(0.0, deadline - time.time())
@@ -868,7 +737,6 @@ class WebSocketRealtimeClientBase(RealtimeAudioClientBase):
                 return ""
 
             self._log(f'Timeout waiting for response ({timeout}s)')
-            self._on_response_timeout()
             return ""
 
         except Exception as e:

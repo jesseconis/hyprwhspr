@@ -3,7 +3,6 @@ Waybar integration commands for hyprwhspr
 """
 
 import json
-import os
 from pathlib import Path
 
 try:
@@ -11,12 +10,7 @@ try:
 except ImportError:
     from output_control import log_info, log_success, log_warning, log_error
 
-try:
-    from ..installation import is_nix_install, tray_command as stable_tray_command
-except ImportError:
-    from installation import is_nix_install, tray_command as stable_tray_command
-
-from ._shared import (HYPRWHSPR_ROOT, USER_HOME, _load_jsonc, _strip_jsonc,
+from ._shared import (HYPRWHSPR_ROOT, USER_HOME, _load_jsonc,
                       _validate_hyprwhspr_root)
 
 
@@ -25,49 +19,16 @@ from ._shared import (HYPRWHSPR_ROOT, USER_HOME, _load_jsonc, _strip_jsonc,
 def waybar_command(action: str):
     """Handle waybar subcommands"""
     if action == 'install':
-        if setup_waybar('install') is False:
-            raise RuntimeError('Waybar installation incomplete; see the reported conflicts')
+        setup_waybar('install')
     elif action == 'remove':
-        if setup_waybar('remove') is False:
-            raise RuntimeError('Waybar removal incomplete; reconcile the preserved files and retry')
+        setup_waybar('remove')
     elif action == 'status':
         waybar_status()
     else:
         log_error(f"Unknown waybar action: {action}")
 
 
-def _module_placements(config):
-    """Return (location, list) pairs containing reachable hyprwhspr placements."""
-    sections = [(key, config.get(key)) for key in ('modules-left', 'modules-center', 'modules-right')]
-    placements = []
-    visited = set()
-    while sections:
-        location, section = sections.pop()
-        if not isinstance(section, list):
-            continue
-        if 'custom/hyprwhspr' in section:
-            placements.append((location, section))
-        for module in section:
-            if isinstance(module, str) and module.startswith('group/') and module not in visited:
-                visited.add(module)
-                group = config.get(module)
-                if isinstance(group, dict):
-                    sections.append((f'{module}.modules', group.get('modules')))
-    return placements
-
-
-def _includes(config) -> list:
-    """The include list; Waybar also accepts a single path string."""
-    include = config.get('include', [])
-    return [include] if isinstance(include, str) else include
-
-
-def _module_placed(config) -> bool:
-    """True when custom/hyprwhspr is reachable from a bar section."""
-    return bool(_module_placements(config))
-
-
-def _setup_waybar(mode: str = 'install'):
+def setup_waybar(mode: str = 'install'):
     """Setup or remove waybar integration"""
     if mode == 'install':
         log_info("Setting up Waybar integration...")
@@ -90,24 +51,10 @@ def _setup_waybar(mode: str = 'install'):
         log_error(f"Waybar CSS not found: {css_file}")
         return False
     
-    config_home = Path(os.environ.get('XDG_CONFIG_HOME', USER_HOME / '.config'))
-    waybar_config = config_home / 'waybar' / 'config.jsonc'
-    waybar_style = config_home / 'waybar' / 'style.css'
-    user_module_config = config_home / 'waybar' / 'hyprwhspr-module.jsonc'
+    waybar_config = USER_HOME / '.config' / 'waybar' / 'config.jsonc'
+    waybar_style = USER_HOME / '.config' / 'waybar' / 'style.css'
+    user_module_config = USER_HOME / '.config' / 'waybar' / 'hyprwhspr-module.jsonc'
     
-    if mode == 'install':
-        tray_command = stable_tray_command(HYPRWHSPR_ROOT)
-        if tray_command is None:
-            return False
-    if os.environ.get('HYPRWHSPR_GENERATION') or is_nix_install():
-        # Release and store paths change on update; import a copy instead.
-        css_target = user_module_config.parent / 'hyprwhspr-style.css'
-        if mode == 'install':
-            css_target.parent.mkdir(parents=True, exist_ok=True)
-            from managed_install import atomic_text
-            atomic_text(css_target, css_file.read_text(encoding='utf-8'))
-        css_file = css_target
-
     if mode == 'install':
         # Create waybar config directory
         waybar_config.parent.mkdir(parents=True, exist_ok=True)
@@ -132,12 +79,12 @@ def _setup_waybar(mode: str = 'install'):
         module_config = {
             "custom/hyprwhspr": {
                 "format": "{}",
-                "exec": f"{tray_command} status",
+                "exec": f"{HYPRWHSPR_ROOT}/config/hyprland/hyprwhspr-tray.sh status",
                 "interval": 1,
                 "return-type": "json",
                 "exec-on-event": True,
-                "on-click": f"{tray_command} record",
-                "on-click-right": f"{tray_command} restart",
+                "on-click": f"{HYPRWHSPR_ROOT}/config/hyprland/hyprwhspr-tray.sh record",
+                "on-click-right": f"{HYPRWHSPR_ROOT}/config/hyprland/hyprwhspr-tray.sh restart",
                 "tooltip": True
             }
         }
@@ -147,22 +94,20 @@ def _setup_waybar(mode: str = 'install'):
         
         # Update main waybar config
         try:
-            with open(waybar_config, 'r', encoding='utf-8') as f:
-                original = f.read()
-            config = json.loads(_strip_jsonc(original))
-            needs_include = str(user_module_config) not in _includes(config)
-            needs_module = not _module_placed(config)
+            config = _load_jsonc(waybar_config)
             
             # Add include if not present
-            config['include'] = _includes(config)
-            if needs_include:
+            if 'include' not in config:
+                config['include'] = []
+            
+            if str(user_module_config) not in config['include']:
                 config['include'].append(str(user_module_config))
             
             # Add module to modules-right if not present
             if 'modules-right' not in config:
                 config['modules-right'] = []
             
-            if needs_module:
+            if 'custom/hyprwhspr' not in config['modules-right']:
                 # Try to insert after group/tray-expander
                 try:
                     tray_index = config['modules-right'].index('group/tray-expander')
@@ -171,21 +116,11 @@ def _setup_waybar(mode: str = 'install'):
                     # group/tray-expander not found, append to end
                     config['modules-right'].append('custom/hyprwhspr')
             
-            if not needs_include and not needs_module:
-                log_info("Waybar config already includes hyprwhspr")
-            elif _strip_jsonc(original) != original:
-                # Rewriting would drop the user's comments; ask for the edit instead.
-                # The supporting files are installed safely; status will report
-                # partial configuration until the user adds these entries.
-                log_warning(f"{waybar_config} has comments, so it was left unchanged. Add:")
-                if needs_include:
-                    print(f'  "include": ["{user_module_config}"]')
-                if needs_module:
-                    print('  "custom/hyprwhspr" to "modules-right"')
-            else:
-                with open(waybar_config, 'w', encoding='utf-8') as f:
-                    json.dump(config, f, indent=2, separators=(',', ': '), ensure_ascii=False)
-                log_success("Waybar config updated")
+            # Write back
+            with open(waybar_config, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, separators=(',', ': '))
+            
+            log_success("Waybar config updated")
         except json.JSONDecodeError as e:
             log_error(f"Failed to parse waybar config.jsonc (after stripping comments): {e}")
             log_error("Please check your config.jsonc for JSON syntax errors.")
@@ -216,44 +151,25 @@ def _setup_waybar(mode: str = 'install'):
         # Remove from config
         if waybar_config.exists():
             try:
-                with open(waybar_config, 'r', encoding='utf-8') as f:
-                    original = f.read()
-                config = json.loads(_strip_jsonc(original))
-                has_include = str(user_module_config) in _includes(config)
-                placements = _module_placements(config)
+                config = _load_jsonc(waybar_config)
                 
                 # Remove from include
-                if has_include:
-                    config['include'] = _includes(config)
+                if 'include' in config and str(user_module_config) in config['include']:
                     config['include'].remove(str(user_module_config))
-                    if not config['include']:
-                        del config['include']
-
-                # Remove every occurrence from all reachable sections and groups.
-                for _, section in placements:
-                    section[:] = [module for module in section if module != 'custom/hyprwhspr']
                 
-                if (has_include or placements) and _strip_jsonc(original) != original:
-                    # Rewriting would drop the user's comments; ask for the edit instead.
-                    log_warning(f"{waybar_config} has comments, so it was left unchanged. Remove:")
-                    if has_include:
-                        print(f'  "{user_module_config}" from "include"')
-                    for location, _ in placements:
-                        print(f'  "custom/hyprwhspr" from "{location}"')
-                    # Keep the referenced module and its styling until the user
-                    # removes these entries and retries removal.
-                    return False
-                elif has_include or placements:
-                    with open(waybar_config, 'w', encoding='utf-8') as f:
-                        json.dump(config, f, indent=2, ensure_ascii=False)
-                    log_success("Removed from waybar config")
+                # Remove from modules-right
+                if 'modules-right' in config and 'custom/hyprwhspr' in config['modules-right']:
+                    config['modules-right'].remove('custom/hyprwhspr')
+                
+                with open(waybar_config, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, indent=2)
+                
+                log_success("Removed from waybar config")
             except json.JSONDecodeError as e:
                 log_error(f"Failed to parse waybar config.jsonc (after stripping comments): {e}")
                 log_error("Please check your config.jsonc for JSON syntax errors.")
-                return False
             except IOError as e:
                 log_error(f"Failed to read/write waybar config: {e}")
-                return False
         
         # Remove module config file
         if user_module_config.exists():
@@ -278,20 +194,14 @@ def _setup_waybar(mode: str = 'install'):
                     log_success("Removed CSS import")
             except IOError as e:
                 log_error(f"Failed to remove CSS import: {e}")
-
-        if is_nix_install() and not os.environ.get('HYPRWHSPR_GENERATION'):
-            # Last, so a removal that stops early keeps the file style.css imports.
-            # Managed installs remove it through edit_files ownership.
-            css_file.unlink(missing_ok=True)
     
     return True
 
 
 def waybar_status():
     """Check if waybar is configured"""
-    config_home = Path(os.environ.get('XDG_CONFIG_HOME', USER_HOME / '.config'))
-    waybar_config = config_home / 'waybar' / 'config.jsonc'
-    user_module_config = config_home / 'waybar' / 'hyprwhspr-module.jsonc'
+    waybar_config = USER_HOME / '.config' / 'waybar' / 'config.jsonc'
+    user_module_config = USER_HOME / '.config' / 'waybar' / 'hyprwhspr-module.jsonc'
     
     if not waybar_config.exists():
         log_warning("Waybar config not found")
@@ -300,8 +210,8 @@ def waybar_status():
     try:
         config = _load_jsonc(waybar_config)
         
-        has_module = _module_placed(config)
-        has_include = str(user_module_config) in _includes(config)
+        has_module = 'custom/hyprwhspr' in config.get('modules-right', [])
+        has_include = str(user_module_config) in config.get('include', [])
         has_module_file = user_module_config.exists()
         
         if has_module and has_include and has_module_file:
@@ -310,7 +220,7 @@ def waybar_status():
         else:
             log_warning("Waybar is partially configured")
             if not has_module:
-                log_info("  - Module not in the bar")
+                log_info("  - Module not in modules-right")
             if not has_include:
                 log_info("  - Module config not in include")
             if not has_module_file:
@@ -322,17 +232,3 @@ def waybar_status():
     except IOError as e:
         log_error(f"Failed to check waybar status: {e}")
         return False
-
-
-def setup_waybar(mode: str = 'install'):
-    if not os.environ.get('HYPRWHSPR_GENERATION'):
-        return _setup_waybar(mode)
-    from managed_integrations import edit_files
-    base = Path(os.environ.get('XDG_CONFIG_HOME', USER_HOME / '.config')) / 'waybar'
-    shared = [base / 'config.jsonc', base / 'style.css']
-    paths = shared + [base / 'hyprwhspr-module.jsonc', base / 'hyprwhspr-style.css']
-    removal = {}
-    with edit_files(paths, shared, mode, removal=removal) as proceed:
-        if proceed:
-            return _setup_waybar(mode)
-    return removal.get('complete', False) if mode == 'remove' else False

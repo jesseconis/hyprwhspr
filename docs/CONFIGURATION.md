@@ -1,11 +1,4 @@
-# Configuration
-
-Validate with ease:
-
-```bash
-hyprwhspr config validate  # Settings
-hyprwhspr status --report  # Settings, installation, live state
-```
+# Configuration guide
 
 Configure via `hyprwhspr setup`, the CLI, or by editing `~/.config/hyprwhspr/config.json` directly.
 
@@ -25,6 +18,35 @@ To view your overrides or the full resolved config:
 hyprwhspr config show        # Show your overrides only
 hyprwhspr config show --all  # Show all settings including defaults
 ```
+
+`show --all` emits clean JSON, including `$schema`, so you can temporarily
+materialize every resolved default into the editable file. Always write through
+a temporary file: redirecting directly to `config.json` would truncate it before
+hyprwhspr can read the existing overrides.
+
+```bash
+config="$HOME/.config/hyprwhspr/config.json"
+tmp="$(mktemp "$HOME/.config/hyprwhspr/.config.json.XXXXXX")"
+hyprwhspr config show --all > "$tmp" && mv "$tmp" "$config"
+```
+
+This is optional: absent settings are already active through the defaults. A
+later hyprwhspr command that saves configuration may compact the file back to
+sparse form by design.
+
+## Contents
+
+- [Minimal configuration](#minimal-configuration)
+- [Environment variable substitution](#environment-variable-substitution)
+- [Recording modes](#recording-modes) -- toggle, push-to-talk, auto, silence auto-stop, continuous, long-form
+- [Custom hotkeys](#custom-hotkeys) -- key support, secondary shortcuts, cancel, Hyprland bindings
+- [Backends](#backends) -- Cohere Transcribe, Parakeet, faster-whisper, whisper.cpp, REST API, Realtime WebSocket
+- [Audio and visual feedback](#audio-and-visual-feedback) -- themed visualizer, audio feedback, keepalive, ducking
+- [Text processing](#text-processing) -- word overrides, filler words, symbol replacements
+- [Paste and clipboard behavior](#paste-and-clipboard-behavior) -- paste mode, per-app paste keys, non-QWERTY, auto-submit, post-transcription hook
+- [Integrations](#integrations) -- Waybar, Noctalia, keyboard devices, external hotkey systems
+- [GPU resource management](#gpu-resource-management) -- unload/reload model to free VRAM
+- [Troubleshooting](#troubleshooting)
 
 ## Minimal configuration
 
@@ -48,3 +70,1666 @@ Tokens are stored as-is on disk and expanded at read time:
   "rest_api_key": "${OPENAI_API_KEY}"
 }
 ```
+
+## Recording modes
+
+### Toggle mode
+
+Toggle hotkey mode (default) - press to start, press again to stop:
+
+```jsonc
+{
+    "recording_mode": "toggle"
+}
+```
+
+### Push-to-talk mode
+
+Hold to record, release to stop:
+
+```jsonc
+{
+    "recording_mode": "push_to_talk"
+}
+```
+
+### Auto mode
+
+Hybrid tap/hold - automatically detects your intent:
+
+```jsonc
+{
+    "recording_mode": "auto"
+}
+```
+
+- **Tap** (< 400ms) - Toggle behavior: tap to start recording, tap again to stop
+- **Hold** (>= 400ms) - Push-to-talk behavior: hold to record, release to stop
+
+### Auto-stop on silence
+
+In **toggle** and **auto** modes, `silence_timeout` automatically stops recording (transcribe + paste) after a period of silence — press once, speak, and it finalizes itself when you go quiet:
+
+```jsonc
+{
+    "recording_mode": "toggle",
+    "silence_timeout": 2.5  // Auto-stop after 2.5s of silence. 0 (default) = disabled.
+}
+```
+
+- Default is `0` (disabled) - existing behavior is unchanged.
+- The timer **only arms after speech is detected**, so it won't fire while you're still composing your first sentence.
+- The silence threshold auto-calibrates from your mic's noise floor (shares `continuous_silence_threshold`).
+- Manual stop still works at any time; the stop beep signals the auto-stop. This is purely additive.
+
+### Continuous mode
+
+Press to start, speak naturally, and when you pause for a couple seconds the text is automatically transcribed and pasted. Press again to stop:
+
+```jsonc
+{
+    "recording_mode": "continuous",
+    "continuous_silence_seconds": 2.0,  // Optional: seconds of silence before auto-paste (default: 2.0)
+    "continuous_silence_threshold": 0    // Optional: 0 = auto-calibrate from noise floor (default). Set manually if needed.
+}
+```
+
+- Recording continues after each auto-paste, so you can keep dictating
+- The final press stops recording and pastes any remaining audio
+- Lower `continuous_silence_seconds` to trigger paste after shorter pauses
+- The silence threshold is auto-calibrated from your mic's noise floor at the start of each session; if detection feels off, set `continuous_silence_threshold` manually (check logs for the auto-calibrated value)
+
+### Long-form mode
+
+Extended recording with pause/resume support:
+
+```jsonc
+{
+    "recording_mode": "long_form",
+    "long_form_submit_shortcut": "SUPER+ALT+E",  // Required: no default, must be set
+    "long_form_temp_limit_mb": 500,              // Optional: max temp storage (default: 500 MB)
+    "long_form_auto_save_interval": 300,         // Optional: auto-save interval in seconds (default: 300 = 5 minutes)
+    "use_hypr_bindings": false                   // Optional: set true to use Hyprland compositor bindings
+}
+```
+
+- Primary shortcut toggles recording/pause/resume
+- Submit shortcut processes all recorded segments and pastes transcription
+- Segments are auto-saved periodically to disk for crash recovery
+- Old segments are automatically cleaned up when storage limit is reached
+
+## Custom hotkeys
+
+Extensive key support:
+
+```jsonc
+{
+    "primary_shortcut": "CTRL+SHIFT+SPACE"
+}
+```
+
+### Supported key types
+
+- **Modifiers**: `ctrl`, `alt`, `shift`, `super` (left) or `rctrl`, `ralt`, `rshift`, `rsuper` (right)
+- **Function keys**: `f1` through `f24`
+- **Letters**: `a` through `z`
+- **Numbers**: `1` through `9`, `0`
+- **Arrow keys**: `up`, `down`, `left`, `right`
+- **Special keys**: `enter`, `space`, `tab`, `esc`, `backspace`, `delete`, `home`, `end`, `pageup`, `pagedown`
+- **Lock keys**: `capslock`, `numlock`, `scrolllock`
+- **Media keys**: `mute`, `volumeup`, `volumedown`, `play`, `nextsong`, `previoussong`
+- **Numpad**: `kp0` through `kp9`, `kpenter`, `kpplus`, `kpminus`
+
+Or use direct evdev key names for any key not in the alias list:
+
+```jsonc
+{
+    "primary_shortcut": "SUPER+KEY_COMMA"
+}
+```
+
+Examples:
+
+- `"SUPER+SHIFT+M"` - Super + Shift + M
+- `"CTRL+ALT+F1"` - Ctrl + Alt + F1
+- `"F12"` - Just F12 (no modifier)
+- `"RCTRL+RSHIFT+ENTER"` - Right Ctrl + Right Shift + Enter
+
+### Secondary shortcut with language
+
+Use a different hotkey for a specific language:
+
+```jsonc
+{
+    "primary_shortcut": "SUPER+ALT+D",    // Uses default language from config
+    "secondary_shortcut": "SUPER+ALT+I",  // Optional: second hotkey
+    "secondary_language": "it"          // Language for secondary shortcut
+}
+```
+
+> **Note**: Works with backends that support language parameters:
+> - **Local whisper models**: Fully supported (all pywhispercpp models)
+> - **Realtime WebSocket**: Fully supported (OpenAI, Google, ElevenLabs)
+> - **REST API**: Only if the endpoint accepts a `language` parameter (varies by provider/custom endpoint)
+
+The primary shortcut uses the `language` setting from your config (or auto-detect if `null`); the secondary always uses `secondary_language`.
+
+Configure via CLI:
+
+```bash
+hyprwhspr config secondary-shortcut
+```
+
+### Cancel shortcut
+
+Bail out of an accidental recording — discards the audio and plays the error sound:
+
+```jsonc
+{
+    "cancel_shortcut": "SUPER+ESCAPE"  // Any key combo (default: null = disabled)
+}
+```
+
+Works in all recording modes; **in long-form mode it discards all accumulated segments and resets the session to idle.**
+
+You can also cancel without a dedicated shortcut:
+
+```bash
+# Via CLI
+hyprwhspr record cancel
+
+# Via FIFO directly (useful for Hyprland binds or sxhkd)
+echo cancel > "$XDG_RUNTIME_DIR/hyprwhspr/recording_control"
+```
+
+### Hyprland native bindings
+
+Use Hyprland's compositor bindings instead of evdev keyboard grabbing — sometimes better compatibility with keyboard remappers.
+
+Enable in config (`~/.config/hyprwhspr/config.json`):
+
+```jsonc
+{
+  "use_hypr_bindings": true
+}
+```
+
+Then add bindings to `~/.config/hypr/hyprland.conf`.
+
+#### Toggle mode
+
+Press once to start, press again to stop:
+
+```bash
+bindd = SUPER ALT, D, Speech-to-text, exec, /usr/lib/hyprwhspr/config/hyprland/hyprwhspr-tray.sh record
+```
+
+#### Push-to-talk mode
+
+Hold the key to record, release to stop:
+
+```bash
+bind = SUPER ALT, D, exec, echo "start" > "$XDG_RUNTIME_DIR/hyprwhspr/recording_control"
+bindr = SUPER ALT, D, exec, echo "stop" > "$XDG_RUNTIME_DIR/hyprwhspr/recording_control"
+```
+
+#### Long-form mode
+
+Primary shortcut toggles record/pause/resume; submit shortcut transcribes:
+
+```bash
+bindd = SUPER ALT, D, Speech-to-text, exec, /usr/lib/hyprwhspr/config/hyprland/hyprwhspr-tray.sh record
+bindd = SUPER ALT, E, Speech-to-text-submit, exec, echo "submit" > "$XDG_RUNTIME_DIR/hyprwhspr/recording_control"
+```
+
+#### Cancel recording (all modes)
+
+Discard audio without transcribing:
+
+```bash
+bind = SUPER, ESCAPE, exec, echo "cancel" > "$XDG_RUNTIME_DIR/hyprwhspr/recording_control"
+```
+
+Restart the service to lock in changes:
+
+```bash
+systemctl --user restart hyprwhspr
+```
+
+### Running without keyboard access
+
+With `grab_keys: false` (default), hyprwhspr can start even if you are not in the `input` group, but the global shortcut will not work. Control recording via:
+
+- The CLI (`hyprwhspr record toggle`, `hyprwhspr record start`, etc.)
+- The `recording_control` FIFO for lowest latency (e.g. bind in Hyprland to `echo start > "$XDG_RUNTIME_DIR/hyprwhspr/recording_control"`)
+
+## Backends
+
+**Quick pick by hardware:**
+
+- **NVIDIA GPU** → Cohere Transcribe is the leading edge · whisper.cpp (`large-v3-turbo`) for speed
+- **AMD / Intel GPU** → whisper.cpp (Vulkan)
+- **CPU only** → Parakeet or faster-whisper
+- **No local setup** → REST API
+
+For up-to-date accuracy rankings across open-source models, see the [Open ASR Leaderboard](https://huggingface.co/spaces/hf-audio/open_asr_leaderboard).
+
+| Backend | Privacy | GPU | Speed | Languages | Accuracy | Notes |
+|---------|---------|-----|-------|-----------|----------|-------|
+| Cohere Transcribe | Local | NVIDIA or CPU | Fast | 14 | Best | Gated model, HF token required |
+| Parakeet | Local | NVIDIA or CPU | Fast | Multi | Very good | — |
+| faster-whisper | Local | NVIDIA or CPU | Very fast | 99 | Very good | — |
+| whisper.cpp | Local | NVIDIA, AMD/Intel, CPU | Fast | 99 | Very good | — |
+| REST API | Cloud | — | Varies | Varies | Varies | Cohere, OpenAI, Groq, Regolo |
+| Realtime WebSocket | Cloud | — | Real-time | Varies | Varies | Google Gemini, OpenAI, ElevenLabs |
+
+### Model commands
+
+`hyprwhspr model` commands route automatically to the configured backend:
+
+```bash
+hyprwhspr model status            # Check if model is downloaded/cached
+hyprwhspr model list              # Show model info for active backend
+hyprwhspr model download [model]  # Download or re-download model
+hyprwhspr model unload            # Free GPU VRAM without stopping the service
+hyprwhspr model reload            # Reload the model after an unload
+```
+
+Models are downloaded automatically during `hyprwhspr setup`; use `model download` to re-download if needed. For `unload`/`reload` details, see [GPU resource management](#gpu-resource-management).
+
+### Cohere Transcribe
+
+**#1 on the [Open ASR Leaderboard](https://huggingface.co/spaces/hf-audio/open_asr_leaderboard)** — 5.42 average WER across 9 benchmarks vs. Whisper large-v3's 7.44, at ~3× the throughput. [Benchmark details](https://huggingface.co/blog/CohereLabs/cohere-transcribe-03-2026-release).
+
+**Supported languages:** English, German, French, Italian, Spanish, Portuguese, Greek, Dutch, Polish, Arabic, Vietnamese, Chinese, Japanese, Korean
+
+**Requirements:** ~4 GB VRAM (bfloat16), or CPU with ~8 GB RAM (float32) — slower on CPU
+
+#### Setup
+
+Cohere Transcribe is a **gated model** on HuggingFace — you must accept the license before downloading.
+
+1. Accept the license agreement at: [huggingface.co/CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)
+2. Generate a read token at: [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+3. Run `hyprwhspr setup` and select **[6] Cohere Transcribe** — you will be prompted for your token
+
+The model (~4 GB) is downloaded during setup. Your token is securely stored locally in `~/.config/hyprwhspr/credentials.json` and never shared.
+
+#### Configuration
+
+```jsonc
+{
+    "transcription_backend": "cohere-transcribe",
+    "cohere_transcribe_device": "auto",      // auto | cuda | cpu
+    "cohere_transcribe_dtype": "bfloat16",   // bfloat16 (GPU default) | float32 (CPU)
+    "cohere_transcribe_compile": false       // torch.compile for faster throughput (adds warmup on first call)
+}
+```
+
+On GPU the model always runs in **bfloat16** (its native precision). A `float16` setting is accepted but coerced to bfloat16 — true float16 (IEEE half) overflows the model's attention mask, so it is not usable here. Use `float32` (default on CPU) to force full precision.
+
+Model stored in: `~/.cache/huggingface/hub/models--CohereLabs--cohere-transcribe-03-2026/`
+
+### Parakeet
+
+Parakeet TDT V3 via [onnx-asr](https://github.com/istupakov/onnx-asr).
+
+Typically this model requires a large GPU — onnx-asr makes it run well on CPU with a very small accuracy trade-off.
+
+**Requirements:** ~1 GB RAM (CPU) or VRAM (GPU)
+
+#### Setup
+
+Run `hyprwhspr setup` and select **[1] Parakeet**. The model (~1 GB) is downloaded during setup.
+
+#### Configuration
+
+```jsonc
+{
+    "transcription_backend": "onnx-asr",
+    "onnx_asr_model": "nemo-parakeet-tdt-0.6b-v3",  // default
+    "onnx_asr_quantization": "int8",                  // int8 (default) | fp32
+    "onnx_asr_use_vad": true,                         // Silero VAD for longer recordings (default: true)
+    "onnx_asr_vad_min_duration": 30                   // seconds before VAD is used (default: 30)
+}
+```
+
+Model stored in: `~/.cache/huggingface/hub/`
+
+### faster-whisper
+
+Local Whisper via [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
+
+Run `hyprwhspr setup` and select **[2] faster-whisper** to install.
+
+**Best for:** CPU users wanting faster inference than whisper.cpp, or NVIDIA GPU users where VRAM is constrained — INT8 quantization runs `large-v3-turbo` in ~3.1 GB vs ~6 GB for float16. AMD/Intel GPU users should use Parakeet or whisper.cpp instead (CTranslate2 does not support Vulkan or ROCm).
+
+Built-in Silero VAD strips silence before inference — the most effective mitigation for Whisper's hallucination loops on longer recordings.
+
+```jsonc
+{
+    "transcription_backend": "faster-whisper",
+    "faster_whisper_model": "large-v3-turbo",   // CUDA; use "base" or "small" for CPU
+    "faster_whisper_device": "auto",             // auto | cuda | cpu
+    "faster_whisper_compute_type": "auto",       // auto → int8 on cuda, float32 on cpu; set "int8" on cpu for speed
+    "faster_whisper_vad_filter": true            // Silero VAD (default: true)
+}
+```
+
+#### Available models
+
+| Model | Size (INT8) | Notes |
+|-------|-------------|-------|
+| `tiny` | ~75 MB | Fastest |
+| `base` | ~145 MB | Recommended for CPU |
+| `small` | ~484 MB | Better accuracy |
+| `medium` | ~1.5 GB | High accuracy |
+| `large-v3` | ~3.1 GB | Best accuracy (needs GPU) |
+| `large-v3-turbo` | ~1.6 GB | **Recommended for CUDA** |
+| `distil-large-v3` | ~1.5 GB | Distilled, CPU/GPU balance |
+
+Models stored in: `~/.cache/huggingface/hub/`
+
+### whisper.cpp
+
+Local Whisper via [pywhispercpp](https://github.com/abdeladim-s/pywhispercpp).
+
+Run `hyprwhspr setup` and select **[3] Whisper CPU**, **[4] Whisper NVIDIA**, or **[5] Whisper AMD/Intel (Vulkan)**.
+
+**Best for:** modern NVIDIA cards or discrete AMD/Intel (via Vulkan) — extremely fast on GPU with `large-v3` or `large-v3-turbo`.
+
+#### Available models
+
+Models stored in: `~/.local/share/pywhispercpp/models/`
+
+| Model | Size | Notes |
+|-------|------|-------|
+| `tiny` / `tiny.en` | ~75 MB | Fastest |
+| `base` / `base.en` | ~148 MB | Recommended (default) |
+| `small` / `small.en` | ~488 MB | Better accuracy |
+| `medium` / `medium.en` | ~1.5 GB | High accuracy |
+| `large-v3` | ~2.9 GB | Best accuracy, **requires GPU** |
+| `large-v3-turbo` | ~1.6 GB | Fast + accurate, **requires GPU** |
+
+> **GPU required:** `large-v3` and `large-v3-turbo` require GPU acceleration for reasonable speed.
+
+Download a specific model by name:
+
+```bash
+hyprwhspr model download base
+hyprwhspr model download small.en
+```
+
+Set model in config (pywhispercpp only — faster-whisper uses `faster_whisper_model`):
+
+```jsonc
+{
+    "model": "small.en",  // .en = English-only; omit suffix for multilingual
+    // "threads": 6       // optional; omit for auto = min(8, CPU count)
+}
+```
+
+#### Voice activity detection
+
+Optional native Silero VAD strips silence before inference — the same hallucination mitigation faster-whisper ships, off by default here because it needs an extra ~1 MB model (`ggml-silero-v5.1.2.bin`, auto-downloaded to the models directory on first use):
+
+```jsonc
+{
+    "pywhispercpp_use_vad": true   // default: false
+}
+```
+
+If the download fails (e.g. offline), the service logs a warning and continues without VAD.
+
+#### Language detection
+
+English-only speakers can use the smaller `.en` models; for multi-language detection, pick a model without the `.en` suffix:
+
+```jsonc
+{
+    "language": null // null = auto-detect (default), or specify language code
+}
+```
+
+Auto-detect (`null`, the default) runs an extra detection pass per utterance. Setting `language` explicitly skips it and lowers latency.
+
+Whisper accepts any of its 99 supported language codes — the core set:
+
+| Code | Language | Code | Language |
+|------|----------|------|----------|
+| `en` | English | `pt` | Portuguese |
+| `de` | German | `nl` | Dutch |
+| `fr` | French | `pl` | Polish |
+| `es` | Spanish | `ru` | Russian |
+| `it` | Italian | `zh` | Chinese |
+| `ja` | Japanese | `ko` | Korean |
+
+For the full list, see the [Whisper language codes](https://github.com/openai/whisper/blob/main/whisper/tokenizer.py).
+
+#### Whisper prompt
+
+Customize transcription behavior:
+
+```jsonc
+{
+    "whisper_prompt": "Transcribe with proper capitalization, including sentence beginnings, proper nouns, titles, and standard English capitalization rules."
+}
+```
+
+The prompt influences how Whisper interprets and transcribes your audio, eg:
+
+- `"Transcribe as technical documentation with proper capitalization, acronyms and technical terminology."`
+- `"Transcribe as casual conversation with natural speech patterns."`
+- `"Transcribe as an ornery pirate on the cusp of scurvy."`
+
+#### Translation
+
+Translate non-English speech into English:
+
+```jsonc
+{
+    "task": "translate",
+    "language": "it"  // optional: set source language, or null to auto-detect
+}
+```
+
+- **`"transcribe"`** (default) - Output in the source language
+- **`"translate"`** - Translate speech into English
+
+> **Note**: Supported by `faster-whisper` and `pywhispercpp` backends. `language` and `task` are independent — setting a non-English language does not imply translation.
+
+#### Language-specific prompts
+
+Set a per-language prompt using `whisper_prompt_{lang}`:
+
+```jsonc
+{
+    "whisper_prompt": "Transcribe with proper capitalization.",
+    "whisper_prompt_de": "Transkribiere auf Deutsch. Verwende Schweizer Rechtschreibung: kein ß, immer ss."
+}
+```
+
+- Falls back to `whisper_prompt` if no language-specific prompt is configured
+- Only applies when a language is active (via `language`, `secondary_language`, or `--lang`)
+
+#### Decoding strategy
+
+Controls how Whisper searches for the best transcription. Applies to `pywhispercpp` and `faster-whisper` backends.
+
+```jsonc
+{
+    "sampling_strategy": "beam_search",  // "beam_search" (default) or "greedy"
+    "beam_size": 5                       // number of candidates to track (beam_search only)
+}
+```
+
+- **`"beam_search"`** (default) — keeps the top N candidate sequences in parallel and picks the best overall result. Matches `whisper-cli` defaults. Better accuracy, especially for non-English audio and noisy input.
+- **`"greedy"`** — picks the single highest-probability word at each step. Faster, lower quality.
+- **`beam_size`** — higher values (e.g. `8`–`10`) can improve accuracy at the cost of speed. Default `5` is a good balance for real-time dictation.
+
+> **Note**: `sampling_strategy` is locked in at model load time for `pywhispercpp`. Changing it requires a service restart.
+
+### REST API
+
+Use any ASR backend via HTTP API (local or cloud).
+
+#### Cohere 🇨🇦
+
+[Sign up at dashboard.cohere.com](https://dashboard.cohere.com/welcome/register) — Canadian-hosted, same as local Apache 2.0 model.
+
+- **Cohere Transcribe** — #1 Open ASR Leaderboard, 5.42 avg WER, 14 languages
+
+> **Note:** Cohere's API requires a `language` parameter. Set `"language": "en"` (or your language code) in your config alongside the backend selection.
+
+#### OpenAI
+
+Bring an API key from OpenAI, and choose from:
+
+- **GPT-4o Transcribe** - Latest model with best accuracy
+- **GPT-4o Mini Transcribe** - Faster, lighter model
+- **GPT-4o Mini Transcribe (2025-12-15)** - Updated version of the faster, lighter transcription model
+- **GPT Audio Mini (2025-12-15)** - General purpose audio model
+- **Whisper 1** - Legacy Whisper model
+
+#### Groq
+
+Bring an API key from Groq, and choose from:
+
+- **Whisper Large V3** - High accuracy processing
+- **Whisper Large V3 Turbo** - Fastest transcription speed
+
+#### Regolo
+
+Bring an API key from [Regolo](https://regolo.ai/), European-hosted with zero data retention (GDPR):
+
+- **Faster Whisper Large V3** - High accuracy, zero data retention (GDPR)
+
+#### Custom backend
+
+Connect to any backend, local or cloud, via your own custom configuration:
+
+```jsonc
+{
+    "transcription_backend": "rest-api",
+    "rest_endpoint_url": "https://your-server.example.com/transcribe",
+    "rest_headers": {                     // optional arbitrary headers
+        "authorization": "Bearer your-api-key-here"
+    },
+    "rest_body": {                        // optional body fields merged with defaults
+        "model": "custom-model"
+    },
+    "rest_api_key": "your-api-key-here",  // equivalent to rest_headers: { authorization: Bearer your-api-key-here }
+    "rest_timeout": 30,                   // optional, default: 30
+    "rest_audio_format": "wav"            // optional audio format sent to the endpoint: "wav" (default) | "mp3"
+}
+```
+
+### Realtime WebSocket
+
+Low-latency streaming transcription.
+
+#### OpenAI Realtime
+
+Two modes available (set `realtime_mode` in your config):
+
+- **transcribe** (default) - Pure speech-to-text, more expensive than HTTP
+- **converse** - Voice-to-AI: speak and get AI responses, configurable via `hyprwhspr config edit`
+
+```jsonc
+{
+    "transcription_backend": "realtime-ws",
+    "websocket_provider": "openai",
+    "websocket_model": "gpt-realtime-whisper",
+    "realtime_mode": "transcribe",       // "transcribe" or "converse"
+    "realtime_transcription_delay": "low", // "minimal", "low", "medium", "high", or "xhigh"
+    "realtime_timeout": 30,              // Advanced: seconds to wait after stop for final transcript
+    "realtime_buffer_max_seconds": 5     // Advanced: max unsent audio backlog (seconds) before dropping old chunks
+}
+```
+
+#### Google Gemini
+
+Realtime streaming transcription via Google's Gemini Live API.
+
+Bring an API key from [Google AI Studio](https://aistudio.google.com/).
+
+Uses native 16kHz audio (no resampling) and server-side VAD.
+
+- **transcribe** (default) - speech-to-text via gemini's live transcript events
+- **converse** - voice-to-AI: speak and get AI responses
+
+```jsonc
+{
+    "transcription_backend": "realtime-ws",
+    "websocket_provider": "google",
+    "websocket_model": "gemini-3.1-flash-live-preview",
+    "realtime_mode": "transcribe",           // "transcribe" or "converse"
+    "realtime_timeout": 30,                  // Advanced: seconds to wait after stop for final transcript
+    "realtime_buffer_max_seconds": 5         // Advanced: max unsent audio backlog (seconds) before dropping old chunks
+}
+```
+
+#### Self-hosted RealtimeSTT
+
+hyprwhspr has a native adapter for RealtimeSTT's FastAPI browser-server
+protocol. hyprwhspr remains the sole microphone producer: it sends binary PCM
+packets to the session-owned `/ws/transcribe` connection, uses `realtime`
+events for the OSD preview, and returns all `final` segments for normal cursor
+insertion. Cavasik or the browser UI does not need to be running.
+
+```jsonc
+{
+    "transcription_backend": "realtime-ws",
+    "websocket_provider": "realtimestt",
+    "websocket_url": "ws://127.0.0.1:8010/ws/transcribe",
+    "realtime_mode": "transcribe",
+    "realtime_timeout": 30,
+    "realtime_buffer_max_seconds": 5
+}
+```
+
+Model and language selection remain server-side, so `websocket_model` and an API
+key are not required. The adapter expects the protocol documented by
+RealtimeSTT's `example_fastapi_server`: `start`/`stop`/`clear` commands, framed
+PCM16 binary packets, and `realtime`/`final` events.
+
+#### ElevenLabs Scribe v2
+
+Ultra-low latency (~150ms) streaming transcription.
+
+Bring an API key from [ElevenLabs](https://elevenlabs.io/) with speech-to-text capabilities enabled.
+
+Uses native 16kHz audio (no resampling) and auto-reconnects on connection drops.
+
+- **transcribe** (default) - speech-to-text
+
+```jsonc
+{
+    "transcription_backend": "realtime-ws",
+    "websocket_provider": "elevenlabs",
+    "websocket_model": "scribe_v2_realtime",
+    "realtime_timeout": 30,              // Advanced: seconds to wait after stop for final transcript
+    "realtime_buffer_max_seconds": 5     // Advanced: max unsent audio backlog (seconds) before dropping old chunks
+}
+```
+
+## Audio and visual feedback
+
+### Themed visualizer
+
+The recording-status indicator — the **mic OSD** — gives visual feedback while recording and auto-matches Omarchy themes.
+
+> Highly recommended!
+
+```jsonc
+{
+  "mic_osd_enabled": true
+}
+```
+
+#### Display mode depends on your compositor
+
+`mic_osd_enabled` turns the mic OSD on; *how* it's shown is chosen automatically at startup:
+
+- **Overlay mode** — compositors with layer-shell support (Hyprland, Sway, niri, KDE Plasma Wayland) get the animated always-on-top overlay. Requires GTK4, PyCairo, and `gtk4-layer-shell`.
+- **Notification mode** — GNOME/Mutter and X11 sessions use desktop notifications (recording / transcribing / inserted), which never steal the focus the paste needs. The layer-shell overlay is Wayland-only. Notifications require `notify-send` (libnotify).
+
+Set `mic_osd_enabled: false` to turn off both. The service log records which mode was selected:
+
+```bash
+journalctl --user -u hyprwhspr.service | grep -E 'Mic-OSD daemon started|status via notifications'
+```
+
+#### Overlay styles
+
+In overlay mode, `mic_osd_style` picks one of four visualizations (notification mode ignores it):
+
+- `waveform` — the full themed waveform with transcript preview (default)
+- `vu_meter` — a VU meter
+- `pill` — a compact monochrome status pill: idle dots, live bars while recording, a travelling wave while processing, a pulse on error, and a checkmark on success. Can optionally show an animated live transcript on realtime backends that stream partial results.
+- `spectrum` — a compact, mirrored frequency spectrum inspired by CAVA/Cavasik. FFT analysis runs against hyprwhspr's existing capture stream; it does not launch Cavasik or open another microphone connection. Its transcript wraps below the meter and the bottom-anchored layer surface grows upward one line at a time, up to a configurable limit.
+
+![Pill OSD states](assets/pill-states.png)
+
+```jsonc
+{
+  "mic_osd_style": "spectrum"
+}
+```
+
+Restart the service after changing the style:
+
+```bash
+systemctl --user restart hyprwhspr
+```
+
+#### Pill live transcript
+
+Shows the last few words while recording. Opt-in; needs `mic_osd_style: pill` plus a `realtime-ws` backend that streams partial transcripts (OpenAI, ElevenLabs, or self-hosted RealtimeSTT; not Gemini yet). Full-size `waveform` and `spectrum` previews do not require this pill-specific opt-in. Final transcription and paste are unaffected.
+
+```jsonc
+{
+  "transcription_backend": "realtime-ws",
+  "websocket_provider": "elevenlabs",
+  "websocket_model": "scribe_v2_realtime",
+  "realtime_mode": "transcribe",
+  "mic_osd_style": "pill",
+  "mic_osd_pill_transcript_enabled": true
+}
+```
+
+| Setting | Default | Description |
+|---|---:|---|
+| `mic_osd_pill_transcript_enabled` | `false` | Enable the pill transcript. |
+| `mic_osd_pill_transcript_word_limit` | `4` | Recent words shown (1–12). |
+| `mic_osd_pill_transcript_idle_timeout_ms` | `1400` | Hide after this much idle time; `0` disables. |
+
+#### Spectrum layout, transcript, and response
+
+The spectrum keeps its meter at a stable height. Its panel has only that height
+when there is no preview, then grows and shrinks as transcript lines wrap. Long
+transcripts expand up to 60% of the current monitor's logical height (also
+respecting the bottom margin). Once full, the panel shows the newest lines with
+an ellipsis; the underlying transcript is unchanged. The legacy
+`mic_osd_transcript_max_lines` setting is retained for compatibility but no longer
+limits this preview. GTK4 Layer Shell supports this
+dynamic surface sizing directly; no Quickshell process or compositor window rule
+is involved.
+
+```jsonc
+{
+  "mic_osd_style": "spectrum",
+  "mic_osd_bottom_margin": 130,
+  "mic_osd_spectrum_width": 520,
+  "mic_osd_spectrum_meter_height": 86,
+  "mic_osd_spectrum_background_opacity": 0.46,
+  "mic_osd_spectrum_border_opacity": 0.30,
+
+  "mic_osd_transcript_font_family": "sans-serif",
+  "mic_osd_transcript_font_size": 18,
+  "mic_osd_transcript_max_lines": 6,
+  "mic_osd_transcript_line_spacing": 1.25,
+  "mic_osd_transcript_opacity": 0.96,
+
+  "mic_osd_spectrum_gain": 1.35,
+  "mic_osd_spectrum_noise_floor_db": -72,
+  "mic_osd_spectrum_peak_db": -24,
+  "mic_osd_spectrum_curve": 1.10,
+  "mic_osd_spectrum_rise_ms": 35,
+  "mic_osd_spectrum_fall_ms": 150
+}
+```
+
+For a larger, more responsive live preview, try width `900`, meter height `110`,
+transcript font size `26`, line spacing `1.3`, and background opacity `0.85`.
+For quieter microphones, try gain `1.6`, peak `-34` dB, curve `0.85`, rise `12` ms,
+and fall `85` ms. These are optional overrides, not changes to the defaults.
+The preview can only show text supplied by the backend; a rolling partial
+transcript cannot reconstruct speech the server has already omitted.
+
+Response tuning does **not** alter the audio sent to transcription:
+
+- Increase `mic_osd_spectrum_gain` to make all bars taller.
+- Make `mic_osd_spectrum_peak_db` more negative (for example `-30`) so normal
+  speech reaches the purple/pink end of the gradient sooner.
+- Raise `mic_osd_spectrum_noise_floor_db` to suppress room noise, or lower it
+  for a very quiet microphone. Keep it below `mic_osd_spectrum_peak_db`.
+- Lower `mic_osd_spectrum_rise_ms` for a faster attack. Increase
+  `mic_osd_spectrum_fall_ms` to make peaks linger.
+- Lower `mic_osd_spectrum_curve` to emphasize quiet frequency detail.
+
+These presentation and response settings are watched while the OSD daemon is
+running and normally apply within 400 ms of saving `config.json`; the service
+does not need to be restarted. Changing `mic_osd_style` still requires a service
+restart because the main process chooses the matching audio-feed format.
+
+For an isolated visualizer while tuning, run from the repository root:
+
+```bash
+PYTHONPATH="$PWD/lib" python -m mic_osd.main --viz spectrum
+```
+
+That standalone window stays visible until Ctrl-C and also hot-reloads the
+settings above. It uses the active hyprwhspr level feed when one exists;
+otherwise it opens the default microphone as a fallback. Stop or hide the
+service-owned mic OSD first if you want to avoid two overlays.
+
+The spectrum's center-to-peak gradient can also be overridden in the normal
+`mic-osd.css` theme file with `@define-color spectrum-base`,
+`spectrum-middle`, `spectrum-high`, and `spectrum-peak`.
+
+#### GNOME/Mutter waveform overlay
+
+GNOME users who want an animated waveform instead of notifications can install the opt-in GNOME Shell extension in `contrib/gnome-shell-extension/` — it draws inside gnome-shell, always-on-top, without stealing focus:
+
+```bash
+cd contrib/gnome-shell-extension
+./install.sh
+```
+
+Log out and back in if GNOME cannot enable it immediately. The extension only reads hyprwhspr's state and audio-level files — disable it and GNOME falls back to notifications.
+
+### Audio feedback
+
+Optional sound notifications:
+
+```jsonc
+{
+    "audio_feedback": true,            // Enable audio feedback (default: true)
+    "audio_volume": 0.5,               // General audio volume fallback (0.1 to 1.0, default: 0.5)
+    "start_sound_volume": 1.0,         // Start recording sound volume (0.1 to 1.0, default: 1.0)
+    "stop_sound_volume": 1.0,          // Stop recording sound volume (0.1 to 1.0, default: 1.0)
+    "error_sound_volume": 0.5,         // Error sound volume (0.1 to 1.0, default: 0.5)
+    "start_sound_path": "custom-start.ogg",  // Custom start sound (relative to assets)
+    "stop_sound_path": "custom-stop.ogg",    // Custom stop sound (relative to assets)
+    "error_sound_path": "custom-error.ogg"  // Custom error sound (relative to assets)
+}
+```
+
+Default sounds included:
+
+- **Start recording**: `ping-up.ogg` (ascending tone)
+- **Stop recording**: `ping-down.ogg` (descending tone)
+- **Error/blank audio**: `ping-error.ogg` (double-beep)
+
+Custom sounds:
+
+- **Supported formats**: `.ogg`, `.wav`, `.mp3`
+- **Fallback**: Uses defaults if custom files don't exist
+
+### Audio stream keepalive
+
+By default hyprwhspr opens the microphone only while recording. On some hardware (certain USB mics on raw ALSA), the audio device suspends between uses and the first recording after an idle period fails with a `paTimedOut` error. If you see this, enable the keepalive stream:
+
+```jsonc
+{
+  "keepalive_stream": true
+}
+```
+
+This holds a silent input stream open in the background so the device stays warm.
+
+**Leave this off unless you need it** — an open input stream triggers the microphone-in-use indicator on most desktops (GNOME, KDE, Ubuntu, etc.), making it appear as though hyprwhspr is always listening. It's not!
+
+### Audio ducking
+
+Quiet system volume on record:
+
+```jsonc
+{
+  "audio_ducking": true,
+  "audio_ducking_percent": 50
+}
+```
+
+- `audio_ducking: true` — set true to enable audio ducking
+- `audio_ducking_percent: 50` — how much to reduce volume BY (default 50 = reduce to 50% of original; 70 = reduce to 30%)
+
+Ducking lowers each application stream's volume, not the device master — your speaker setting is untouched and shell volume OSDs don't fire on every recording. Streams that start mid-recording aren't ducked.
+
+#### Other devices: background ducking hooks
+
+`audio_ducking_hooks` is an optional list of recording-scoped command sessions.
+It works independently of local `audio_ducking` and does not require `pulsectl`.
+Each device has its own background worker: connections, commands, and restoration
+never wait on the recording or transcription thread. Restart hyprwhspr after
+editing this list.
+
+Example for an Android tablet running Termux with SSH and Termux:API:
+
+```json
+{
+  "audio_ducking_hooks": [
+    {
+      "name": "galaxy-tab",
+      "command": [
+        "/usr/bin/python3",
+        "/absolute/path/to/hyprwhspr/scripts/duck-termux.py",
+        "--host", "u0_a280@192.168.4.175",
+        "--port", "8022",
+        "--volume", "2"
+      ],
+      "restore_timeout": 15
+    }
+  ]
+}
+```
+
+The helper runs its script over SSH; nothing needs to be installed from this
+repository on the tablet. Remote dependencies are `bash`, `flock`, `timeout`,
+`jq`, and working `termux-volume` (Termux:API app/package and permissions).
+Configure key-based SSH and verify the host key interactively first. The helper
+uses batch mode, strict host-key checking, a five-second connect timeout and
+SSH keepalives; it will never prompt during recording. `--host` can also be an
+SSH config alias, so address changes can live in `~/.ssh/config`.
+
+It snapshots the music volume, lowers it to `--volume` (default `2`), then
+restores the snapshot on EOF when **recording ends**, without waiting for STT.
+A heartbeat renews a six-second remote lease: if the network stalls or the
+parent disappears, the remote shell restores after the heartbeats cease.
+Termux API calls have five-second deadlines. A per-stream lock prevents
+concurrent clients from saving an already-ducked value. A private volume journal
+allows the next invocation to recover an interrupted restoration. A phone that
+is powered off, suspended indefinitely, or forcibly kills the remote shell
+cannot be guaranteed to restore immediately; recovery occurs when the command
+can run again. Manual volume changes during a take are replaced by the snapshot
+on restoration.
+
+**Custom devices / operating systems:** add another object with a unique `name`
+and a trusted `command` argument array. The command may be any local adapter or
+SSH client; no implicit shell expansion occurs (use absolute paths, not `~`).
+Optional `enabled: false` disables a device. Commands run as your user, so treat
+this configuration as executable code and do not embed passwords in it.
+
+The default (`persistent: false`) command protocol is deliberately small:
+
+1. Read a `recording` line from stdin before changing volume.
+2. Save the original device state and duck it.
+3. Consume subsequent `recording` lines (sent once per second).
+4. On EOF, restore and exit. Also restore on a remote lease timeout and signals;
+   a network disconnect may not deliver EOF promptly. Cleanup must be idempotent.
+
+Do not use SSH `-n`, `-f`, or a PTY: stdin carries the session lifetime. The
+remote adapter must implement its own lease and bounded device calls; a generic
+local timeout cannot undo arbitrary remote commands. Do not implement this as a
+fixed-duration sleep or separate uncoordinated start/stop SSH commands.
+
+In the default session mode, on stop/cancel/start failure/shutdown, hyprwhspr closes stdin asynchronously.
+`restore_timeout` (default `10`, range `1`–`60` seconds) bounds the local cleanup
+wait, followed by process-group TERM and, one second later, KILL. Rapid recording
+restarts are serialized per device: the previous command finishes cleanup
+before the next starts, while other devices remain independent. Commands that
+fail are not retried during the same take, avoiding duplicate volume snapshots;
+they are tried again on the next recording. Exit failures are logged with the
+device name; command output is discarded to avoid blocking or leaking secrets.
+Remote ducking is best effort: capture starts immediately, so connection latency
+can leave the beginning of a recording unducked.
+
+##### Low-latency persistent control (recommended for rooted Android)
+
+Termux:API's broadcast bridge can take seconds per volume operation; warming
+SSH alone does not remove that delay. On a rooted device, use Android's direct
+volume service through Magisk `su` instead, together with a warm SSH connection:
+
+```json
+{
+  "audio_ducking_hooks": [
+    {
+      "name": "galaxy-tab",
+      "persistent": true,
+      "command": [
+        "/usr/bin/python3",
+        "/absolute/path/to/hyprwhspr/scripts/duck-termux.py",
+        "--host", "u0_a280@192.168.4.175",
+        "--port", "8022",
+        "--volume", "2",
+        "--persistent",
+        "--backend", "android-root"
+      ],
+      "restore_timeout": 3
+    }
+  ]
+}
+```
+
+Both `persistent: true` and the adapter's `--persistent` are required. The root
+backend needs `bash`, `flock`, `timeout`, non-interactive Magisk root permission
+for Termux, and `/system/bin/cmd media_session volume`; no Termux:API or Rust
+service is needed. Volume calls have two-second deadlines and verify the
+result. The control process stays unprivileged; only volume-service calls use
+`su`. No root network listener is installed. Establish root permission manually
+before use, rather than allowing a permission prompt during a recording.
+
+The worker connects at app startup while idle. Look for
+`[DUCKING_HOOK] galaxy-tab: persistent connection ready`. Each recording sends
+one state update over the existing encrypted channel. Stop sends `idle`, restores
+the saved volume, and leaves the connection ready for the next take. Repeated
+heartbeats do not re-query the volume or overwrite the snapshot. EOF, shutdown,
+and six seconds without a heartbeat still trigger restoration and exit.
+
+The persistent protocol for other adapters is:
+
+- Emit `ready\n` on stdout after connection setup and recovery.
+- Read `idle\n` or `recording\n` on stdin. These are desired states, not toggle
+  commands; apply them idempotently and emit `ok\n` **after** completion.
+- Keep stdout reserved for these short acknowledgements. Restore on EOF, signals,
+  and remote lease expiry; preserve a recovery journal if applicable.
+
+The worker permits only one outstanding request, waits at most ten seconds for
+`ready` and five for `ok`, and tears down unresponsive sessions. Connections are
+retried in the background with 1–15 second exponential backoff, even while idle.
+After reconnect it sends the **current** recording state, not a queue of old
+start/stop commands. Recovery of a stale journal happens before `ready`, so a
+reconnected active recording can safely take a fresh snapshot. A single live
+connection owns the remote stream lock. Disconnected clients cannot hold it
+indefinitely while the remote process is running normally: lease expiry restores
+and releases it. Suspend/force-kill limitations described above still apply.
+
+**Roaming/security:** retain strict SSH host-key checks and key authentication.
+No broadcast discovery, plaintext UDP, or extra listening port is used. If the
+LAN address is unreachable on a public network, ducking becomes unavailable
+without affecting capture; the remote lease restores volume, and the worker
+reconnects when reachable again. An unrelated host at the same private IP will
+not receive commands unless its SSH identity matches the pinned key. Use a DHCP
+reservation/local DNS or SSH alias for changing LAN addresses. For control from
+outside the LAN, use a private authenticated VPN (for example WireGuard or
+Tailscale) and its stable address; do not expose root control to the public
+internet. No VPN or public exposure is configured automatically.
+
+Android must allow Termux/sshd to run in the background; check battery restrictions
+if connections disappear while the screen is off. A wake lock can improve
+reliability but consumes battery. Recording never waits for readiness or a remote
+acknowledgement, so a small amount of audio can still leak during network/device
+latency, especially immediately after roaming. There is deliberately no capture
+delay and no promise of instantaneous remote muting.
+
+## Text processing
+
+### Word overrides
+
+Customize transcriptions:
+
+```jsonc
+{
+    "word_overrides": {
+        "hyper whisper": "hyprwhspr",
+        "um": ""
+    }
+}
+```
+
+Use empty string `""` to delete words entirely.
+
+`{"hyper whisper": "hyprwhspr"}` ships as the default (the product name is spoken "hyper whisper").
+
+Single-character overrides match anywhere in a word (not just at word boundaries):
+
+```jsonc
+{
+    "word_overrides": {
+        "ß": "ss"
+    }
+}
+```
+
+- `"Straße"` → `"Strasse"`, `"Fuß"` → `"Fuss"`, etc.
+- Multi-character overrides use whole-word matching only
+
+### Filler word filtering
+
+Remove common filler words automatically:
+
+```jsonc
+{
+    "filter_filler_words": true,  // Enable automatic filler word removal (default: false)
+    "filler_words": ["uh", "um", "er", "ah", "eh", "hmm", "hm", "mm", "mhm"]  // Customize list
+}
+```
+
+### Symbol replacements
+
+Automatically converts spoken words to symbols and punctuation:
+
+```jsonc
+{
+    "symbol_replacements": true  // default: true (set false to disable speech-to-symbol replacements)
+}
+```
+
+**Punctuation:**
+
+- "period" → "."
+- "comma" → ","
+- "question mark" → "?"
+- "exclamation mark" → "!"
+- "colon" → ":"
+- "semicolon" → ";"
+
+**Symbols:**
+
+- "at symbol" → "@"
+- "hash" → "#"
+- "plus" → "+"
+- "equals" → "="
+- "dash" → "-"
+- "underscore" → "_"
+
+**Brackets:**
+
+- "open paren" → "("
+- "close paren" → ")"
+- "open bracket" → "["
+- "close bracket" → "]"
+- "open brace" → "{"
+- "close brace" → "}"
+
+**Special commands:**
+
+- "new line" → new line
+- "tab" → tab character
+
+## Paste and clipboard behavior
+
+hyprwhspr copies dictated text to the clipboard, sends a paste shortcut, then restores your clipboard. Wayland prefers `wl-clipboard` plus `wtype` (falling back to `ydotool key`). X11 uses `python-pyperclip` with `xclip`, and `xdotool`/`xprop` for focused-window and terminal detection. `xsel` is also accepted as a clipboard fallback when installed. Most setups need no configuration. GNOME/Mutter has a few extras — see [GNOME/Mutter notes](#gnomemutter-notes).
+
+### Paste mode
+
+The paste shortcut is auto-detected from the focused window:
+
+- **Terminals** (Ghostty, Kitty, WezTerm, Alacritty, foot, …) → Ctrl+Shift+V
+- **Everything else** (editors, browsers, chat apps) → Ctrl+V
+
+Override with `paste_mode` if needed:
+
+```jsonc
+{
+    "paste_mode": "ctrl_shift"  // "ctrl_shift" (terminal paste) | "ctrl" (GUI paste) | "super" | "alt"
+}
+```
+
+The default is `null`, which auto-detects the appropriate paste chord from the
+focused application. The legacy `shift_paste` setting also accepts `null` for
+the same auto-detection behavior.
+
+### App-specific paste keys
+
+Some apps use non-standard paste shortcuts — GUI Emacs, for example, uses Ctrl+Y while Ctrl+V scrolls. Set per-app behavior with `applications`, keyed by window identifier:
+
+```jsonc
+{
+    "applications": {
+        "emacs": { "auto_paste": "ctrl+y" },  // custom paste chord
+        "some-app": { "auto_paste": false }    // disable: nothing pasted, clipboard untouched
+    }
+}
+```
+
+Run `hyprwhspr config focused-window` to see the identifiers for the active window. Run straight from a terminal it just reports the terminal, so add a delay and focus the target window before it fires — the output still lands in your terminal:
+
+```bash
+sleep 3; hyprwhspr config focused-window   # then click into the app you want
+```
+
+Prefer stable app classes over window titles, which change with the open document.
+
+> **Terminal Emacs** (`emacs -nw`, `emacsclient -t`): hyprwhspr sees the terminal, not Emacs, so terminal paste (Ctrl+Shift+V) is normally correct.
+
+### Non-QWERTY layouts
+
+`ydotool` sends physical Linux keycodes, so `Ctrl+KEY_V` may not be `Ctrl+v` on layouts like bepo or dvorak. To fix on Wayland: run `wev`, press the key that types `v`, and copy the printed keycode into `paste_keycode_wev`:
+
+```jsonc
+{
+    "paste_keycode_wev": 55 // `wev` keycode for the key that types 'v' on your layout
+}
+```
+
+If you already know the Linux evdev keycode, set `paste_keycode` directly. Non-Latin layouts (Thai, Russian, Arabic, …) are a special case handled on GNOME/Mutter — see [GNOME/Mutter notes](#gnomemutter-notes).
+
+### Auto-submit
+
+Automatically press Enter after pasting — aka Dictation YOLO. Handy for chat boxes and search fields; careful elsewhere.
+
+```jsonc
+{
+    "auto_submit": true   // Send Enter key after paste (default: false)
+}
+```
+
+### Clipboard behavior
+
+hyprwhspr saves your clipboard before injection and restores it afterward — dictated text never permanently overwrites it. To instead clear the clipboard a few seconds after pasting:
+
+```jsonc
+{
+    "clipboard_behavior": true,         // true = clear clipboard after a delay (default: false = restore previous contents)
+    "clipboard_clear_delay": 5.0        // seconds to wait before clearing (only when clipboard_behavior is true)
+}
+```
+
+### GNOME/Mutter notes
+
+GNOME/Mutter lacks layer-shell, so visual feedback uses notifications. Injection depends on the session:
+
+- **Window detection** uses the AT-SPI accessibility bridge — `hyprwhspr setup` offers to enable it (`gsettings set org.gnome.desktop.interface toolkit-accessibility true`). Without it, GNOME can't tell terminals apart and paste falls back to Ctrl+V. An explicit `paste_mode` (with no `applications` rules) skips the probe entirely.
+- **GNOME Wayland direct typing:** Mutter blocks `wtype`, so ASCII text on a US layout is typed directly with `ydotool type`; anything else falls back to clipboard paste automatically. Set `"prefer_clipboard_paste": true` to always use clipboard paste.
+- **GNOME X11 clipboard paste:** X11 uses `xclip` and a normal paste chord rather than the Wayland-only direct-typing workaround. GNOME/X11 on Ubuntu 24.04 is the currently validated X11 configuration.
+- **Non-Latin layouts** (Thai, Russian, Arabic, …): no physical key produces a `v` keysym, so hyprwhspr briefly switches to a Latin input source for the paste chord and restores your layout after — just keep a Latin source in Settings → Keyboard → Input Sources.
+
+### Post-transcription hook
+
+Pipe each transcription through a shell command before it's pasted. Stdin receives the (preprocessed) transcription; non-empty stdout replaces it. Empty stdout leaves the text unchanged, so the same mechanism works for both transforms and fire-and-forget observers. A hook that exits with status `77` consumes the transcription successfully and prevents it from being pasted.
+
+```jsonc
+{
+    "post_transcription_hook": "sed 's|.*|<dictation>&</dictation>|'"
+}
+```
+
+The example above wraps every injected transcription in `<dictation>...</dictation>` — a useful signal to downstream LLMs that the text came from ASR and may contain transcription artifacts (homophones, proper-noun misspellings).
+
+Other patterns:
+
+Archive transcriptions to a log, leave text unchanged (observer-only):
+
+```jsonc
+{ "post_transcription_hook": "tee -a ~/.local/share/hyprwhspr/log.txt >/dev/null" }
+```
+
+User-provided transform script on `$PATH`:
+
+```jsonc
+{ "post_transcription_hook": "~/.local/bin/filler-word-coach" }
+```
+
+Two environment variables are exported to the hook:
+
+- `HYPRWHSPR_MODEL` — the active whisper model
+- `HYPRWHSPR_BACKEND` — the active transcription backend
+
+The hook runs under a 5-second timeout. Exit status `77` is reserved for an intentional consume result; stdout is ignored and the transcription is not pasted. On timeout, any other non-zero exit, or any subprocess error, the original text is preserved — a broken hook will never silently eat a dictation. Errors are logged to the service journal.
+
+Note: the command runs under `shell=True`, so pipes, redirects, and command chaining work as expected. Treat `post_transcription_hook` as trusted config (same threat model as the rest of `config.json`).
+
+## Integrations
+
+### voxd / lightd microphone activity
+
+Set `"voxd_integration": true` and restart Hyprwhspr to suspend voxd-managed
+speech while dictation capture is active. `"voxd_socket": null` (default) uses
+`VOXD_SOCKET`, then `$XDG_RUNTIME_DIR/voxd.sock` (or `/tmp/voxd-<uid>.sock`). An
+explicit socket path is also supported. Start voxd with `--light-socket` to have
+it hold lightd's `speech-input` profile; configure that profile's colour/effect
+in lightd (cyan breathing is hue 180).
+
+The capture thread acquires a connection-owned lease before starting its
+recording stream, renews every second, and closes it on stop, failure, pause or
+recovery. Transcription, idle keepalive, and level monitoring do not hold the
+lease. voxd pauses/continues the same player rather than restarting the TTS
+message. Multiple microphones aggregate; output resumes only after the last
+lease ends. A dead/stalled client expires after five seconds.
+
+The initial local handshake is bounded to 500 ms. If voxd is unavailable or
+restarts, dictation continues with a warning and retries in the background;
+output/light coordination cannot be guaranteed until reconnection. Already
+buffered device audio may produce a brief tail after suspension. This controls
+voxd audio, not unrelated browser/music players; existing `audio_ducking` and
+`audio_ducking_hooks` remain independent.
+
+### Waybar
+
+Add dynamic tray icon to your `~/.config/waybar/config`:
+
+```jsonc
+{
+    "custom/hyprwhspr": {
+        "exec": "/usr/lib/hyprwhspr/config/hyprland/hyprwhspr-tray.sh status",
+        "interval": 2,
+        "return-type": "json",
+        "exec-on-event": true,
+        "format": "{}",
+        "on-click": "/usr/lib/hyprwhspr/config/hyprland/hyprwhspr-tray.sh toggle",
+        "on-click-right": "/usr/lib/hyprwhspr/config/hyprland/hyprwhspr-tray.sh restart",
+        "tooltip": true
+    }
+}
+```
+
+Add CSS styling to your `~/.config/waybar/style.css`:
+
+```css
+@import "/usr/lib/hyprwhspr/config/waybar/hyprwhspr-style.css";
+```
+
+Waybar icon click interactions:
+
+- **Left-click**: Start/stop recording (auto-starts service if needed)
+- **Right-click**: Restart Hyprwhspr service
+
+### Noctalia
+
+[Noctalia](https://noctalia.dev) (v5+) ships its own bar and theming engine. `hyprwhspr setup` offers this integration when Noctalia is detected, or run it directly:
+
+```bash
+hyprwhspr noctalia install   # also: status / remove
+```
+
+You get:
+
+- **Bar widget** ([`noctwhspr`](https://noctalia.dev/plugins/community/noctwhspr)) — service/recording state as a glyph; left-click records, right-click restarts. Also installable straight from Noctalia's plugin browser (Settings → Plugins).
+- **Visualizer theme sync** — the recording overlay follows your live Noctalia palette, including theme switches.
+
+Install enables the plugin, but placing the widget is up to you: **Noctalia Settings → Bar → add widget → noctwhspr** (or add `goodroot/noctwhspr:status` to a bar's widget list in Noctalia's `settings.toml`). Setup reminds you of this only when the widget isn't in your bar yet; reinstalls keep existing placements.
+
+Earlier `goodroot/hyprwhspr` names migrate automatically on reinstall.
+
+Niri users: see [Service starts but doesn't work until restarted](#service-starts-but-doesnt-work-until-restarted) for the `NIRI_SOCKET` requirement.
+
+### Keyboard device selection
+
+If you have multiple input tools (e.g., Espanso, keyd, kmonad), specify which to use:
+
+```jsonc
+{
+  "selected_device_name": "USB Keyboard"  // Match by device name (recommended)
+}
+```
+
+Or by device path:
+
+```jsonc
+{
+  "selected_device_path": "/dev/input/event3"  // Match by exact path
+}
+```
+
+Device name takes priority if both are set. Use `hyprwhspr keyboard list` to see available devices.
+
+### Keyboard hotplug (docks, Bluetooth)
+
+By default hyprwhspr watches for keyboards plugged in after startup and attaches them automatically:
+
+```jsonc
+{
+  "keyboard_hotplug": true   // default; set false for startup-only discovery
+}
+```
+
+**Restricting which keyboards are used (optional):** setting a `keyboard_device_names` allowlist limits attachment — at startup *and* on hot-plug — to just the listed devices. Use it if auto-discovery picks up a device you don't want grabbed, or to pin behavior to a known set of keyboards. Leave it unset to keep the default "attach any keyboard" behavior.
+
+**Interactive configurator (to set the optional allowlist):**
+
+```bash
+hyprwhspr keyboard configure
+```
+
+This detects your keyboards and pre-selects the real ones (using udev's
+keyboard/mouse classification so a fancy mouse isn't picked by mistake). It shows
+the recommended set and lets you accept it as-is or adjust the list by number,
+then writes `keyboard_device_names` and offers to restart the service so it takes
+effect immediately.
+
+If the device names are cryptic and you're not sure which one is your keyboard,
+run `hyprwhspr keyboard detect` and press a key — it reports which device the
+keypress came from (and its number in `keyboard configure`).
+
+**Manual alternative** — edit `config.json` directly (run `hyprwhspr keyboard list` to find exact device names) and restart the service:
+
+```jsonc
+{
+  "keyboard_device_names": [
+    "AT Translated Set 2 keyboard",
+    "SONiX USB Keyboard"
+  ]
+}
+```
+
+`selected_device_name` and `selected_device_path` take priority over this list if set.
+
+### External hotkey systems
+
+Control recording via CLI (Espanso, KDE, GNOME, etc.) - set these terminal commands however is appropriate:
+
+```bash
+# Start recording
+hyprwhspr record start
+
+# Start recording with specific language
+hyprwhspr record start --lang it    # Italian
+hyprwhspr record start --lang de    # German
+hyprwhspr record start --lang es    # Spanish
+
+# Stop recording (transcribes and pastes)
+hyprwhspr record stop
+
+# Cancel recording (discards audio, no transcription)
+hyprwhspr record cancel
+
+# Toggle recording on/off
+hyprwhspr record toggle
+hyprwhspr record toggle --lang it   # Toggle with language override
+
+# Check current status
+hyprwhspr record status
+
+# Capture: trigger a recording and stream the transcription to stdout
+# Blocks until transcription is complete. Suppresses text injection — use for scripting/piping.
+# Self-triggers a recording if none is in progress; attaches to an in-flight recording if one is.
+hyprwhspr record capture
+hyprwhspr record capture --lang it   # Capture with language override
+```
+
+`--lang` overrides the default language for that recording session — handy for per-language hotkeys. Bind the commands in KDE, GNOME, sxhkd, or any other hotkey system:
+
+```bash
+# Example: KDE custom shortcuts
+# English: hyprwhspr record toggle
+# Italian: hyprwhspr record start --lang it
+# Cancel:  hyprwhspr record cancel
+
+# Example: Hyprland config
+bind = SUPER ALT, D, exec, hyprwhspr record toggle
+bind = SUPER ALT, I, exec, hyprwhspr record start --lang it
+bind = SUPER, ESCAPE, exec, hyprwhspr record cancel
+```
+
+### Mute detection
+
+Lets you know when you're disconnected. Mute detection can conflict with Bluetooth microphones — disable it if so:
+
+```jsonc
+{
+  "mute_detection": false
+}
+```
+
+## GPU resource management
+
+Free GPU VRAM without stopping the service - useful before running a game or other GPU-intensive workload. Keyboard shortcuts stay active; recording is blocked while the model is unloaded, with a desktop notification on attempt.
+
+```bash
+# Unload model from GPU memory (service stays alive, shortcuts still active)
+hyprwhspr model unload
+
+# Reload model back into memory when ready to dictate again
+hyprwhspr model reload
+```
+
+Only applies to local-model backends (Cohere Transcribe, `pywhispercpp`, `faster-whisper`, `onnx-asr`) — no-op for `rest-api` and `realtime-ws`, which hold no local GPU memory. The Waybar tray shows a `󰒲` sleep icon while the model is unloaded.
+
+### Hyprland keybindings
+
+For quick access, bind unload and reload to keys in `~/.config/hypr/hyprland.conf`:
+
+```bash
+# Free GPU before starting a local LLM
+bindd = SUPER ALT, U, Unload Whisper model, exec, hyprwhspr model unload
+
+# Reclaim dictation when done
+bindd = SUPER ALT, L, Reload Whisper model, exec, hyprwhspr model reload
+```
+
+## Troubleshooting
+
+### Reset installation
+
+If you're having persistent issues, completely reset hyprwhspr:
+
+```bash
+hyprwhspr uninstall
+hyprwhspr setup
+```
+
+### Common issues
+
+#### Something is weird
+
+Restart the service - right click on the waybar icon if you use it, or:
+
+```bash
+systemctl --user restart hyprwhspr.service
+```
+
+Still weird? Proceed.
+
+#### I heard the sound but don't see text
+
+On resume/restart, the microphone often "loses connection" and requires reseating — a Linux quirk not resolvable by hyprwhspr. Reseat your microphone as prompted, and ensure the **right microphone** is set in sound options.
+
+#### Hotkey not working
+
+```bash
+# Check service status for hyprwhspr
+systemctl --user status hyprwhspr.service
+
+# Check logs
+journalctl --user -u hyprwhspr.service -f
+```
+
+```bash
+# The ydotool paste fallback (GNOME/Mutter) runs as a private child of hyprwhspr.
+# After a dictation, confirm the daemon is alive:
+pgrep -af 'ydotoold .*hyprwhspr-ydotool.sock'
+```
+
+#### Why no ydotool service? (private ydotoold)
+
+`wtype` is the primary paste path. On compositors that reject the Wayland
+virtual-keyboard protocol (notably GNOME/Mutter), hyprwhspr falls back to its
+**own private `ydotoold`** — a child process on a dedicated socket
+(`$XDG_RUNTIME_DIR/hyprwhspr-ydotool.sock`), launched lazily and torn down with the
+service. It runs rootless via the `uaccess` ACL on `/dev/uinput`; the `input`
+group and udev rule from setup are the fallback, and mainly serve the global
+hotkey (evdev reads of `/dev/input/event*`).
+
+#### Service starts but doesn't work until restarted
+
+`hyprwhspr` must start within an active graphical session.
+
+If the service appears active but hotkeys/transcription don't work until you manually restart, your session environment may not be set up correctly.
+
+Check your session:
+
+```bash
+# Verify graphical-session.target is active
+systemctl --user is-active graphical-session.target
+
+# Verify the active display environment is available to systemd services
+systemctl --user show-environment | grep -E 'WAYLAND_DISPLAY|DISPLAY|XAUTHORITY|NIRI_SOCKET'
+```
+
+A value can also be **stale**, especially when two Hyprland sessions have run
+under the same user. Compare `echo $WAYLAND_DISPLAY` and
+`echo $HYPRLAND_INSTANCE_SIGNATURE` in the session where the hotkey is used to
+the output of `systemctl --user show-environment`. If they differ, import the
+current session and restart:
+
+```bash
+systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XAUTHORITY \
+  XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DESKTOP_SESSION \
+  HYPRLAND_INSTANCE_SIGNATURE NIRI_SOCKET
+systemctl --user restart hyprwhspr.service
+```
+
+A single user service can target only one graphical session at a time. With two
+simultaneous compositor sessions, run hyprwhspr in the session whose environment
+was imported most recently.
+
+If `WAYLAND_DISPLAY` is missing, add to `~/.config/hypr/hyprland.conf`:
+
+```bash
+# Export session environment to systemd user services
+exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+```
+
+hyprwhspr also has a startup fallback: if `WAYLAND_DISPLAY` is unset but a
+Wayland socket exists in `XDG_RUNTIME_DIR`, it will use the newest `wayland-*`
+socket for its own process and children. The compositor environment export above
+is still the recommended fix because it makes the correct display available to
+all systemd user services.
+
+For X11, `DISPLAY` must be present and `XAUTHORITY` should be imported when your
+session uses it:
+
+```bash
+systemctl --user import-environment DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP
+systemctl --user show-environment | grep -E 'DISPLAY|XAUTHORITY|XDG_SESSION_TYPE'
+```
+
+Do not set `WAYLAND_DISPLAY` in an explicit `XDG_SESSION_TYPE=x11` session.
+
+**Niri:**
+
+hyprwhspr uses `niri msg --json focused-window` to detect the focused app and choose the correct paste shortcut. That requires `NIRI_SOCKET` to be available in the systemd user environment used by `hyprwhspr.service`.
+
+If `NIRI_SOCKET` is missing, add an environment export to your Niri startup config:
+
+```kdl
+spawn-at-startup "dbus-update-activation-environment" "--systemd" "WAYLAND_DISPLAY" "XDG_CURRENT_DESKTOP" "NIRI_SOCKET"
+```
+
+**Hyprland:**
+
+If `graphical-session.target` is inactive, you likely need a session manager to activate it.
+
+The recommended approach is to launch Hyprland via [uwsm](https://github.com/Vladimir-csp/uwsm) (it activates `graphical-session.target` and exports the session environment to systemd).
+
+If you *aren't* using a session manager and your system allows it, you can try starting it manually:
+
+```bash
+exec-once = systemctl --user start graphical-session.target
+```
+
+> **Note:** Some distros set `graphical-session.target` with `RefuseManualStart=yes`, in which case the manual start will fail and you should use a session manager like `uwsm` instead.
+
+Then restart Hyprland or log out and back in.
+
+Run `hyprwhspr validate` to confirm the session is configured correctly.
+
+#### Permission denied
+
+```bash
+# Fix uinput permissions
+hyprwhspr setup
+
+# Log out and back in
+```
+
+#### No audio input
+
+Is your mic _actually_ available?
+
+```bash
+# Check audio devices
+pactl list short sources
+
+# Restart PipeWire
+systemctl --user restart pipewire
+```
+
+#### Microphone indicator shows on while idle
+
+If your desktop (GNOME, Ubuntu, etc.) shows the microphone as active whenever the hyprwhspr service is running, you likely have `keepalive_stream` enabled. Disable it:
+
+```jsonc
+{
+  "keepalive_stream": false
+}
+```
+
+This is the default. If you previously enabled it to fix `paTimedOut` errors, see [Audio stream keepalive](#audio-stream-keepalive) for the trade-off.
+
+#### Audio feedback not working
+
+```bash
+# Check if audio feedback is enabled in config
+cat ~/.config/hyprwhspr/config.json | grep audio_feedback
+
+# Verify sound files exist (script install uses ~/hyprwhspr/share/assets/)
+ls -la /usr/lib/hyprwhspr/share/assets/   # AUR install
+ls -la ~/hyprwhspr/share/assets/           # Script install
+
+# Check which audio player is available
+which ffplay paplay pw-play aplay
+```
+
+**Important:** the default sounds are OGG; `aplay` (ALSA) only supports WAV and will produce white noise on OGG. Install `ffplay` (ffmpeg) or ensure `paplay` (pulseaudio-utils) or `pw-play` (pipewire) is available.
+
+#### Model not found
+
+```bash
+# Check installed models (routes to active backend)
+hyprwhspr model status
+
+# Download a model
+hyprwhspr model download base
+
+# Verify model in config
+cat ~/.config/hyprwhspr/config.json | grep model
+```
+
+#### Stuck recording state
+
+```bash
+# Check service health and auto-recover
+/usr/lib/hyprwhspr/config/hyprland/hyprwhspr-tray.sh health
+
+# Manual restart if needed
+systemctl --user restart hyprwhspr.service
+
+# Check service status
+systemctl --user status hyprwhspr.service
+```
+
+#### This sucks
+
+Doh! We tried.
+
+Wipe the slate clean and remove everything:
+
+```
+hyprwhspr uninstall
+yay -Rs hyprwhspr
+```
+
+Or better yet - create an issue and help us improve.

@@ -24,29 +24,15 @@ except ImportError:
 
 def _get_version():
     import subprocess
-    import json
-    metadata = Path(__file__).parent.parent / 'release.json'
-    if metadata.is_file():
-        try:
-            version = json.loads(metadata.read_text(encoding="utf-8"))['version']
-            return version if isinstance(version, str) and version else 'unknown'
-        except (OSError, ValueError, KeyError, TypeError):
-            return 'unknown'
     try:
         result = subprocess.run(
             ['git', 'describe', '--tags', '--abbrev=7'],
             cwd=Path(__file__).parent.parent,
-            capture_output=True, text=True, check=True, timeout=2
+            capture_output=True, text=True, check=True
         )
         return result.stdout.strip()
     except Exception:
         return 'unknown'
-
-
-class _VersionAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        print(f"{parser.prog} {_get_version()}")
-        parser.exit()
 
 
 def main():
@@ -55,7 +41,7 @@ def main():
         prog='hyprwhspr',
         description='hyprwhspr - ferocious speech-to-text for Linux',
     )
-    parser.add_argument('--version', action=_VersionAction, nargs=0, help='Show version and exit')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {_get_version()}')
     
     # Global verbosity flags
     parser.add_argument('-q', '--quiet', action='store_true',
@@ -77,14 +63,11 @@ def main():
                               help='Path to Python executable for venv (e.g., /usr/bin/python3.14)')
     setup_subparsers = setup_parser.add_subparsers(dest='setup_action', help='Setup actions')
     auto_parser = setup_subparsers.add_parser('auto', help='Automated setup')
-    # Only backends omarchy_command can actually configure belong here; a value
-    # it does not handle installs one backend and writes another into config.
-    auto_parser.add_argument('--backend',
-                             choices=['faster-whisper', 'nvidia', 'vulkan', 'cpu', 'onnx-asr', 'parakeet-cpp', 'qwen3-asr'],
+    auto_parser.add_argument('--backend', choices=['nvidia', 'vulkan', 'cpu', 'onnx-asr'],
                              help='Backend to install (default: auto-detect GPU)')
-    auto_parser.add_argument('--model', help='Model to download (default: large-v3-turbo on NVIDIA, base otherwise; auto for onnx-asr)')
+    auto_parser.add_argument('--model', help='Model to download (default: base for whisper, auto for onnx-asr)')
     auto_parser.add_argument('--no-waybar', action='store_true', help='Skip bar integration (Waybar/Noctalia)')
-    auto_parser.add_argument('--no-mic-osd', action='store_true', help='Disable mic-osd visualization (otherwise the current setting is kept)')
+    auto_parser.add_argument('--no-mic-osd', action='store_true', help='Disable mic-osd visualization')
     auto_parser.add_argument('--no-systemd', action='store_true', help='Skip systemd service setup')
     auto_parser.add_argument('--hypr-bindings', action='store_true', help='Enable Hyprland compositor bindings')
     auto_parser.add_argument('--python', dest='python_path', metavar='PATH',
@@ -95,18 +78,9 @@ def main():
     install_subparsers = install_parser.add_subparsers(dest='install_action', help='Install actions')
     install_subparsers.add_parser('auto', help=argparse.SUPPRESS)  # Hidden for backwards compatibility, use 'setup auto' instead
 
-    repair_parser = install_subparsers.add_parser('repair', help='Repair managed installation')
-    repair_parser.add_argument('--python', metavar='PATH')
-    install_subparsers.add_parser('status', help='Read-only managed installation status')
-    update_parser = subparsers.add_parser('update', help='Update managed application release')
-    update_parser.add_argument('--version', metavar='VERSION')
-    update_parser.add_argument('--python', metavar='PATH')
-
     # config command
     config_parser = subparsers.add_parser('config', help='Configuration management')
     config_subparsers = config_parser.add_subparsers(dest='config_action', help='Config actions')
-    validate_parser = config_subparsers.add_parser('validate', help='Validate configuration without changes')
-    validate_parser.add_argument('--json', action='store_true', dest='json_output')
     config_subparsers.add_parser('init', help='Create default config')
     config_show_parser = config_subparsers.add_parser('show', help='Display current config')
     config_show_parser.add_argument('--all', action='store_true', dest='show_all', help='Show all settings including defaults')
@@ -148,16 +122,14 @@ def main():
     model_parser = subparsers.add_parser('model', help='Model management')
     model_subparsers = model_parser.add_subparsers(dest='model_action', help='Model actions')
     model_download_parser = model_subparsers.add_parser('download', help='Download model')
-    model_download_parser.add_argument('name', nargs='?', default=None, help='Model name (default: configured ONNX model or base)')
+    model_download_parser.add_argument('name', nargs='?', default='base', help='Model name (default: base)')
     model_subparsers.add_parser('list', help='List available models')
     model_subparsers.add_parser('status', help='Check installed models')
     model_subparsers.add_parser('unload', help='Unload model from memory to free GPU resources')
     model_subparsers.add_parser('reload', help='Reload model into memory after unload')
 
     # status command
-    status_parser = subparsers.add_parser('status', help='Overall status check')
-    status_parser.add_argument('--report', action='store_true', help='Read-only diagnostic report')
-    status_parser.add_argument('--json', action='store_true', dest='json_output')
+    subparsers.add_parser('status', help='Overall status check')
     
     # validate command
     subparsers.add_parser('validate', help='Validate installation')
@@ -168,18 +140,6 @@ def main():
                             help='Record live audio instead of using test.wav')
     test_parser.add_argument('--mic-only', action='store_true',
                             help='Only test microphone, skip transcription')
-
-    # transcribe command
-    transcribe_parser = subparsers.add_parser(
-        'transcribe', help='Transcribe a WAV or MP3 audio file'
-    )
-    transcribe_parser.add_argument('input', metavar='INPUT', help='Input .wav or .mp3 file')
-    transcribe_parser.add_argument('-o', '--output', metavar='PATH',
-                                   help='Write transcript to PATH instead of stdout')
-    transcribe_parser.add_argument('--lang', dest='language', metavar='CODE',
-                                   help='Language code for transcription (e.g., en, it, de)')
-    transcribe_parser.add_argument('--clean', action='store_true',
-                                   help='Apply configured dictation text cleanup')
     
     # keyboard command
     keyboard_parser = subparsers.add_parser('keyboard', help='Keyboard device management')
@@ -196,7 +156,6 @@ def main():
     record_start_parser.add_argument('--lang', dest='language', metavar='CODE',
                                      help='Language code for transcription (e.g., en, it, de)')
     record_subparsers.add_parser('stop', help='Stop recording')
-    record_subparsers.add_parser('release', help='Key-up for push-to-talk bindings: stop, or latch a long hold')
     record_subparsers.add_parser('cancel', help='Cancel recording and discard audio')
     record_toggle_parser = record_subparsers.add_parser('toggle', help='Toggle recording on/off')
     record_toggle_parser.add_argument('--lang', dest='language', metavar='CODE',
@@ -207,14 +166,7 @@ def main():
     )
     record_capture_parser.add_argument('--lang', dest='language', metavar='CODE',
                                        help='Language code for transcription (e.g., en, it, de)')
-    record_capture_parser.add_argument(
-        '--trace-processing', action='store_true',
-        help='Return raw/preprocessed text and daemon processing settings as JSON'
-    )
     record_subparsers.add_parser('status', help='Show current recording status')
-    record_subparsers.add_parser('copy-last', help='Copy the last dictation to the clipboard')
-    record_subparsers.add_parser('paste-last', help='Paste the last dictation without auto-submit')
-    record_subparsers.add_parser('clear-last', help='Forget the last dictation retained in memory')
     
     # backend command
     backend_parser = subparsers.add_parser('backend', help='Backend management')
@@ -231,14 +183,13 @@ def main():
     state_reset_parser.add_argument('--all', action='store_true', help='Also remove installations')
     
     # uninstall command
-    uninstall_parser = subparsers.add_parser('uninstall', help='Remove application; preserve settings, credentials and models')
-    uninstall_parser.add_argument('--purge', action='store_true', help='Also remove owned personal data')
+    uninstall_parser = subparsers.add_parser('uninstall', help='Completely remove hyprwhspr and all user data')
     uninstall_parser.add_argument('--keep-models', action='store_true',
-                                 help='Preserve models even with --purge; unrecorded legacy models are always preserved')
+                                 help='Keep downloaded Whisper models (faster reinstall)')
     uninstall_parser.add_argument('--remove-permissions', action='store_true',
-                                 help='Remove only permissions recorded as added by installation; preserve unrecorded legacy permissions')
+                                 help='Automatically remove system permissions (groups, udev rules)')
     uninstall_parser.add_argument('--skip-permissions', action='store_true',
-                                 help='Preserve all system permissions')
+                                 help='Skip permission removal entirely')
     uninstall_parser.add_argument('--yes', action='store_true',
                                  help='Skip confirmation prompt (non-interactive)')
     
@@ -268,35 +219,7 @@ def main():
     
     # Route to appropriate command handler
     try:
-        from installation import is_nix_install, nix_command_error, require_supported_backend
-        ownership_error = nix_command_error(args)
-        if ownership_error:
-            parser.exit(1, ownership_error + '\n')
-        if is_nix_install():
-            if args.command == 'install' and args.install_action == 'status':
-                print('Installation: Nix-managed (beta, Whisper.cpp CPU). Update through your Nix configuration or profile.')
-                return
-            # Transcribe and test fail through WhisperManager; only a download
-            # would fetch a model the package cannot run.
-            if args.command == 'model' and args.model_action == 'download':
-                import json
-                from paths import CONFIG_FILE
-                if CONFIG_FILE.exists():
-                    config = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-                    if not isinstance(config, dict):
-                        raise ValueError('Configuration must be a JSON object.')
-                    require_supported_backend(config.get('transcription_backend', 'pywhispercpp'))
-        if args.command == 'update' or (args.command == 'install' and args.install_action in ('repair', 'status')):
-            from managed_install import main as lifecycle_main
-            command = [args.command]
-            if args.command == 'install':
-                command.append(args.install_action)
-            if getattr(args, 'version', None):
-                command.extend(['--version', args.version])
-            if getattr(args, 'python', None):
-                command.extend(['--python', args.python])
-            sys.exit(lifecycle_main(command))
-        elif args.command == 'setup':
+        if args.command == 'setup':
             from cli.setup import setup_command
             from cli.install import omarchy_command
             if hasattr(args, 'setup_action') and args.setup_action == 'auto':
@@ -307,8 +230,7 @@ def main():
                 sys.exit(1)
             else:
                 python_path = getattr(args, 'python_path', None)
-                if setup_command(python_path=python_path) is False:
-                    sys.exit(1)
+                setup_command(python_path=python_path)
         elif args.command == 'install':
             from cli.install import omarchy_command
             if not args.install_action:
@@ -321,9 +243,6 @@ def main():
             if not args.config_action:
                 config_parser.print_help()
                 sys.exit(1)
-            if args.config_action == 'validate':
-                from diagnostics import run_diagnostics
-                sys.exit(run_diagnostics(json_output=args.json_output))
             from cli.config import config_command
             config_command(args.config_action, show_all=getattr(args, 'show_all', False))
         elif args.command == 'waybar':
@@ -355,15 +274,9 @@ def main():
                 model_parser.print_help()
                 sys.exit(1)
             from cli.models import model_command
-            model_name = getattr(args, 'name', None)
-            if not model_command(args.model_action, model_name):
-                sys.exit(1)
+            model_name = getattr(args, 'name', 'base')
+            model_command(args.model_action, model_name)
         elif args.command == 'status':
-            if args.json_output and not args.report:
-                parser.error('status --json requires --report')
-            if args.report:
-                from diagnostics import run_diagnostics
-                sys.exit(run_diagnostics(report=True, json_output=args.json_output))
             from cli.status import status_command
             status_command()
         elif args.command == 'validate':
@@ -375,15 +288,6 @@ def main():
                 live=getattr(args, 'live', False),
                 mic_only=getattr(args, 'mic_only', False)
             )
-        elif args.command == 'transcribe':
-            from cli.transcribe import transcribe_command
-            if not transcribe_command(
-                input_path=args.input,
-                output_path=getattr(args, 'output', None),
-                language=getattr(args, 'language', None),
-                clean=getattr(args, 'clean', False),
-            ):
-                sys.exit(1)
         elif args.command == 'keyboard':
             if not args.keyboard_action:
                 keyboard_parser.print_help()
@@ -412,17 +316,12 @@ def main():
             elif args.state_action == 'reset':
                 state_reset_command(getattr(args, 'all', False))
         elif args.command == 'record':
-            from cli.record import record_command, record_capture_command, record_recovery_command
+            from cli.record import record_command, record_capture_command
             if not args.record_action:
                 record_parser.print_help()
                 sys.exit(1)
-            if args.record_action in ('copy-last', 'paste-last', 'clear-last'):
-                record_recovery_command(args.record_action)
-            elif args.record_action == 'capture':
-                record_capture_command(
-                    language=getattr(args, 'language', None),
-                    trace_processing=getattr(args, 'trace_processing', False),
-                )
+            if args.record_action == 'capture':
+                record_capture_command(language=getattr(args, 'language', None))
             else:
                 record_command(args.record_action, language=getattr(args, 'language', None))
         elif args.command == 'uninstall':
@@ -431,8 +330,7 @@ def main():
                 keep_models=getattr(args, 'keep_models', False),
                 remove_permissions=getattr(args, 'remove_permissions', False),
                 skip_permissions=getattr(args, 'skip_permissions', False),
-                yes=getattr(args, 'yes', False),
-                purge=getattr(args, 'purge', False)
+                yes=getattr(args, 'yes', False)
             )
     except KeyboardInterrupt:
         print("\nOperation cancelled by user")

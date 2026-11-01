@@ -2,11 +2,6 @@
 import sys
 from typing import Any, Optional
 
-try:
-    from .installation import repair_hint
-except ImportError:
-    from installation import repair_hint
-
 
 def require_package(
     module_name: str,
@@ -34,6 +29,12 @@ def require_package(
         print(f"ERROR: {pkg} is not available in this Python environment.", file=sys.stderr)
         print(f"ImportError: {e}", file=sys.stderr)
         print("\nThis is a required dependency. Please install it:", file=sys.stderr)
-        hint = repair_hint(install_hint or 'hyprwhspr setup\n  Source checkout: ./bin/hyprwhspr setup')
-        print(f"  {hint}", file=sys.stderr)
+        if install_hint:
+            print(f"  {install_hint}", file=sys.stderr)
+        else:
+            print(f"  Arch:          pacman -S {pkg}", file=sys.stderr)
+            print(f"  Debian/Ubuntu: apt install python3-{module_name}", file=sys.stderr)
+            print(f"  Fedora:        dnf install python3-{module_name}", file=sys.stderr)
+            print(f"  openSUSE:      zypper install python3-{module_name}", file=sys.stderr)
+            print(f"  Or via pip:    pip install {module_name}", file=sys.stderr)
         sys.exit(1)

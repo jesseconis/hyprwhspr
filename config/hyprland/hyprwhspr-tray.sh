@@ -39,12 +39,25 @@ else
 fi
 mkdir -p -m 700 "$RUNTIME_DIR"
 
-# Builtin clock (bash 5): Waybar runs `status` every second, so no date forks
-_date_ms(){
-    if [[ -n "${EPOCHREALTIME:-}" ]]; then local t="${EPOCHREALTIME/[.,]/}"; echo "${t:0:13}"
-    else date +%s%3N 2>/dev/null || date +%s; fi
+# Performance optimization: command caching
+_now=$(date +%s%3N 2>/dev/null || date +%s)  # ms if available
+declare -A _cache
+
+
+# Cached command execution with timeout
+cmd_cached() {
+    local key="$1" ttl_ms="${2:-500}" cmd="${3}"; shift 3 || true
+    local now=$(_date_ms)
+    if [[ -n "${_cache[$key.time]:-}" && $((now - _cache[$key.time])) -lt $ttl_ms ]]; then
+        printf '%s' "${_cache[$key.val]}"; return 0
+    fi
+    local out
+    out=$(timeout 0.25s bash -c "$cmd" 2>/dev/null) || out=""
+    _cache[$key.val]="$out"; _cache[$key.time]=$now
+    printf '%s' "$out"
 }
-_epoch(){ echo "${EPOCHSECONDS:-$(date +%s)}"; }
+
+_date_ms(){ date +%s%3N 2>/dev/null || date +%s; }
 
 # Non-login shell: -l sourcing profiles can blow the timeout
 try() { timeout 0.5s bash -c "$*" 2>/dev/null; }
@@ -66,36 +79,7 @@ stabilize() {
 
 # Function to check if hyprwhspr is running
 is_hyprwhspr_running() {
-    [[ -n "${_SVC_ACTIVE:-}" ]] && { [[ "$_SVC_ACTIVE" == 1 ]]; return; }
     systemctl --user is-active --quiet hyprwhspr.service
-}
-
-# One probe per status tick. get_current_state and mic_tooltip_line run in
-# $(...) subshells that inherit these, so each check reuses one systemctl and
-# two pactl calls instead of repeating them (~60 processes a tick before).
-probe_once() {
-    if systemctl --user is-active --quiet hyprwhspr.service; then _SVC_ACTIVE=1; else _SVC_ACTIVE=0; fi
-    _SOURCES="$(try 'pactl list short sources')"
-    _DEFAULT_SRC="$(try 'pactl get-default-source')"
-    _PROBED=1
-}
-
-pactl_sources() {
-    if [[ -n "${_PROBED:-}" ]]; then printf '%s' "$_SOURCES"; else try 'pactl list short sources'; fi
-}
-
-pactl_default_source() {
-    if [[ -n "${_PROBED:-}" ]]; then printf '%s' "$_DEFAULT_SRC"; else try 'pactl get-default-source'; fi
-}
-
-# True when `pactl list short sources` output has a real input, i.e. a
-# source whose name doesn't end in .monitor (an output's loopback)
-has_input_source() {
-    local _id name _rest
-    while read -r _id name _rest; do
-        [[ -n "$name" && "$name" != *.monitor ]] && return 0
-    done <<<"$1"
-    return 1
 }
 
 # Note: hyprwhspr runs a *private* ydotoold child from the app itself (no shared
@@ -104,18 +88,21 @@ has_input_source() {
 # Function to check PipeWire health comprehensively
 # Uses retry logic to handle startup timing issues (PipeWire may take a moment to initialize)
 is_pipewire_ok() {
-    # A probe that already listed inputs proves pactl answers
-    [[ -n "${_PROBED:-}" ]] && has_input_source "$_SOURCES" && return 0
-
     local retries=3
     local delay=0.1  # 100ms between retries
     
     # Retry loop to handle startup timing
-    for ((i = 1; i <= retries; i++)); do
-        # pactl answers and lists a real input (not an output's .monitor)
-        if timeout 0.2s pactl info >/dev/null 2>&1 \
-            && has_input_source "$(pactl list short sources 2>/dev/null)"; then
-            return 0
+    for i in $(seq 1 $retries); do
+        # Check if pactl is accessible
+        if timeout 0.2s pactl info >/dev/null 2>&1; then
+            # Check if we have any input sources (not monitors)
+            # Note: pactl list short sources shows both inputs and output monitors
+            # We need actual input sources, which don't have ".monitor" in the name
+            local sources
+            sources=$(pactl list short sources 2>/dev/null | grep -v "\.monitor" | grep -v "^$")
+            if [[ -n "$sources" ]]; then
+                return 0  # Success
+            fi
         fi
         
         # If not last retry, wait before trying again
@@ -128,26 +115,12 @@ is_pipewire_ok() {
     return 1
 }
 
-# Model check starts one or two Python interpreters. Cache a pass for 60 s per
-# config file, dropped early when it changes; a failure is rechecked each tick.
-# Deleting a model without touching the config shows up within that minute.
+# Function to check if model file exists
 model_exists() {
-    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/hyprwhspr/config.json"
-    local ok="$RUNTIME_DIR/tray_model_ok" at path
-    if [[ -f "$ok" && ! "$cfg" -nt "$ok" ]] && IFS=$'\t' read -r at path 2>/dev/null < "$ok" \
-        && [[ "$path" == "$cfg" ]] && (( $(_epoch) - at < 60 )); then
-        return 0
-    fi
-    model_exists_uncached || return 1
-    printf '%s\t%s\n' "$(_epoch)" "$cfg" > "$ok" 2>/dev/null
-    return 0
-}
-
-model_exists_uncached() {
-    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/hyprwhspr/config.json"
+    local cfg="$HOME/.config/hyprwhspr/config.json"
     [[ -f "$cfg" ]] || return 0
 
-    # One interpreter start reads both keys
+    # One interpreter start reads both keys (this runs on every status poll)
     local backend model_path
     IFS=$'\t' read -r backend model_path < <("$SYSTEM_PYTHON" - <<'PY' "$cfg" 2>/dev/null
 import json, sys
@@ -176,7 +149,7 @@ PY
 
     # Check onnx-asr availability (lightweight, non-blocking)
     if [[ "$backend" == "onnx-asr" ]]; then
-        local venv_python="${HYPRWHSPR_BACKEND_ENV:-${XDG_DATA_HOME:-$HOME/.local/share}/hyprwhspr/venv}/bin/python"
+        local venv_python="${XDG_DATA_HOME:-$HOME/.local/share}/hyprwhspr/venv/bin/python"
         # Fast timeout check - verify onnx_asr is importable
         # Uses absolute path to venv Python (resilient to MISE/PATH issues)
         if [[ -f "$venv_python" ]]; then
@@ -191,21 +164,10 @@ PY
 
     # faster-whisper uses the HuggingFace cache, not the pywhispercpp models dir
     if [[ "$backend" == "faster-whisper" ]]; then
-        local venv_python="${HYPRWHSPR_BACKEND_ENV:-${XDG_DATA_HOME:-$HOME/.local/share}/hyprwhspr/venv}/bin/python"
+        local venv_python="${XDG_DATA_HOME:-$HOME/.local/share}/hyprwhspr/venv/bin/python"
         if [[ -f "$venv_python" ]] && timeout 3s "$venv_python" -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("faster_whisper") else 1)' >/dev/null 2>&1; then
             return 0
         fi
-        return 1
-    fi
-
-    # qwen3-asr runs a llama.cpp sidecar: check the binary, not a venv import
-    # or the pywhispercpp models dir.
-    if [[ "$backend" == "qwen3-asr" ]]; then
-        local runtime_root="${XDG_DATA_HOME:-$HOME/.local/share}/hyprwhspr/runtime/llama-cpp"
-        local server
-        for server in "$runtime_root"/*/*/llama-server; do
-            [[ -x "$server" ]] && return 0
-        done
         return 1
     fi
 
@@ -231,32 +193,37 @@ PY
 # Microphone detection functions (clean, fast, reliable)
 mic_present() {
     # prefer Pulse/PipeWire view; fall back to ALSA card list
-    has_input_source "$(pactl_sources)" && return 0
+    [[ -n "$(try 'pactl list short sources | grep -v monitor')" ]] && return 0
     [[ -n "$(try 'arecord -l | grep -E ^card')" ]] && return 0
     return 1
 }
 
 mic_accessible() {
     local default_source
-    default_source="$(pactl_default_source)"
+    default_source="$(try 'pactl get-default-source')"
     [[ -n "$default_source" ]] || return 1
 
     [[ -d /dev/snd ]] || return 1
 
+    # Default source must exist (stale default is a real failure)
+    if ! try 'pactl list short sources' | awk '{print $2}' | grep -qxF "$default_source"; then
+        return 1
+    fi
+
     # Don't treat monitor sources as a microphone
     [[ "$default_source" == *.monitor ]] && return 1
 
-    # Default source must exist (stale default is a real failure)
-    local _id name _rest
-    while read -r _id name _rest; do
-        [[ "$name" == "$default_source" ]] && return 0
-    done <<<"$(pactl_sources)"
-    return 1
+    return 0
 }
 
 mic_recording_now() {
     # Only consider it recording if hyprwhspr service is active AND actually recording
     if ! is_hyprwhspr_running; then
+        return 1
+    fi
+    
+    # Check if hyprwhspr process is actually running
+    if ! pgrep -f "hyprwhspr" > /dev/null 2>&1; then
         return 1
     fi
     
@@ -280,7 +247,7 @@ mic_recording_now() {
     if [[ -f "$level_file" ]]; then
         # Check file modification time (seconds since epoch)
         local file_age
-        file_age=$(($(_epoch) - $(stat -c %Y "$level_file" 2>/dev/null || echo 0)))
+        file_age=$(($(date +%s) - $(stat -c %Y "$level_file" 2>/dev/null || echo 0)))
         
         # If audio_level file is stale (>2 seconds), recording is not actually happening
         if [[ $file_age -gt 2 ]]; then
@@ -292,7 +259,7 @@ mic_recording_now() {
         # But give it a grace period (maybe recording just started)
         # Check if recording_status file is very recent (<1 second)
         local status_age
-        status_age=$(($(_epoch) - $(stat -c %Y "$status_file" 2>/dev/null || echo 0)))
+        status_age=$(($(date +%s) - $(stat -c %Y "$status_file" 2>/dev/null || echo 0)))
         if [[ $status_age -gt 1 ]]; then
             # Status file exists but no audio_level file and status is >1s old
             # This suggests recording never actually started or crashed immediately
@@ -304,22 +271,9 @@ mic_recording_now() {
     return 0
 }
 
-# Sample spec rarely changes: a full `pactl list sources` per tick is waste,
-# so the label is cached for 30 s per default source.
 mic_fidelity_label() {
-    local f="$RUNTIME_DIR/tray_fidelity" def="$(pactl_default_source)" at src label
-    if IFS=$'\t' read -r at src label 2>/dev/null < "$f" \
-        && [[ "$src" == "$def" ]] && (( $(_epoch) - at < 30 )); then
-        printf '%s\n' "$label"; return
-    fi
-    label="$(mic_fidelity_label_uncached "$def")"
-    # An empty label may be a timed-out pactl: retry next tick, don't pin it
-    [[ -n "$label" ]] && printf '%s\t%s\t%s\n' "$(_epoch)" "$def" "$label" > "$f" 2>/dev/null
-    printf '%s\n' "$label"
-}
-
-mic_fidelity_label_uncached() {
-    local def="$1" spec rate ch fmt
+    local def spec rate ch fmt
+    def="$(try 'pactl get-default-source')"
     [[ -n "$def" ]] || def='@DEFAULT_SOURCE@'
     spec="$(try "pactl list sources | awk -v D=\"$def\" '
         /^[[:space:]]*Name:/{name=\$2}
@@ -617,6 +571,28 @@ control_recording() {
     fi
 }
 
+# Function to check service health and recover from stuck states
+check_service_health() {
+    if is_hyprwhspr_running; then
+        # Check if service has been in "activating" state too long
+        local service_status=$(systemctl --user show hyprwhspr.service --property=ActiveState --value)
+        
+        if [ "$service_status" = "activating" ]; then
+            # Service is stuck starting, restart it
+            echo "Service stuck in activating state, restarting..." >&2
+            systemctl --user restart hyprwhspr.service
+            return 1
+        fi
+        
+        # Check if recording state is stuck (running but no actual audio)
+        if is_hyprwhspr_running && ! is_hyprwhspr_recording; then
+            # Service is running but not recording - this is normal
+            return 0
+        fi
+    fi
+    return 0
+}
+
 # Function to emit JSON output for waybar with granular error classes
 emit_json() {
     local state="$1" reason="${2:-}" custom_tooltip="${3:-}"
@@ -689,8 +665,9 @@ emit_json() {
     local zws_count=$((ts % 10))
     local zws=""
     # Add 0-9 zero-width spaces based on timestamp (invisible but unique)
-    printf -v zws '%*s' "$zws_count" ''
-    zws="${zws// /$'\u200b'}"
+    for ((i=0; i<zws_count; i++)); do
+        zws="${zws}$(printf '\u200B')"
+    done
     text="${text}${zws}"
     
     # Output JSON for waybar
@@ -701,8 +678,11 @@ emit_json() {
 get_current_state() {
     local reason=""
     
+    # Check service health first
+    check_service_health
+    
     # Check if service is running
-    if ! is_hyprwhspr_running; then
+    if ! systemctl --user is-active --quiet hyprwhspr.service; then
         # Distinguish failed from inactive
         if systemctl --user is-failed --quiet hyprwhspr.service; then
             local result exec_code
@@ -738,7 +718,7 @@ get_current_state() {
         local rest="${result#*:}"
         local reason="${rest%%:*}"
         local timestamp="${rest#*:}"
-        local current_time=$(_epoch)
+        local current_time=$(date +%s)
         local result_age=$((current_time - timestamp))
 
         # If recovery succeeded within last 5 seconds, we're in grace period
@@ -759,7 +739,7 @@ get_current_state() {
     if [[ -f "$zero_volume_file" ]]; then
         # Check file age - if recent (<60s), show error
         local file_age
-        file_age=$(($(_epoch) - $(stat -c %Y "$zero_volume_file" 2>/dev/null || echo 0)))
+        file_age=$(($(date +%s) - $(stat -c %Y "$zero_volume_file" 2>/dev/null || echo 0)))
         if [[ $file_age -lt 60 ]]; then
             echo "error:mic_no_audio"; return
         else
@@ -786,7 +766,6 @@ case "${1:-status}" in
     "status")
         # Check for recovery results and show notifications
         check_recovery_result
-        probe_once
         IFS=: read -r s r <<<"$(stabilize "$(get_current_state)")"
         emit_json "$s" "$r" "$(mic_tooltip_line)"
         ;;
@@ -842,9 +821,12 @@ case "${1:-status}" in
         fi
         ;;
     "health")
-        # Kept for scripts. It never recovered anything: a Type=simple unit
-        # can't sit in "activating". Stuck recording: hyprwhspr record cancel
-        probe_once
+        check_service_health
+        if [ $? -eq 0 ]; then
+            echo "Service health check passed" >&2
+        else
+            echo "Service health check failed, attempting recovery" >&2
+        fi
         IFS=: read -r s r <<<"$(get_current_state)"
         # Only output JSON if stdout is not a TTY (i.e., being called by Waybar)
         if [ ! -t 1 ]; then
@@ -860,6 +842,6 @@ case "${1:-status}" in
         echo "  start     - Start hyprwhspr"
         echo "  stop      - Stop hyprwhspr"
         echo "  restart   - Restart hyprwhspr"
-        echo "  health    - Same as status (kept for scripts)"
+        echo "  health    - Check service health and recover if needed"
         ;;
 esac

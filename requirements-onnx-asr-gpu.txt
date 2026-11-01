@@ -1,2 +1,2 @@
 -r requirements.txt
-onnx-asr[gpu,hub]
+onnx-asr[cuda,hub]

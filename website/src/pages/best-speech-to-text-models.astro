@@ -199,32 +199,6 @@ import BlogPost from "../layouts/BlogPost.astro";
         <li>Privacy: fully local</li>
     </ul>
 
-    <h2>Qwen3-ASR</h2>
-
-    <p>
-        <strong>Best for: Chinese, Japanese and Korean.</strong>
-    </p>
-
-    <p>
-        <a href="https://github.com/QwenLM/Qwen3-ASR" target="_blank" rel="noopener"
-            >Qwen3-ASR</a
-        > is the open CJK specialist. The 1.7B model outruns Whisper-large-v3 on
-        most published benchmarks, especially Mandarin and Japanese.
-    </p>
-
-    <p>
-        A pinned llama.cpp sidecar keeps it local and leaves Python untouched.
-        Long audio breaks at pauses, then joins again. Experimental; no streaming
-        or timestamps yet.
-    </p>
-
-    <ul>
-        <li>Requires: ~2.4 GB disk for the 1.7B Q8 pair (~1.0 GB for 0.6B)</li>
-        <li>Languages: 30, plus 22 Chinese dialects</li>
-        <li>Acceleration: Vulkan (NVIDIA, AMD or Intel) or CPU</li>
-        <li>Privacy: fully local</li>
-    </ul>
-
     <h2>A note on GPU support</h2>
 
     <p>
@@ -309,7 +283,6 @@ import BlogPost from "../layouts/BlogPost.astro";
                 ></tr
             >
             <tr><td>Multiple languages</td><td>Whisper large-v3</td></tr>
-            <tr><td>Chinese, Japanese or Korean</td><td>Qwen3-ASR</td></tr>
             <tr
                 ><td>Multilingual, constrained VRAM</td><td>faster-whisper</td
                 ></tr

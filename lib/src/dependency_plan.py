@@ -1,37 +1,25 @@
 """Authoritative dependency plan specifications and resolution."""
 
-import importlib.util
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 try:
     from .dependency_manifest import fingerprint, parse_graph
-    from .realtime_protocols import protocol_for_provider
 except ImportError:
     from dependency_manifest import fingerprint, parse_graph
-    from realtime_protocols import protocol_for_provider
-
-
-CORE_IMPORTS = ('sounddevice', 'numpy', 'soxr', 'soundfile')
 
 
 PLAN_SPECS = {
-    'parakeet-cpp': ('requirements-parakeet-cpp.txt', CORE_IMPORTS, 'parakeet-cpp'),
-    'pywhispercpp': ('requirements-pywhispercpp.txt', CORE_IMPORTS + ('pywhispercpp',), 'pywhispercpp'),
-    'rest': ('requirements-rest.txt', CORE_IMPORTS + ('requests',), 'rest'),
-    'realtime': ('requirements-realtime.txt', CORE_IMPORTS + ('websocket',), 'realtime'),
-    'elevenlabs': ('requirements-realtime-elevenlabs.txt', CORE_IMPORTS + ('elevenlabs',), 'elevenlabs'),
-    'cohere': ('requirements-cohere-transcribe.txt', CORE_IMPORTS + (
-        'pandas', 'scipy', 'numba', 'sklearn', 'transformers', 'torch', 'librosa', 'huggingface_hub'), 'cohere'),
-    'onnx-cpu': ('requirements-onnx-asr.txt', CORE_IMPORTS + ('onnx_asr',), 'onnx'),
-    'onnx-gpu': ('requirements-onnx-asr-gpu.txt', CORE_IMPORTS + ('onnx_asr',), 'onnx'),
-    'faster-cpu': ('requirements-faster-whisper.txt', CORE_IMPORTS + ('faster_whisper',), 'faster-whisper'),
-    'faster-cuda': ('requirements-faster-whisper-cuda.txt', CORE_IMPORTS + ('faster_whisper',), 'faster-whisper'),
-    # Inference happens in the pinned llama.cpp sidecar, so there is no ASR
-    # import to verify — only the core audio deps the capture pipeline needs.
-    'qwen3-asr': ('requirements-qwen3-asr.txt', CORE_IMPORTS, 'qwen3-asr'),
+    'pywhispercpp': ('requirements-pywhispercpp.txt', ('sounddevice', 'numpy', 'soxr', 'pywhispercpp'), 'pywhispercpp'),
+    'rest': ('requirements-rest.txt', ('sounddevice', 'numpy', 'soxr', 'requests'), 'rest'),
+    'realtime': ('requirements-realtime.txt', ('sounddevice', 'numpy', 'soxr', 'websocket'), 'realtime'),
+    'elevenlabs': ('requirements-realtime-elevenlabs.txt', ('sounddevice', 'numpy', 'soxr', 'elevenlabs'), 'elevenlabs'),
+    'cohere': ('requirements-cohere-transcribe.txt', ('sounddevice', 'numpy', 'soxr', 'transformers', 'torch'), 'cohere'),
+    'onnx-cpu': ('requirements-onnx-asr.txt', ('sounddevice', 'numpy', 'soxr', 'onnx_asr'), 'onnx'),
+    'onnx-gpu': ('requirements-onnx-asr-gpu.txt', ('sounddevice', 'numpy', 'soxr', 'onnx_asr'), 'onnx'),
+    'faster-cpu': ('requirements-faster-whisper.txt', ('sounddevice', 'numpy', 'soxr', 'faster_whisper'), 'faster-whisper'),
+    'faster-cuda': ('requirements-faster-whisper-cuda.txt', ('sounddevice', 'numpy', 'soxr', 'faster_whisper'), 'faster-whisper'),
 }
 
 
@@ -51,37 +39,14 @@ def plan_key(backend: str, provider: Optional[str], variant: Optional[str], erro
     if backend in ('rest-api', 'remote'):
         return 'rest'
     if backend == 'realtime-ws':
-        return protocol_for_provider(provider).deps
+        return 'elevenlabs' if provider == 'elevenlabs' else 'realtime'
     if backend == 'cohere-transcribe':
         return 'cohere'
     if backend == 'onnx-asr':
         return 'onnx-gpu' if variant in ('gpu', 'cuda') else 'onnx-cpu'
     if backend == 'faster-whisper':
         return 'faster-cuda' if variant in ('gpu', 'cuda') else 'faster-cpu'
-    if backend in ('qwen3-asr', 'parakeet-cpp'):
-        return backend
     raise error(f"No dependency manifest is defined for backend {backend!r}")
-
-
-def _importable(name: str) -> bool:
-    try:
-        return importlib.util.find_spec(name) is not None
-    except (ImportError, ValueError):
-        # Fall back to the loaded-module table when find_spec raises.
-        return name in sys.modules
-
-
-def missing_imports(backend: str, provider: Optional[str] = None):
-    """Required imports of a backend's plan that this interpreter cannot find.
-
-    Modules are located without importing them. A backend without a plan
-    yields an empty tuple.
-    """
-    try:
-        imports = PLAN_SPECS[plan_key(backend, provider, None, ValueError)][1]
-    except ValueError:
-        return ()
-    return tuple(name for name in imports if not _importable(name))
 
 
 def resolve(root: Path, backend: str, provider: Optional[str], variant: Optional[str], error: Callable):

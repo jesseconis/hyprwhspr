@@ -6,14 +6,8 @@ OpenAI-compatible transcription API) and returns the transcript.
 Stateless: configuration is re-read on every request.
 """
 
-import re
 import time
 from typing import Optional
-
-try:
-    from ..service_log import log
-except ImportError:
-    from service_log import log
 
 try:
     from ..dependencies import require_package
@@ -21,30 +15,14 @@ except ImportError:
     from dependencies import require_package
 
 np = require_package('numpy')
+requests = require_package('requests')
 
 try:
     from ..credential_manager import get_credential
 except ImportError:
     from credential_manager import get_credential
 
-try:
-    from ..backend_utils import endpoint_key, is_valid_http_url, redact_url
-except ImportError:
-    from backend_utils import endpoint_key, is_valid_http_url, redact_url
-
 from .base import TranscriptionBackend
-
-
-_URL_RE = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://[^\s\'"<>()]+')
-# urllib3 names the request target alone: "... with url: /path?query".
-_URL_TARGET_RE = re.compile(r'(url: /[^\s?#\'"]*)[?#][^\s\'"]*')
-
-
-def _safe_error(exc):
-    """Exception type and message with URLs redacted for the log."""
-    text = _URL_RE.sub(lambda match: redact_url(match.group(0)), str(exc))
-    text = _URL_TARGET_RE.sub(r'\1', text)
-    return f'{type(exc).__name__}: {text}' if text else type(exc).__name__
 
 
 class RestApiBackend(TranscriptionBackend):
@@ -53,20 +31,8 @@ class RestApiBackend(TranscriptionBackend):
     name = 'rest-api'
     is_local = False
 
-    def __init__(self, manager):
-        super().__init__(manager)
-        self._requests = None
-
-    def _requests_client(self):
-        """Load the REST-only dependency when this backend is actually used."""
-        if self._requests is None:
-            self._requests = require_package('requests')
-        return self._requests
-
     def initialize(self) -> bool:
         """Configure REST API backend"""
-        self._requests_client()
-
         # Attempt migration of API key if needed (backup in case config was loaded before migration)
         self.config.migrate_api_key_to_credential_manager()
 
@@ -74,19 +40,19 @@ class RestApiBackend(TranscriptionBackend):
         endpoint_url = self.config.get_setting('rest_endpoint_url')
 
         if not endpoint_url:
-            log('ERROR: REST backend selected but rest_endpoint_url not configured')
+            print('ERROR: REST backend selected but rest_endpoint_url not configured')
             return False
 
-        if not is_valid_http_url(endpoint_url.strip() if isinstance(endpoint_url, str) else endpoint_url):
-            log(f'WARNING: REST endpoint URL should be an http:// or https:// URL: {redact_url(endpoint_url)}')
+        if not endpoint_url.startswith('https://') and not endpoint_url.startswith('http://'):
+            print(f'WARNING: REST endpoint URL should start with https:// or http://: {endpoint_url}')
 
         # Validate timeout is reasonable
         timeout = self.config.get_setting('rest_timeout', 30)
         if timeout < 1 or timeout > 300:
-            log(f'WARNING: REST timeout should be between 1-300 seconds, got {timeout}')
+            print(f'WARNING: REST timeout should be between 1-300 seconds, got {timeout}')
 
-        log(f'[BACKEND] Using REST API: {redact_url(endpoint_url)}')
-        log(f'[REST] Timeout configured: {timeout}s')
+        print(f'[BACKEND] Using REST API: {endpoint_url}')
+        print(f'[REST] Timeout configured: {timeout}s')
 
         # Log user-defined config objects (sanitized)
         rest_headers = self.config.get_setting('rest_headers', {})
@@ -98,88 +64,33 @@ class RestApiBackend(TranscriptionBackend):
         if provider_id:
             api_key = get_credential(provider_id)
             if api_key:
-                log(f'[REST] API key configured (via credential manager, provider: {provider_id})')
+                print(f'[REST] API key configured (via credential manager, provider: {provider_id})')
             else:
-                log(f'WARNING: [REST] Provider {provider_id} configured but API key not found in credential store')
+                print(f'WARNING: [REST] Provider {provider_id} configured but API key not found in credential store')
         else:
             # Backward compatibility: check for old rest_api_key in config
             api_key = self.config.get_setting('rest_api_key')
             if api_key:
-                log('[REST] API key configured (via rest_api_key - deprecated, consider migrating)')
+                print('[REST] API key configured (via rest_api_key - deprecated, consider migrating)')
 
         if rest_headers and isinstance(rest_headers, dict):
             header_count = len([k for k in rest_headers.keys() if rest_headers.get(k) is not None])
             if header_count > 0:
-                log(f'[REST] Custom headers configured ({header_count} keys)')
+                print(f'[REST] Custom headers configured ({header_count} keys)')
 
         if rest_body and isinstance(rest_body, dict):
             body_count = len([k for k in rest_body.keys() if rest_body.get(k) is not None])
             if body_count > 0:
-                log(f'[REST] Custom body fields configured ({body_count} fields)')
-
-        fallbacks = self._resolve_endpoints(endpoint_url, warn=True)[1:]
-        if fallbacks:
-            log(f'[REST] Fallbacks: {", ".join(redact_url(url) for url in fallbacks)}')
+                print(f'[REST] Custom body fields configured ({body_count} fields)')
 
         language = self.config.get_setting('language', None)
         if language:
-            log(f'[REST] Language hint: {language}')
+            print(f'[REST] Language hint: {language}')
 
         # Explicitly set to None to avoid confusion with top-level model setting
         self.current_model = None
         self.ready = True
         return True
-
-    def _has_credential(self):
-        """Whether requests carry a key: stored, legacy, or a custom Authorization header."""
-        provider_id = self.config.get_setting('rest_api_provider')
-        if provider_id:
-            if get_credential(provider_id):
-                return True
-        elif self.config.get_setting('rest_api_key'):
-            return True
-        rest_headers = self.config.get_setting('rest_headers', {})
-        return isinstance(rest_headers, dict) and any(
-            str(key).lower() == 'authorization' and value is not None
-            for key, value in rest_headers.items())
-
-    def _resolve_endpoints(self, endpoint_url, warn=False):
-        """Primary first, then usable fallbacks, in order.
-
-        Fallbacks are mirrors that get the primary's key, headers and body.
-        Entries that are not HTTP(S) URLs with a host, or repeat an earlier
-        endpoint, are dropped. So is an http:// fallback behind a keyed
-        https:// primary: it would send the key in cleartext. Warnings name
-        the index only, since the value may embed credentials.
-        """
-        primary = endpoint_url.strip() if isinstance(endpoint_url, str) else endpoint_url
-        endpoints = [primary]
-        fallbacks = self.config.get_setting('rest_fallback_endpoint_urls', [])
-        if not isinstance(fallbacks, list):
-            if warn:
-                log('WARNING: rest_fallback_endpoint_urls must be an array; ignoring invalid value')
-            return endpoints
-        if not fallbacks:
-            return endpoints
-
-        seen = {endpoint_key(primary)} if is_valid_http_url(primary) else set()
-        keyed_https = (isinstance(primary, str) and primary.lower().startswith('https://')
-                       and self._has_credential())
-        for index, url in enumerate(fallbacks):
-            url = url.strip() if isinstance(url, str) else url
-            if not is_valid_http_url(url):
-                reason = 'invalid'
-            elif endpoint_key(url) in seen:
-                reason = 'duplicate'
-            elif keyed_https and url.lower().startswith('http://'):
-                reason = 'plain-http (would leak the key)'
-            else:
-                seen.add(endpoint_key(url))
-                endpoints.append(url)
-                continue
-            if warn:
-                log(f'WARNING: [REST] Ignoring {reason} rest_fallback_endpoint_urls entry at index {index}')
-        return endpoints
 
     def transcribe(self, audio_data: np.ndarray, sample_rate: int = 16000, language_override: Optional[str] = None) -> str:
         """
@@ -193,11 +104,7 @@ class RestApiBackend(TranscriptionBackend):
         Returns:
             Transcribed text string
         """
-        requests = self._requests_client()
         try:
-            # Tracks the endpoint being attempted so outer failure handlers can
-            # name it safely; stays None if an error precedes the attempt loop.
-            request_url = None
 
             # Get REST endpoint configuration
             endpoint_url = self.config.get_setting('rest_endpoint_url')
@@ -208,7 +115,7 @@ class RestApiBackend(TranscriptionBackend):
             if provider_id:
                 api_key = get_credential(provider_id)
                 if not api_key:
-                    log(f'WARNING: [REST] Provider {provider_id} configured but API key not found in credential store')
+                    print(f'WARNING: [REST] Provider {provider_id} configured but API key not found in credential store')
             else:
                 # Backward compatibility: check for old rest_api_key in config
                 api_key = self.config.get_setting('rest_api_key')
@@ -218,11 +125,11 @@ class RestApiBackend(TranscriptionBackend):
             rest_body = self.config.get_setting('rest_body', {})
 
             if not isinstance(rest_headers, dict):
-                log('WARNING: rest_headers must be an object/dict; ignoring invalid value')
+                print('WARNING: rest_headers must be an object/dict; ignoring invalid value')
                 rest_headers = {}
 
             if not isinstance(rest_body, dict):
-                log('WARNING: rest_body must be an object/dict; ignoring invalid value')
+                print('WARNING: rest_body must be an object/dict; ignoring invalid value')
                 rest_body = {}
 
             extra_headers = {}
@@ -232,7 +139,7 @@ class RestApiBackend(TranscriptionBackend):
                 try:
                     extra_headers[str(key)] = str(value)
                 except Exception:
-                    log(f'WARNING: Skipping non-serializable rest_headers entry: {key}')
+                    print(f'WARNING: Skipping non-serializable rest_headers entry: {key}')
 
             extra_body = {}
             for key, value in rest_body.items():
@@ -241,11 +148,11 @@ class RestApiBackend(TranscriptionBackend):
                 try:
                     key_str = str(key)
                 except Exception:
-                    log(f'WARNING: Skipping rest_body entry with non-stringable key: {key}')
+                    print(f'WARNING: Skipping rest_body entry with non-stringable key: {key}')
                     continue
 
                 if isinstance(value, (dict, list, tuple, set)):
-                    log(f'WARNING: rest_body values must be scalar (key: {key_str}); skipping entry')
+                    print(f'WARNING: rest_body values must be scalar (key: {key_str}); skipping entry')
                     continue
 
                 extra_body[key_str] = value
@@ -253,22 +160,23 @@ class RestApiBackend(TranscriptionBackend):
             if not endpoint_url:
                 raise ValueError('REST endpoint URL not configured')
 
-            endpoint_urls = self._resolve_endpoints(endpoint_url)
-
             # Extract model information from rest_body if available (before processing)
             model_info = rest_body.get('model') if isinstance(rest_body, dict) else None
 
             if model_info:
-                log_msg = f'[REST API] {redact_url(endpoint_url)} - model: {model_info}'
+                log_msg = f'[REST API] {endpoint_url} - model: {model_info}'
             else:
-                log_msg = f'[REST API] {redact_url(endpoint_url)}'
+                log_msg = f'[REST API] {endpoint_url}'
 
-            log(log_msg)
+            print(log_msg, flush=True)
 
             # Convert audio to WAV format
             wav_bytes = self._numpy_to_wav_bytes(audio_data, sample_rate)
             audio_duration = len(audio_data) / sample_rate
-            log(f'[REST] Audio: {audio_duration:.2f}s @ {sample_rate}Hz, {len(wav_bytes)} bytes')
+            print(
+                f'[REST] Audio: {audio_duration:.2f}s @ {sample_rate}Hz, {len(wav_bytes)} bytes',
+                flush=True,
+            )
 
             # Prepare the request
             files = {'file': ('audio.wav', wav_bytes, 'audio/wav')}
@@ -289,7 +197,11 @@ class RestApiBackend(TranscriptionBackend):
 
             # Fill prompt from config - use language-specific prompt if available
             if 'prompt' not in data:
-                whisper_prompt, _ = self.resolve_whisper_prompt(language)
+                whisper_prompt = None
+                if language:
+                    whisper_prompt = self.config.get_setting(f'whisper_prompt_{language}', None)
+                if not whisper_prompt:
+                    whisper_prompt = self.config.get_setting('whisper_prompt', None)
                 if whisper_prompt:
                     data['prompt'] = whisper_prompt
 
@@ -297,81 +209,64 @@ class RestApiBackend(TranscriptionBackend):
             if data:
                 # Sanitize - don't log full prompt, just keys
                 param_summary = ', '.join(f'{k}={v[:20] + "..." if isinstance(v, str) and len(v) > 20 else v}' for k, v in data.items())
-                log(f'[REST] Request params: {param_summary}')
+                print(f'[REST] Request params: {param_summary}', flush=True)
 
-            # Send the request, advancing to the next endpoint only when the
-            # server never got the audio (connection errors, including connect
-            # timeouts) or refused it (HTTP 429/5xx). A read timeout means the
-            # server may still be transcribing; retrying would bill it twice.
-            for index, request_url in enumerate(endpoint_urls):
-                has_fallback = index + 1 < len(endpoint_urls)
+            # Send the request
+            print(f'[REST] Sending request to {endpoint_url}...', flush=True)
+            start_time = time.time()
+            response = requests.post(endpoint_url, files=files, data=data, headers=headers, timeout=timeout)
+            response_time = time.time() - start_time
+            print(f'[REST] Response received in {response_time:.2f}s (status: {response.status_code})', flush=True)
+
+            # Check for HTTP errors
+            if response.status_code != 200:
+                error_msg = f'REST API returned status {response.status_code}'
                 try:
-                    log(f'[REST] Sending request to {redact_url(request_url)}...')
-                    start_time = time.time()
-                    response = requests.post(request_url, files=files, data=data, headers=headers, timeout=timeout)
-                    response_time = time.time() - start_time
-                    log(f'[REST] Response received in {response_time:.2f}s (status: {response.status_code})')
-                except requests.exceptions.ConnectionError as exc:
-                    if not has_fallback:
-                        raise
-                    log(f'WARNING: [REST] Could not reach {redact_url(request_url)} '
-                        f'({_safe_error(exc)}); trying fallback endpoint')
-                    continue
+                    error_detail = response.json()
+                    error_msg += f': {error_detail}'
+                except Exception:
+                    error_msg += f': {response.text[:200]}'
+                print(f'ERROR: {error_msg}')
+                return ''
 
-                # Check for HTTP errors
-                if response.status_code != 200:
-                    retryable = response.status_code == 429 or response.status_code >= 500
-                    if retryable and has_fallback:
-                        log(f'WARNING: [REST] Status {response.status_code} from {redact_url(request_url)}; trying fallback endpoint')
-                        # Release the discarded response body before the retry.
-                        response.close()
-                        continue
-                    error_msg = f'REST API returned status {response.status_code}'
-                    try:
-                        error_detail = response.json()
-                        error_msg += f': {error_detail}'
-                    except Exception:
-                        error_msg += f': {response.text[:200]}'
-                    log(f'ERROR: {error_msg}')
-                    return ''
+            # Parse the response
+            try:
+                result = response.json()
+            except Exception as json_err:
+                # Show raw response for debugging
+                raw_body = response.text[:500] if response.text else '(empty)'
+                print(f'ERROR: Failed to parse JSON response: {json_err}')
+                print(f'[REST] Raw response body: {raw_body}')
+                print(f'[REST] Content-Type: {response.headers.get("Content-Type", "not set")}')
+                return ''
 
-                # Parse the response
-                try:
-                    result = response.json()
-                except Exception as json_err:
-                    # Show raw response for debugging
-                    raw_body = response.text[:500] if response.text else '(empty)'
-                    log(f'ERROR: Failed to parse JSON response: {json_err}')
-                    log(f'[REST] Raw response body: {raw_body}')
-                    log(f'[REST] Content-Type: {response.headers.get("Content-Type", "not set")}')
-                    return ''
+            # Try common response formats
+            transcription = ''
+            if 'text' in result:
+                transcription = result['text']
+            elif 'transcription' in result:
+                transcription = result['transcription']
+            elif 'result' in result:
+                transcription = result['result']
+            else:
+                print(f'ERROR: Unexpected response format: {result}')
+                return ''
 
-                # Try common response formats
-                transcription = ''
-                if 'text' in result:
-                    transcription = result['text']
-                elif 'transcription' in result:
-                    transcription = result['transcription']
-                elif 'result' in result:
-                    transcription = result['result']
-                else:
-                    log(f'ERROR: Unexpected response format: {result}')
-                    return ''
-
-                log(f'[REST] Transcription received ({len(transcription)} chars)')
-                return transcription.strip()
+            print(
+                f'[REST] Transcription received ({len(transcription)} chars)',
+                flush=True,
+            )
+            return transcription.strip()
 
         except requests.exceptions.Timeout:
-            log(f'ERROR: REST API request timed out after {timeout}s at {redact_url(request_url) or "<unknown>"}')
+            print(f'ERROR: REST API request timed out after {timeout}s')
             return ''
-        except requests.exceptions.ConnectionError as exc:
-            log(f'ERROR: Failed to connect to REST API at {redact_url(request_url) or "<unknown>"}: '
-                f'{_safe_error(exc)}')
+        except requests.exceptions.ConnectionError as e:
+            print(f'ERROR: Failed to connect to REST API: {e}')
             return ''
-        except requests.exceptions.RequestException as exc:
-            log(f'ERROR: REST API request failed at {redact_url(request_url) or "<unknown>"}: '
-                f'{_safe_error(exc)}')
+        except requests.exceptions.RequestException as e:
+            print(f'ERROR: REST API request failed: {e}')
             return ''
-        except Exception as exc:
-            log(f'ERROR: REST transcription failed: {_safe_error(exc)}')
+        except Exception as e:
+            print(f'ERROR: REST transcription failed: {e}')
             return ''

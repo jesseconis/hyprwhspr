@@ -24,8 +24,12 @@ except ImportError:
 
 # ==================== Mic-OSD Commands ====================
 
-def _query_mic_osd_availability():
-    """Return availability, reason, and runtime source for the service Python."""
+def _check_mic_osd_availability():
+    """Check mic-osd availability using the same Python the service will use.
+    
+    Returns:
+        tuple: (is_available: bool, reason: str)
+    """
     # First, try with venv Python (same as service uses)
     venv_python = VENV_DIR / 'bin' / 'python'
     if venv_python.exists():
@@ -38,9 +42,8 @@ def _query_mic_osd_availability():
 import sys
 sys.path.insert(0, {lib_path_str})
 from mic_osd import MicOSDRunner
-source = MicOSDRunner.runtime_source()
-if source != 'unavailable':
-    print('AVAILABLE:', source)
+if MicOSDRunner.is_available():
+    print('AVAILABLE')
 else:
     print('UNAVAILABLE:', MicOSDRunner.get_unavailable_reason())
 """
@@ -49,16 +52,14 @@ else:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=5
             )
             if result.returncode == 0:
                 output = result.stdout.strip()
                 if output == 'AVAILABLE':
-                    return True, "", "system"
-                if output.startswith('AVAILABLE:'):
-                    return True, "", output.replace('AVAILABLE:', '').strip()
+                    return True, ""
                 elif output.startswith('UNAVAILABLE:'):
-                    return False, output.replace('UNAVAILABLE:', '').strip(), "unavailable"
+                    return False, output.replace('UNAVAILABLE:', '').strip()
         except Exception as e:
             # Fall through to current Python check
             pass
@@ -70,17 +71,11 @@ else:
         from mic_osd import MicOSDRunner
         
         if MicOSDRunner.is_available():
-            return True, "", MicOSDRunner.runtime_source()
+            return True, ""
         else:
-            return False, MicOSDRunner.get_unavailable_reason(), "unavailable"
+            return False, MicOSDRunner.get_unavailable_reason()
     except ImportError:
-        return False, "mic-osd module not found", "unavailable"
-
-
-def _check_mic_osd_availability():
-    """Check mic-osd availability using the same Python the service will use."""
-    available, reason, _source = _query_mic_osd_availability()
-    return available, reason
+        return False, "mic-osd module not found"
 
 
 def mic_osd_command(action: str):
@@ -128,12 +123,11 @@ def mic_osd_status():
     enabled = config.get_setting('mic_osd_enabled', True)
     
     # Check dependencies using service's Python
-    deps_available, deps_reason, runtime_source = _query_mic_osd_availability()
+    deps_available, deps_reason = _check_mic_osd_availability()
     
     print("\nMic-OSD Status:")
     print(f"  Enabled in config: {'Yes' if enabled else 'No'}")
     print(f"  Dependencies available: {'Yes' if deps_available else 'No'}")
-    print(f"  Layer-shell runtime: {runtime_source}")
     
     if deps_available:
         if enabled:

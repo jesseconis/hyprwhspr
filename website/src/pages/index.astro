@@ -12,7 +12,7 @@ import "../styles/global.css";
         <title>hyprwhspr — system speech-to-text for Linux</title>
         <meta
             name="description"
-            content="Fast, accurate, private, and hackable system-wide dictation for Linux on Wayland and X11. Local Whisper models, cloud APIs, instant transcription."
+            content="Fast, accurate, system-wide dictation for Linux on Wayland and X11. Local Whisper models, cloud APIs, instant transcription."
         />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -36,8 +36,8 @@ import "../styles/global.css";
                     </h1>
                     <p class="subtitle">
                         System-wide speech&#8209;to&#8209;text.<br />
-                        Local models. Secure cloud providers. Fully featured, fully
-                        hackable.
+                        Local models. Secure cloud providers. Fully featured. Top
+                        performance.
                     </p>
 
                     <div class="cta-row">
@@ -61,9 +61,6 @@ import "../styles/global.css";
                         </a>
                         <a class="btn btn-secondary" href="/#install">
                             Quick install
-                        </a>
-                        <a class="btn btn-secondary" href="/docs/">
-                            Read the docs
                         </a>
                     </div>
 
@@ -154,9 +151,8 @@ import "../styles/global.css";
                             >
                             <h3>Audio ducking</h3>
                             <p>
-                                Other audio steps down while you record, back up
-                                when you're done — or pause your player instead
-                                and pick up where it left off.
+                                System volume steps down while you record, back
+                                up when you're done.
                             </p>
                         </div>
 
@@ -281,8 +277,7 @@ import "../styles/global.css";
                             <p>
                                 Pipe every transcription through your own shell
                                 command before it pastes — reformat, route, log,
-                                or consume it without pasting. Your text, your
-                                pipeline.
+                                or consume it without pasting.
                             </p>
                         </div>
 
@@ -293,10 +288,9 @@ import "../styles/global.css";
                             >
                             <h3>Scriptable control</h3>
                             <p>
-                                Full CLI — start/stop/toggle/cancel, driven from
-                                anywhere. Wire it to KDE, GNOME, sxhkd, Espanso,
-                                or your own scripts, beyond the built-in evdev
-                                hotkeys.
+                                CLI start/stop/toggle/cancel — wire it to KDE,
+                                GNOME, sxhkd, or Espanso, beyond the built-in
+                                evdev hotkeys.
                             </p>
                         </div>
                     </div>
@@ -432,10 +426,6 @@ import "../styles/global.css";
                             </div>
                         </div>
                     </div>
-
-                    <p class="install-next">
-                        First dictation, updates and what's next: <a href="/docs/quick-start/">quick start guide →</a>
-                    </p>
                 </div>
             </section>
 
@@ -461,7 +451,8 @@ import "../styles/global.css";
                             <span class="post-card-tag">models</span>
                             <h3>Best Speech-to-Text Models for Linux</h3>
                             <p>
-                                Parakeet, Whisper, onnx-asr, Cohere, Qwen3-ASR. Pick your engine.
+                                Parakeet TDT V3, Whisper, onnx-asr, Cohere —
+                                which model fits your hardware and workflow.
                             </p>
                             <span class="post-card-read">Read →</span>
                         </a>
@@ -497,8 +488,8 @@ import "../styles/global.css";
                             </p>
                             <p>
                                 hyprwhspr is built for accuracy and speed: it runs the top local
-                                models — Parakeet TDT V3, Cohere Transcribe, Whisper,
-                                faster-whisper, onnx-asr, Qwen3-ASR — held hot, so
+                                models — Parakeet TDT V3, Cohere Transcribe, the full Whisper
+                                family, faster-whisper, onnx-asr — held hot in memory, so
                                 transcription is instant rather than gated behind a multi-second
                                 load. GPU acceleration (NVIDIA CUDA, AMD/Intel Vulkan) is
                                 auto-detected; on CPU, onnx-asr is genuinely fast and accurate —
@@ -554,8 +545,7 @@ import "../styles/global.css";
                                 audit trail, no way to verify what you're actually running. For
                                 a tool that sits on your microphone and injects text into every
                                 application on your system, that's not a tradeoff worth making.
-                                Read the code, build it yourself, know what's on your machine —
-                                and if you want to change something, it's right there to hack on.
+                                Read the code, build it yourself, know what's on your machine.
                             </p>
                         </details>
 
@@ -585,8 +575,6 @@ import "../styles/global.css";
                 <a href="https://github.com/goodroot/hyprwhspr">GitHub</a>
                 <span class="footer-sep">·</span>
                 <a href="/privacy">Privacy</a>
-                <span class="footer-sep">·</span>
-                <a href="/docs/">Docs</a>
             </div>
         </footer>
 
@@ -973,15 +961,6 @@ import "../styles/global.css";
         letter-spacing: 0.1em;
         color: var(--comment);
         text-transform: uppercase;
-    }
-
-    .install-next {
-        font-size: 0.82rem;
-        color: var(--fg-dim);
-    }
-
-    .install-next a {
-        color: var(--blue);
     }
 
     .install-after {

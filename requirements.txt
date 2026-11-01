@@ -2,11 +2,9 @@
 sounddevice>=0.5.0
 numpy>=1.26.0
 soxr>=0.5.0
-soundfile>=0.12.1
 
 # Global shortcuts and text injection
 evdev>=1.9.0
-pyperclip>=1.11.0
 
 # System integration
 pyudev>=0.24.4
@@ -19,6 +17,3 @@ rich>=14.0.0
 # requirements-visualizer.txt and are installed best-effort, so a GUI build
 # failure (e.g. missing girepository-2.0 on Ubuntu 24.04) can never abort the
 # install of the core runtime deps above.
-
-# Read-only configuration validation
-jsonschema>=4.18.0

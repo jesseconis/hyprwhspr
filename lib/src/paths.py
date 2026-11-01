@@ -37,6 +37,9 @@ LOCK_FILE = RUNTIME_DIR / 'hyprwhspr.lock'
 VISUALIZER_STATE_FILE = RUNTIME_DIR / 'visualizer_state'  # recording|paused|processing|error|success
 TRANSCRIPT_PREVIEW_FILE = RUNTIME_DIR / 'transcript_preview'
 MIC_OSD_LEVEL_FEED_FILE = RUNTIME_DIR / 'mic_osd_level_feed'
+# Written by the OSD after it handles SIGUSR1. The runner uses this handshake
+# to distinguish a live process from a responsive/mapped OSD main loop.
+MIC_OSD_VISIBLE_FILE = RUNTIME_DIR / 'mic_osd_visible'
 
 # Secure credential storage
 CREDENTIALS_DIR = DATA_DIR
@@ -51,6 +54,3 @@ LONGFORM_SEGMENTS_DIR = TEMP_DIR / 'longform_segments'
 
 # Model lifecycle signal file (presence = model is manually unloaded from memory)
 MODEL_UNLOADED_FILE = RUNTIME_DIR / 'model_unloaded'
-
-# Recent raw recordings, kept when 'debug_recordings' is on
-DEBUG_RECORDINGS_DIR = RUNTIME_DIR / 'recordings'

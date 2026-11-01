@@ -1,5 +1,4 @@
 import io
-import shutil
 import subprocess
 import sys
 import types
@@ -11,65 +10,44 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib" / "src"))
+sys.modules.setdefault("pyperclip", types.SimpleNamespace(copy=lambda text: None, paste=lambda: ""))
 
 from text_injector import (
     POST_TRANSCRIPTION_HOOK_CONSUMED_EXIT_CODE,
-    InjectionOutcome,
     TextInjector,
-    preprocess_text,
     _LazyPyperclip,
     _PostTranscriptionHookOutcome,
-    ClipboardData,
 )
 
 
-import keyboard_layout
-import text_injector
+class ConfigStub:
+    def __init__(self, settings=None):
+        self.settings = settings or {}
 
-from tests.text_injector_helpers import ConfigStub, make_injector
+    def get_setting(self, name, default=None):
+        return self.settings.get(name, default)
 
-
-class ImmediateThread:
-    """Run a restore thread's target inline."""
-
-    def __init__(self, target, daemon):
-        self.target = target
-
-    def start(self):
-        self.target()
+    def get_word_overrides(self):
+        return self.settings.get("word_overrides", {})
 
 
 class TextInjectorInjectionTests(unittest.TestCase):
-    def test_clipboard_settle_delay_and_failed_copy(self):
-        for value, expected in [(0.15, 0.15), (0.03, 0.03), (0, None),
-                                (-1, 0.15), (float('nan'), 0.15),
-                                (float('inf'), 0.15), ('0.1', 0.15),
-                                (None, 0.15), (True, 0.15)]:
-            for copied in (True, False):
-                with self.subTest(value=value, copied=copied):
-                    injector = self._injector()
-                    injector.config_manager = ConfigStub({'clipboard_settle_delay': value})
-                    injector.xdotool_available = True
-                    with (
-                        mock.patch.object(injector, '_save_clipboard', return_value=b'old'),
-                        mock.patch.object(injector, '_copy_text_to_clipboard', return_value=copied),
-                        mock.patch.object(injector, '_is_x11_session', return_value=True),
-                        mock.patch.object(injector, '_send_paste_keys_xdotool', return_value=True) as paste,
-                        mock.patch.object(injector, '_restore_clipboard') as restore,
-                        mock.patch.object(injector, '_send_enter_if_auto_submit') as submit,
-                        mock.patch('text_injector.time.sleep') as sleep,
-                    ):
-                        self.assertEqual(injector._paste_via_clipboard('hello', 'ctrl+v', False, False), copied)
-                        if copied and expected:
-                            sleep.assert_called_once_with(expected)
-                        else:
-                            sleep.assert_not_called()
-                        self.assertEqual(paste.called, copied)
-                        self.assertEqual(restore.called, copied)
-                        submit.assert_not_called()
-
     def _injector(self):
-        return make_injector()
+        injector = TextInjector.__new__(TextInjector)
+        injector.config_manager = ConfigStub()
+        injector.session_type = "wayland"
+        injector.ydotool_available = True
+        injector.wtype_available = False
+        injector.xdotool_available = False
+        injector._hyprland_shortcut_syntax = None
+        # Private ydotoold daemon manager: not running by default (so
+        # _clear_stuck_modifiers is a no-op), but ensure_running() succeeds when a
+        # ydotool command is actually issued.
+        injector._ydotoold = mock.Mock()
+        injector._ydotoold.is_running.return_value = False
+        injector._ydotoold.ensure_running.return_value = True
+        injector._ydotoold.socket_env.return_value = {"YDOTOOL_SOCKET": "/run/x.sock"}
+        return injector
 
     def test_wayland_clipboard_success_does_not_use_fallback(self):
         injector = self._injector()
@@ -111,6 +89,13 @@ class TextInjectorInjectionTests(unittest.TestCase):
     def test_restore_fallback_restores_utf8_but_skips_binary(self):
         injector = self._injector()
 
+        class ImmediateThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
         with (
             mock.patch("text_injector.time.sleep"),
             mock.patch("text_injector.threading.Thread", ImmediateThread),
@@ -121,94 +106,6 @@ class TextInjectorInjectionTests(unittest.TestCase):
             injector._restore_clipboard(b"\xff\x00", delay=0)
 
         fallback.assert_called_once_with("café")
-
-    def test_wayland_clipboard_offers_text_as_plain_text(self):
-        # Sniffed by content, this sentence is application/mbox, which a
-        # terminal will not paste.
-        text = "From what I remember, that was not the right word."
-        injector = self._injector()
-        completed = types.SimpleNamespace(returncode=0)
-        with (
-            mock.patch("text_injector.shutil.which", return_value="/usr/bin/wl-copy"),
-            mock.patch("text_injector.subprocess.run", return_value=completed) as run,
-        ):
-            self.assertTrue(injector._copy_text_to_clipboard(text))
-
-        run.assert_called_once_with(
-            ["wl-copy", "--type", "text/plain;charset=utf-8"],
-            input=text.encode(),
-            timeout=2,
-        )
-
-    def test_wayland_restore_offers_utf8_as_text_and_leaves_binary_type_inferred(self):
-        injector = self._injector()
-
-        completed = types.SimpleNamespace(returncode=0)
-        with (
-            mock.patch("text_injector.time.sleep"),
-            mock.patch("text_injector.threading.Thread", ImmediateThread),
-            mock.patch("text_injector.shutil.which", return_value="/usr/bin/wl-copy"),
-            mock.patch("text_injector.subprocess.run", return_value=completed) as run,
-        ):
-            injector._restore_clipboard(b"From the saved clipboard", delay=0)
-            injector._restore_clipboard(b"\x89PNG\r\n\x1a\n\x00\xff", delay=0)
-
-        self.assertEqual(
-            [call.args[0] for call in run.call_args_list],
-            [["wl-copy", "--type", "text/plain;charset=utf-8"], ["wl-copy"]],
-        )
-
-    def _save_with_offered_types(self, offered):
-        injector = self._injector()
-
-        def run(argv, **kwargs):
-            if argv == ["wl-paste", "--list-types"]:
-                return types.SimpleNamespace(returncode=0, stdout=offered.encode())
-            return types.SimpleNamespace(returncode=0, stdout=b"<svg/>")
-
-        with (
-            mock.patch("text_injector.shutil.which", return_value="/usr/bin/wl-paste"),
-            mock.patch("text_injector.subprocess.run", side_effect=run) as run_mock,
-        ):
-            saved = injector._save_clipboard()
-        return saved, run_mock.call_args_list[-1].args[0]
-
-    def test_clipboard_save_prefers_plain_text_when_offered(self):
-        saved, read = self._save_with_offered_types("text/html\ntext/plain;charset=utf-8\nUTF8_STRING\n")
-
-        self.assertEqual(read, ["wl-paste", "--no-newline", "--type", "text/plain;charset=utf-8"])
-        self.assertEqual(saved.mime_type, "text/plain;charset=utf-8")
-
-    def test_clipboard_save_records_non_text_type(self):
-        saved, read = self._save_with_offered_types("image/svg+xml\n")
-
-        self.assertEqual(read, ["wl-paste", "--no-newline", "--type", "image/svg+xml"])
-        self.assertEqual(saved, b"<svg/>")
-        self.assertEqual(saved.mime_type, "image/svg+xml")
-
-    def test_clipboard_save_skips_x11_atoms(self):
-        saved, read = self._save_with_offered_types("TARGETS\nTIMESTAMP\nimage/svg+xml\n")
-
-        self.assertEqual(read, ["wl-paste", "--no-newline", "--type", "image/svg+xml"])
-        self.assertEqual(saved.mime_type, "image/svg+xml")
-
-    def test_wayland_restore_reoffers_saved_type(self):
-        injector = self._injector()
-        completed = types.SimpleNamespace(returncode=0)
-        with (
-            mock.patch("text_injector.time.sleep"),
-            mock.patch("text_injector.threading.Thread", ImmediateThread),
-            mock.patch("text_injector.shutil.which", return_value="/usr/bin/wl-copy"),
-            mock.patch("text_injector.subprocess.run", return_value=completed) as run,
-        ):
-            # UTF-8, but not text: must not be flattened to text/plain.
-            injector._restore_clipboard(ClipboardData(b"<svg/>", "image/svg+xml"), delay=0)
-            injector._restore_clipboard(ClipboardData(b"From the saved clipboard", "text/plain"), delay=0)
-
-        self.assertEqual(
-            [call.args[0] for call in run.call_args_list],
-            [["wl-copy", "--type", "image/svg+xml"], ["wl-copy", "--type", "text/plain;charset=utf-8"]],
-        )
 
     def test_x11_skips_wayland_clipboard_tools_and_uses_xdotool_chord(self):
         injector = self._injector()
@@ -238,9 +135,6 @@ class TextInjectorInjectionTests(unittest.TestCase):
 
     def test_x11_injection_prefers_xdotool_without_wtype_or_ydotool(self):
         injector = self._injector()
-        injector.config_manager = ConfigStub(
-            {"ydotool_modifier_overrides": {"ctrl": "capslock"}}
-        )
         injector.session_type = "x11"
         injector.ydotool_available = False
         injector.wtype_available = False
@@ -406,9 +300,6 @@ class TextInjectorInjectionTests(unittest.TestCase):
 
     def test_wtype_sends_arbitrary_single_key_chord(self):
         injector = self._injector()
-        injector.config_manager = ConfigStub(
-            {"ydotool_modifier_overrides": {"ctrl": "capslock"}}
-        )
         completed = types.SimpleNamespace(returncode=0, stderr=b"")
 
         with mock.patch("text_injector.subprocess.run", return_value=completed) as run:
@@ -541,9 +432,6 @@ class TextInjectorInjectionTests(unittest.TestCase):
 
     def test_hyprland_native_paste_avoids_wtype(self):
         injector = self._injector()
-        injector.config_manager = ConfigStub(
-            {"ydotool_modifier_overrides": {"ctrl": "capslock"}}
-        )
         with (
             mock.patch.object(injector, "_get_active_window_info", return_value=None),
             mock.patch.object(injector, "_save_clipboard", return_value=b"old"),
@@ -582,53 +470,6 @@ class TextInjectorInjectionTests(unittest.TestCase):
             self.assertTrue(injector._inject_via_clipboard_and_hotkey("hello"))
         wtype.assert_called_once_with("ctrl+v")
         ydotool.assert_called_once_with("ctrl+v")
-
-    def test_wtype_rejection_logs_resolved_chord_before_ydotool_fallback(self):
-        injector = self._injector()
-        injector.wtype_available = True
-        injector.config_manager = ConfigStub({"paste_mode": "ctrl_shift"})
-        output = io.StringIO()
-        with (
-            mock.patch.object(injector, "_save_clipboard", return_value=b"old"),
-            mock.patch.object(injector, "_copy_text_to_clipboard", return_value=True),
-            mock.patch.object(injector, "_is_hyprland_session", return_value=False),
-            mock.patch.object(injector, "_is_gnome_wayland_session", return_value=False),
-            mock.patch.object(injector, "_send_paste_keys_wtype", return_value=False),
-            mock.patch.object(injector, "_send_paste_keys_slow", return_value=True),
-            mock.patch.object(injector, "_clear_stuck_modifiers"),
-            mock.patch.object(injector, "_restore_clipboard"),
-            mock.patch.object(injector, "_send_enter_if_auto_submit"),
-            mock.patch("text_injector.time.sleep"),
-            redirect_stdout(output),
-        ):
-            self.assertTrue(injector._inject_via_clipboard_and_hotkey("hello"))
-        self.assertIn("wtype rejected paste chord 'ctrl+shift+v'", output.getvalue())
-        self.assertIn("falling back to ydotool", output.getvalue())
-
-    def test_focused_window_failure_warns_once_with_resolved_chord(self):
-        injector = self._injector()
-        injector.config_manager = ConfigStub({
-            "applications": {"org.example.Terminal": {"auto_paste": "ctrl+y"}},
-            "paste_mode": "ctrl_shift",
-        })
-        output = io.StringIO()
-        with (
-            mock.patch.object(injector, "_get_active_window_info", return_value=None),
-            mock.patch.object(injector, "_save_clipboard", return_value=b"old"),
-            mock.patch.object(injector, "_copy_text_to_clipboard", return_value=True),
-            mock.patch.object(injector, "_is_hyprland_session", return_value=False),
-            mock.patch.object(injector, "_is_gnome_wayland_session", return_value=False),
-            mock.patch.object(injector, "_send_paste_keys_slow", return_value=True),
-            mock.patch.object(injector, "_clear_stuck_modifiers"),
-            mock.patch.object(injector, "_restore_clipboard"),
-            mock.patch.object(injector, "_send_enter_if_auto_submit"),
-            mock.patch("text_injector.time.sleep"),
-            redirect_stdout(output),
-        ):
-            self.assertTrue(injector._inject_via_clipboard_and_hotkey("one"))
-            self.assertTrue(injector._inject_via_clipboard_and_hotkey("two"))
-        warning = "Focused-window detection failed; using resolved paste chord 'ctrl+shift+v'."
-        self.assertEqual(output.getvalue().count(warning), 1)
 
     def test_hyprland_failure_stops_at_successful_wtype_fallback(self):
         injector = self._injector()
@@ -690,179 +531,6 @@ class TextInjectorInjectionTests(unittest.TestCase):
         run.assert_has_calls([
             mock.call(["key", "29:1"], timeout=1),
             mock.call(["key", "21:1", "21:0"], timeout=1),
-            mock.call(["key", "29:0"], timeout=1),
-        ])
-
-    def test_ydotool_uses_named_modifier_override(self):
-        injector = self._injector()
-        injector.config_manager = ConfigStub(
-            {"ydotool_modifier_overrides": {"ctrl": "KEY_CAPS_LOCK"}}
-        )
-        completed = types.SimpleNamespace(returncode=0, stderr=b"")
-
-        with mock.patch.object(injector, "_run_ydotool", return_value=completed) as run:
-            self.assertTrue(injector._send_paste_keys_slow("ctrl+shift+v"))
-
-        run.assert_has_calls([
-            mock.call(["key", "58:1", "42:1"], timeout=1),
-            mock.call(["key", "47:1", "47:0"], timeout=1),
-            mock.call(["key", "42:0", "58:0"], timeout=1),
-        ])
-
-    def test_ydotool_accepts_numeric_modifier_override(self):
-        injector = self._injector()
-        injector.config_manager = ConfigStub(
-            {"ydotool_modifier_overrides": {"ctrl": 97}}
-        )
-
-        self.assertEqual(injector._ydotool_modifier_keycodes()["ctrl"], 97)
-
-    def test_ydotool_accepts_linux_meta_key_names_and_super_aliases(self):
-        injector = self._injector()
-
-        for physical_name in ("KEY_LEFTMETA", "leftmeta", "leftsuper"):
-            with self.subTest(physical_name=physical_name):
-                injector.config_manager = ConfigStub({
-                    "ydotool_modifier_overrides": {"super": physical_name}
-                })
-                self.assertEqual(injector._ydotool_modifier_keycodes()["super"], 125)
-
-    def test_ydotool_accepts_function_key_modifier_override(self):
-        injector = self._injector()
-        injector.config_manager = ConfigStub({
-            "ydotool_modifier_overrides": {"super": "f13"}
-        })
-
-        self.assertEqual(injector._ydotool_modifier_keycodes()["super"], 183)
-
-    def test_ydotool_decimal_strings_are_evdev_codes_not_digit_keys(self):
-        injector = self._injector()
-
-        injector.config_manager = ConfigStub({
-            "ydotool_modifier_overrides": {"ctrl": "9", "alt": "58"}
-        })
-        resolved = injector._ydotool_modifier_keycodes()
-        self.assertEqual(resolved["ctrl"], 9)
-        self.assertEqual(resolved["alt"], 58)
-
-        injector.config_manager = ConfigStub({
-            "ydotool_modifier_overrides": {"ctrl": "KEY_9"}
-        })
-        self.assertEqual(injector._ydotool_modifier_keycodes()["ctrl"], 10)
-
-    def test_ydotool_modifier_override_keys_use_chord_aliases(self):
-        injector = self._injector()
-        cases = {
-            "control": ("ctrl", 58),
-            "meta": ("super", 58),
-            "cmd": ("super", 58),
-            "logo": ("super", 58),
-        }
-
-        for alias, (canonical, expected) in cases.items():
-            with self.subTest(alias=alias):
-                injector.config_manager = ConfigStub({
-                    "ydotool_modifier_overrides": {alias: "capslock"}
-                })
-                self.assertEqual(
-                    injector._ydotool_modifier_keycodes()[canonical], expected
-                )
-
-    def test_invalid_ydotool_modifier_overrides_fall_back_and_warn_once(self):
-        injector = self._injector()
-        injector.config_manager = ConfigStub({
-            "ydotool_modifier_overrides": {
-                "ctrl": "not-a-key",
-                "hyper": "capslock",
-                "alt": True,
-                "shift": 768,
-            }
-        })
-
-        output = io.StringIO()
-        with redirect_stdout(output):
-            first = injector._ydotool_modifier_keycodes()
-            second = injector._ydotool_modifier_keycodes()
-
-        self.assertEqual(first, {"ctrl": 29, "shift": 42, "super": 125, "alt": 56})
-        self.assertEqual(second, first)
-        self.assertEqual(output.getvalue().count("Ignoring invalid"), 4)
-
-    def test_non_object_ydotool_modifier_overrides_falls_back(self):
-        injector = self._injector()
-        injector.config_manager = ConfigStub(
-            {"ydotool_modifier_overrides": "ctrl=capslock"}
-        )
-
-        output = io.StringIO()
-        with redirect_stdout(output):
-            resolved = injector._ydotool_modifier_keycodes()
-
-        self.assertEqual(resolved, {"ctrl": 29, "shift": 42, "super": 125, "alt": 56})
-        self.assertIn("Ignoring invalid", output.getvalue())
-
-    def test_clear_stuck_modifiers_includes_override(self):
-        injector = self._injector()
-        injector.config_manager = ConfigStub(
-            {"ydotool_modifier_overrides": {"ctrl": "capslock"}}
-        )
-        injector._ydotoold.is_running.return_value = True
-
-        with mock.patch.object(injector, "_run_ydotool") as run:
-            injector._clear_stuck_modifiers()
-
-        command = run.call_args.args[0]
-        self.assertIn("58:0", command)
-        self.assertEqual(command.count("58:0"), 1)
-
-    def test_failed_ydotool_chord_releases_overridden_modifiers(self):
-        injector = self._injector()
-        injector.config_manager = ConfigStub(
-            {"ydotool_modifier_overrides": {"ctrl": "capslock"}}
-        )
-        succeeded = types.SimpleNamespace(returncode=0, stderr=b"")
-        failed = types.SimpleNamespace(returncode=1, stderr=b"key failed")
-
-        with mock.patch.object(
-            injector, "_run_ydotool", side_effect=[succeeded, failed, succeeded]
-        ) as run:
-            self.assertFalse(injector._send_paste_keys_slow("ctrl+v"))
-
-        run.assert_has_calls([
-            mock.call(["key", "58:1"], timeout=1),
-            mock.call(["key", "47:1", "47:0"], timeout=1),
-            mock.call(["key", "58:0"], timeout=1),
-        ])
-
-    def test_unavailable_ydotool_does_not_attempt_spurious_modifier_release(self):
-        injector = self._injector()
-
-        output = io.StringIO()
-        with (
-            redirect_stdout(output),
-            mock.patch.object(injector, "_run_ydotool", return_value=None) as run,
-        ):
-            self.assertFalse(injector._send_paste_keys_slow("ctrl+v"))
-
-        run.assert_called_once_with(["key", "29:1"], timeout=1)
-        self.assertNotIn("Could not release", output.getvalue())
-
-    def test_failed_modifier_press_command_still_attempts_release(self):
-        injector = self._injector()
-        failed = types.SimpleNamespace(returncode=1, stderr=b"partial failure")
-        succeeded = types.SimpleNamespace(returncode=0, stderr=b"")
-
-        output = io.StringIO()
-        with (
-            redirect_stdout(output),
-            mock.patch.object(
-                injector, "_run_ydotool", side_effect=[failed, succeeded]
-            ) as run,
-        ):
-            self.assertFalse(injector._send_paste_keys_slow("ctrl+v"))
-
-        run.assert_has_calls([
-            mock.call(["key", "29:1"], timeout=1),
             mock.call(["key", "29:0"], timeout=1),
         ])
 
@@ -1060,33 +728,6 @@ class TextInjectorInjectionTests(unittest.TestCase):
         paste_chord.assert_called_once_with("ctrl+v")
         direct_type.assert_not_called()
 
-    def test_non_ascii_text_skips_the_layout_probe(self):
-        """Non-ASCII pastes whatever the layout is, so don't pay to compile it."""
-        injector = self._injector()
-
-        with (
-            mock.patch("text_injector.shutil.which", return_value=None),
-            mock.patch("text_injector.pyperclip.copy"),
-            mock.patch.object(injector, "_get_active_window_info", return_value=None),
-            mock.patch.object(injector, "_save_clipboard", return_value=b""),
-            mock.patch.object(injector, "_send_paste_keys_slow", return_value=True),
-            mock.patch.object(injector, "_layout_is_type_safe") as type_safe,
-            mock.patch.object(injector, "_restore_clipboard"),
-            mock.patch.object(injector, "_send_enter_if_auto_submit"),
-            mock.patch.dict(
-                "text_injector.os.environ",
-                {
-                    "XDG_SESSION_TYPE": "wayland",
-                    "XDG_CURRENT_DESKTOP": "GNOME",
-                    "WAYLAND_DISPLAY": "wayland-0",
-                },
-                clear=True,
-            ),
-        ):
-            self.assertTrue(injector._inject_via_clipboard_and_hotkey("zażółć"))
-
-        type_safe.assert_not_called()
-
     def test_gnome_failed_paste_restores_previous_clipboard(self):
         injector = self._injector()
 
@@ -1115,29 +756,6 @@ class TextInjectorInjectionTests(unittest.TestCase):
         restore_clipboard.assert_called_once_with(
             b"old clipboard", injected=b"hello", delay=0
         )
-
-    def test_gnome_explicit_ydotool_failure_leaves_dictation_on_clipboard(self):
-        injector = self._injector()
-        with (
-            mock.patch.object(injector, "_get_active_window_info", return_value=None),
-            mock.patch.object(injector, "_save_clipboard", return_value=b"old clipboard"),
-            mock.patch.object(injector, "_copy_text_to_clipboard", return_value=True),
-            mock.patch.object(injector, "_layout_is_type_safe", return_value=False),
-            mock.patch.object(injector, "_run_ydotool", return_value=None),
-            mock.patch.object(injector, "_restore_clipboard") as restore_clipboard,
-            mock.patch("text_injector.time.sleep"),
-            mock.patch.dict(
-                "text_injector.os.environ",
-                {
-                    "XDG_SESSION_TYPE": "wayland",
-                    "XDG_CURRENT_DESKTOP": "GNOME",
-                    "WAYLAND_DISPLAY": "wayland-0",
-                },
-                clear=True,
-            ),
-        ):
-            self.assertFalse(injector._inject_via_clipboard_and_hotkey("hello"))
-        restore_clipboard.assert_not_called()
 
     def test_ydotool_type_command_uses_small_delay_and_argument_separator(self):
         injector = self._injector()
@@ -1188,146 +806,13 @@ class TextInjectorInjectionTests(unittest.TestCase):
     def test_layout_type_safe_redetects_each_call(self):
         injector = self._injector()
 
-        with (
-            mock.patch.object(
-                injector, "_detect_active_layout", side_effect=[("us", ""), ("de", "")]
-            ) as detect,
-            mock.patch.object(
-                text_injector.keyboard_layout,
-                "ascii_positions_match_us",
-                side_effect=[True, False],
-            ),
-        ):
+        with mock.patch.object(
+            injector, "_detect_active_layout", side_effect=["us", "de"]
+        ) as detect:
             self.assertTrue(injector._layout_is_type_safe())
             self.assertFalse(injector._layout_is_type_safe())
 
         self.assertEqual(detect.call_count, 2)
-
-    @unittest.skipUnless(shutil.which("xkbcli"), "xkbcli not installed")
-    def test_standard_polish_layout_is_type_safe(self):
-        """pl keeps US ASCII positions and reaches Polish glyphs via AltGr."""
-        injector = self._injector()
-        keyboard_layout.reset_caches()
-
-        with mock.patch.object(
-            injector, "_detect_active_layout", return_value=("pl", "")
-        ):
-            self.assertTrue(injector._layout_is_type_safe())
-
-    @unittest.skipUnless(shutil.which("xkbcli"), "xkbcli not installed")
-    def test_polish_qwertz_variant_is_not_type_safe(self):
-        """pl(qwertz) swaps z/y, so ydotool type would mangle ASCII."""
-        injector = self._injector()
-        keyboard_layout.reset_caches()
-
-        with mock.patch.object(
-            injector, "_detect_active_layout", return_value=("pl", "qwertz")
-        ):
-            self.assertFalse(injector._layout_is_type_safe())
-
-    @unittest.skipUnless(shutil.which("xkbcli"), "xkbcli not installed")
-    def test_us_dvorak_variant_is_not_type_safe(self):
-        injector = self._injector()
-        keyboard_layout.reset_caches()
-
-        with mock.patch.object(
-            injector, "_detect_active_layout", return_value=("us", "dvorak")
-        ):
-            self.assertFalse(injector._layout_is_type_safe())
-
-    def test_gnome_source_id_variant_is_detected(self):
-        injector = self._injector()
-        completed = types.SimpleNamespace(
-            returncode=0, stdout="[('xkb', 'pl+dvorak'), ('xkb', 'us')]"
-        )
-
-        with mock.patch("text_injector.subprocess.run", return_value=completed):
-            self.assertEqual(injector._detect_active_layout(), ("pl", "dvorak"))
-
-    def test_localectl_variant_is_detected(self):
-        injector = self._injector()
-        calls = [
-            types.SimpleNamespace(returncode=1, stdout=""),
-            types.SimpleNamespace(
-                returncode=0,
-                stdout="   X11 Layout: pl\n  X11 Variant: dvorak\n",
-            ),
-        ]
-
-        with mock.patch("text_injector.subprocess.run", side_effect=calls):
-            self.assertEqual(injector._detect_active_layout(), ("pl", "dvorak"))
-
-    def test_localectl_unset_variant_is_empty(self):
-        injector = self._injector()
-        calls = [
-            types.SimpleNamespace(returncode=1, stdout=""),
-            types.SimpleNamespace(
-                returncode=0,
-                stdout="   X11 Layout: pl\n  X11 Variant: (unset)\n",
-            ),
-        ]
-
-        with mock.patch("text_injector.subprocess.run", side_effect=calls):
-            self.assertEqual(injector._detect_active_layout(), ("pl", ""))
-
-    def test_localectl_empty_layout_line_does_not_swallow_the_next(self):
-        injector = self._injector()
-        calls = [
-            types.SimpleNamespace(returncode=1, stdout=""),
-            types.SimpleNamespace(
-                returncode=0, stdout="   X11 Layout:\n  X11 Model: pc105\n"
-            ),
-        ]
-
-        with (
-            mock.patch("text_injector.subprocess.run", side_effect=calls),
-            mock.patch.dict("text_injector.os.environ", {}, clear=True),
-        ):
-            self.assertEqual(injector._detect_active_layout(), ("", ""))
-
-    def test_localectl_empty_variant_line_does_not_swallow_the_next(self):
-        injector = self._injector()
-        calls = [
-            types.SimpleNamespace(returncode=1, stdout=""),
-            types.SimpleNamespace(
-                returncode=0,
-                stdout="   X11 Layout: us\n  X11 Variant: \n  X11 Options: grp:alt\n",
-            ),
-        ]
-
-        with mock.patch("text_injector.subprocess.run", side_effect=calls):
-            self.assertEqual(injector._detect_active_layout(), ("us", ""))
-
-    def test_env_variant_is_detected(self):
-        injector = self._injector()
-
-        with (
-            mock.patch("text_injector.subprocess.run", side_effect=OSError("no tool")),
-            mock.patch.dict(
-                "text_injector.os.environ",
-                {"XKB_DEFAULT_LAYOUT": "pl,us", "XKB_DEFAULT_VARIANT": "dvorak,"},
-                clear=True,
-            ),
-        ):
-            self.assertEqual(injector._detect_active_layout(), ("pl", "dvorak"))
-
-    def test_type_safety_falls_back_to_name_check_without_xkbcli(self):
-        """No xkbcli: only plain us keeps direct typing, everything else pastes."""
-        injector = self._injector()
-
-        with mock.patch.object(
-            text_injector.keyboard_layout, "ascii_positions_match_us", return_value=None
-        ):
-            for layout, variant, expected in [
-                ("us", "", True),
-                ("us", "dvorak", False),
-                ("pl", "", False),
-                ("de", "", False),
-            ]:
-                with mock.patch.object(
-                    injector, "_detect_active_layout", return_value=(layout, variant)
-                ):
-                    self.assertIs(injector._layout_is_type_safe(), expected)
 
     def test_clipboard_restore_default_delay_is_config_default(self):
         injector = self._injector()
@@ -1365,7 +850,7 @@ class TextInjectorInjectionTests(unittest.TestCase):
         ]
 
         with mock.patch("text_injector.subprocess.run", side_effect=calls):
-            self.assertEqual(injector._detect_active_layout(), ("", ""))
+            self.assertEqual(injector._detect_active_layout(), "")
 
     def test_gnome_non_xkb_mru_source_is_not_type_safe(self):
         injector = self._injector()
@@ -1388,9 +873,9 @@ class TextInjectorInjectionTests(unittest.TestCase):
             mock.patch("text_injector.subprocess.run", side_effect=calls) as run,
             mock.patch("text_injector.time.monotonic", side_effect=[10.0, 10.5, 11.2]),
         ):
-            self.assertEqual(injector._detect_active_layout(), ("us", ""))
-            self.assertEqual(injector._detect_active_layout(), ("us", ""))
-            self.assertEqual(injector._detect_active_layout(), ("de", ""))
+            self.assertEqual(injector._detect_active_layout(), "us")
+            self.assertEqual(injector._detect_active_layout(), "us")
+            self.assertEqual(injector._detect_active_layout(), "de")
 
         self.assertEqual(run.call_count, 2)
 
@@ -1505,42 +990,6 @@ class TextInjectorInjectionTests(unittest.TestCase):
         self.assertEqual(chord, "ctrl+y")
         self.assertEqual(buf.getvalue(), "")
 
-    # ---- Issue #243: KDE Plasma terminals must get Ctrl+Shift+V ----
-
-    def test_atspi_konsole_resolves_to_terminal_paste(self):
-        """Konsole reached via the AT-SPI probe is a terminal, not a GUI app.
-
-        On KDE Plasma Wayland no compositor IPC of ours can see the window, so
-        AT-SPI is the only source of a class. Once the accessibility bridge hands
-        us one, terminal detection has to fire — otherwise paste stays Ctrl+V and
-        silently does nothing in Konsole.
-        """
-        injector = self._injector()
-        injector.config_manager = ConfigStub({})
-        window_info = {"class": "konsole", "source": "at-spi"}
-
-        self.assertTrue(injector._is_terminal(window_info))
-        self.assertEqual(injector._detect_paste_mode(window_info), "ctrl_shift")
-
-        chord, app = injector._resolve_paste_chord(window_info)
-        self.assertEqual(chord, "ctrl+shift+v")
-        self.assertIsNone(app)
-
-    def test_undetected_window_still_falls_back_to_gui_paste(self):
-        """No window info keeps the pre-existing Ctrl+V default (unchanged)."""
-        injector = self._injector()
-        injector.config_manager = ConfigStub({})
-
-        # `None` means "look it up yourself", so the lookup has to be stubbed to
-        # model a session where nothing can be detected.
-        with mock.patch.object(injector, "_get_active_window_info", return_value=None):
-            self.assertFalse(injector._is_terminal())
-            self.assertEqual(injector._detect_paste_mode(), "ctrl")
-            chord, app = injector._resolve_paste_chord(None)
-
-        self.assertEqual(chord, "ctrl+v")
-        self.assertIsNone(app)
-
 
     def test_post_hook_consume_exit_code_returns_consume_result(self):
         injector = self._injector()
@@ -1602,191 +1051,9 @@ class TextInjectorInjectionTests(unittest.TestCase):
             mock.patch.object(injector, "_run_post_transcription_hook", return_value=consumed),
             mock.patch.object(injector, "_inject_via_clipboard_and_hotkey") as inject,
         ):
-            self.assertEqual(injector.inject_text("open terminal"), InjectionOutcome.CONSUMED)
+            self.assertTrue(injector.inject_text("open terminal"))
 
         inject.assert_not_called()
-
-    def test_inject_text_returns_injected_on_successful_paste(self):
-        injector = self._injector()
-        injector.config_manager = ConfigStub({})
-
-        with (
-            mock.patch.object(injector, "_preprocess_text", return_value="hello"),
-            mock.patch.object(injector, "_inject_via_clipboard_and_hotkey", return_value=True),
-        ):
-            self.assertEqual(injector.inject_text("hello"), InjectionOutcome.INJECTED)
-
-    def test_transcript_emptied_by_filtering_pastes_nothing(self):
-        # An utterance that was nothing but fillers filters down to "". The
-        # empty check at the top of inject_text runs on the raw text, so without
-        # a second guard the trailing space alone would reach the clipboard.
-        injector = self._injector()
-        injector.config_manager = ConfigStub(
-            {"filter_filler_words": True, "filler_words": ["um", "uh"]}
-        )
-
-        with mock.patch.object(injector, "_inject_via_clipboard_and_hotkey") as inject:
-            self.assertEqual(injector.inject_text("Um. Uh."), InjectionOutcome.INJECTED)
-
-        inject.assert_not_called()
-
-    def test_inject_text_returns_failed_on_failed_paste(self):
-        injector = self._injector()
-        injector.config_manager = ConfigStub({})
-
-        with (
-            mock.patch.object(injector, "_preprocess_text", return_value="hello"),
-            mock.patch.object(injector, "_inject_via_clipboard_and_hotkey", return_value=False),
-        ):
-            self.assertEqual(injector.inject_text("hello"), InjectionOutcome.FAILED)
-
-
-class TrailingSpaceTests(unittest.TestCase):
-    def _injected(self, text, settings):
-        injector = make_injector()
-        injector.config_manager = ConfigStub(settings)
-
-        with (
-            mock.patch.object(injector, "_preprocess_text", return_value=text),
-            mock.patch.object(
-                injector, "_inject_via_clipboard_and_hotkey", return_value=True
-            ) as inject,
-        ):
-            self.assertEqual(injector.inject_text(text), InjectionOutcome.INJECTED)
-
-        return inject.call_args[0][0]
-
-    def test_default_config_still_appends_space_for_english(self):
-        self.assertEqual(self._injected("hello", {}), "hello ")
-
-    def test_auto_skips_space_after_cjk(self):
-        self.assertEqual(self._injected("你好世界", {"append_trailing_space": "auto"}), "你好世界")
-        self.assertEqual(self._injected("こんにちは。", {"append_trailing_space": "auto"}), "こんにちは。")
-
-    def test_auto_keeps_space_after_latin(self):
-        self.assertEqual(self._injected("hello", {"append_trailing_space": "auto"}), "hello ")
-
-    def test_explicit_true_always_appends(self):
-        self.assertEqual(self._injected("你好世界", {"append_trailing_space": True}), "你好世界 ")
-        self.assertEqual(self._injected("hello", {"append_trailing_space": True}), "hello ")
-
-    def test_explicit_false_never_appends(self):
-        self.assertEqual(self._injected("你好世界", {"append_trailing_space": False}), "你好世界")
-        self.assertEqual(self._injected("hello", {"append_trailing_space": False}), "hello")
-
-    def test_space_is_decided_after_the_hook_runs(self):
-        injector = make_injector()
-        injector.config_manager = ConfigStub({"append_trailing_space": "auto"})
-        replaced = mock.Mock(outcome=_PostTranscriptionHookOutcome.REPLACE, text="你好")
-
-        with (
-            mock.patch.object(injector, "_preprocess_text", return_value="hello"),
-            mock.patch.object(injector, "_run_post_transcription_hook", return_value=replaced),
-            mock.patch.object(
-                injector, "_inject_via_clipboard_and_hotkey", return_value=True
-            ) as inject,
-        ):
-            injector.inject_text("hello")
-
-        self.assertEqual(inject.call_args[0][0], "你好")
-
-
-class WordOverrideBoundaryTests(unittest.TestCase):
-    def _preprocess(self, text, overrides):
-        injector = make_injector()
-        injector.config_manager = ConfigStub(
-            {"word_overrides": overrides, "symbol_replacements": False}
-        )
-        return injector._preprocess_text(text)
-
-    def test_cjk_override_applies_mid_sentence(self):
-        self.assertEqual(self._preprocess("我说你好世界", {"你好": "HI"}), "我说HI世界")
-
-    def test_cjk_punctuation_override_recipe(self):
-        self.assertEqual(self._preprocess("今天很好句号", {"句号": "。"}), "今天很好。")
-
-    def test_latin_override_still_respects_word_boundaries(self):
-        self.assertEqual(self._preprocess("the cat sat", {"cat": "dog"}), "the dog sat")
-        self.assertEqual(self._preprocess("concatenate", {"cat": "dog"}), "concatenate")
-
-    def test_single_character_override_still_matches_mid_word(self):
-        self.assertEqual(self._preprocess("Straße", {"ß": "ss"}), "Strasse")
-
-    def test_filler_filtering_reaches_preprocessing_through_config(self):
-        # Rule-level coverage lives in test_filler_filter.py; this pins the
-        # config adapter and the interaction with the spoken-symbol pass, which
-        # runs after filtering and is enabled by default.
-        for symbols in (True, False):
-            injector = make_injector()
-            injector.config_manager = ConfigStub(
-                {"symbol_replacements": symbols, "filter_filler_words": True,
-                 "filler_words": ["uh", "um", "er", "ah", "eh", "hmm", "hm", "mm", "mhm"]}
-            )
-            with self.subTest(symbol_replacements=symbols):
-                self.assertEqual(
-                    injector._preprocess_text(
-                        "Fair enough. Um. Uh, what about the um, second option?"
-                    ),
-                    "Fair enough. What about the second option?",
-                )
-                self.assertEqual(injector._preprocess_text("umbrella"), "umbrella")
-
-    def test_dictated_punctuation_next_to_a_filler_is_preserved(self):
-        # Filtering runs before spoken-symbol replacement, so a dictated "comma"
-        # is still a word at that point and survives the filler beside it.
-        # Explicit dictation outranks tidiness.
-        injector = make_injector()
-        injector.config_manager = ConfigStub(
-            {"symbol_replacements": True, "filter_filler_words": True, "filler_words": ["um"]}
-        )
-        self.assertEqual(
-            injector._preprocess_text("hello comma um comma world"), "hello,, world"
-        )
-
-    def test_filler_filtering_is_off_by_default(self):
-        injector = make_injector()
-        injector.config_manager = ConfigStub({"symbol_replacements": False})
-        self.assertEqual(injector._preprocess_text("well um okay"), "well um okay")
-
-
-class SpokenPunctuationPreprocessingTests(unittest.TestCase):
-    def test_command_aware_punctuation_matrix(self):
-        cases = {
-            "Hello, new line. World": "Hello,\nWorld",
-            "Hello. new line? World": "Hello.\nWorld",
-            "Hello period new line World": "Hello.\nWorld",
-            "Hello comma world": "Hello, world",
-            "Hello, comma, world": "Hello, world",
-            "comma, next": ", next",
-            "HELLO COMMA WORLD": "HELLO, WORLD",
-            "hello period close paren": "hello.)",
-            "hello period )": "hello.)",
-            "open paren hi comma close paren": "(hi,)",
-            "Really exclamation mark!!": "Really!!!",
-            "pipe | pipe": "| | |",
-            "done period 。": "done.。",
-            "ok comma，next": "ok,，next",
-            "Wait... really!!": "Wait... really!!",
-            "Why??? new line. Because...": "Why???\nBecause...",
-        }
-        for raw, expected in cases.items():
-            with self.subTest(raw=raw):
-                self.assertEqual(preprocess_text(raw), expected)
-
-    def test_disabled_symbol_replacements_are_unchanged(self):
-        config = ConfigStub({"symbol_replacements": False})
-        self.assertEqual(
-            preprocess_text("Hello,  new line. comma, world", config),
-            "Hello, new line. comma, world",
-        )
-
-    def test_pure_function_still_applies_overrides_and_fillers(self):
-        config = ConfigStub({
-            "word_overrides": {"colour": "color"},
-            "filter_filler_words": True,
-            "filler_words": ["um"],
-        })
-        self.assertEqual(preprocess_text("um colour comma please", config), "color, please")
 
 
 class LazyPyperclipTests(unittest.TestCase):

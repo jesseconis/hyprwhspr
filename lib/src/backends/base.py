@@ -11,12 +11,7 @@ facade and main.py observe.
 import sys
 import wave
 from io import BytesIO
-from typing import Callable, Optional
-
-try:
-    from ..service_log import log
-except ImportError:
-    from service_log import log
+from typing import Optional
 
 try:
     from ..audio_resampler import resample_audio
@@ -38,8 +33,6 @@ class TranscriptionBackend:
     is_local = True           # False: rest-api, realtime-ws (no model lock / unload no-op)
     reinit_on_idle = False    # long-idle (>30 min) reinit before transcribing
     reinit_on_resume = False  # reinit after suspend/resume recovery
-    loads_in_background = False  # load can outlast startup (GPU transfer, sidecar, first-run download)
-    streams_audio = False     # consumes audio live over a connection (realtime-ws)
 
     def __init__(self, manager):
         self._manager = manager
@@ -109,54 +102,6 @@ class TranscriptionBackend:
         return False
 
     # ------------------------------------------------------------------
-    # Streaming surface (streams_audio backends override; no-ops elsewhere)
-    # ------------------------------------------------------------------
-
-    def get_streaming_callback(self) -> Optional[Callable]:
-        """Audio-chunk callback for live streaming, or None."""
-        return None
-
-    def apply_partial_callback(self, callback: Optional[Callable[[str], None]]) -> None:
-        """Route partial-transcript previews to `callback`."""
-
-    @property
-    def last_connect_failure(self) -> Optional[str]:
-        """Why the last reconnect failed ('connecting'/'cooldown'/'failed'), or None."""
-        return None
-
-    def discard_audio(self) -> None:
-        """Drop buffered streamed audio, keeping the connection."""
-
-    def update_language(self, language: Optional[str]) -> None:
-        """Apply a language override to the live connection."""
-
-    def close(self) -> None:
-        """Close the live connection."""
-
-    # ------------------------------------------------------------------
-    # Shared prompt resolution
-    # ------------------------------------------------------------------
-
-    def resolve_whisper_prompt(self, language: Optional[str]) -> 'tuple[Optional[str], str]':
-        """Return (prompt, source key) for `language`.
-
-        A configured prompt wins, language-specific first. Otherwise the shipped
-        English default applies only to English or unknown-language audio, so a
-        non-English speaker is never handed an English prompt. An unknown
-        language is treated as English: backends that cannot detect one have
-        nothing better to assume.
-        """
-        language = (language or '').lower() or None
-        lang_key = f'whisper_prompt_{language or "en"}'
-        defaults = getattr(self.config, 'default_config', None) or {}
-        for key in (lang_key, 'whisper_prompt'):
-            value = self.config.get_setting(key, None)
-            if value and value != defaults.get(key):
-                return value, key
-        fallback = self.config.get_setting(lang_key, None) if language in (None, 'en') else None
-        return (fallback or None), (lang_key if fallback else 'none')
-
-    # ------------------------------------------------------------------
     # Shared audio helpers (used by multiple backends; names preserved
     # so code moved from WhisperManager keeps working verbatim)
     # ------------------------------------------------------------------
@@ -166,7 +111,7 @@ class TranscriptionBackend:
         try:
             return resample_audio(audio_data, source_rate, target_rate)
         except Exception as e:
-            log(f"ERROR: {e}")
+            print(f"ERROR: {e}", flush=True)
             raise
 
     def _numpy_to_wav_bytes(self, audio_data: 'np.ndarray', sample_rate: int = 16000) -> bytes:
@@ -204,5 +149,5 @@ class TranscriptionBackend:
             return wav_buffer.getvalue()
 
         except Exception as e:
-            log(f'ERROR: Failed to convert audio to WAV: {e}')
+            print(f'ERROR: Failed to convert audio to WAV: {e}')
             raise

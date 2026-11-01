@@ -27,13 +27,13 @@ try:
     from ..backend_installer import (
         install_backend, VENV_DIR, PYWHISPERCPP_SRC_DIR, PYWHISPERCPP_MODELS_DIR,
         get_install_state, set_install_state, get_all_state, get_state, init_state,
-        resolve_dependency_plan, dependency_required_imports, execute_dependency_plan,
+        resolve_dependency_plan, execute_dependency_plan,
     )
 except ImportError:
     from backend_installer import (
         install_backend, VENV_DIR, PYWHISPERCPP_SRC_DIR, PYWHISPERCPP_MODELS_DIR,
         get_install_state, set_install_state, get_all_state, get_state, init_state,
-        resolve_dependency_plan, dependency_required_imports, execute_dependency_plan,
+        resolve_dependency_plan, execute_dependency_plan,
     )
 
 try:
@@ -46,70 +46,8 @@ try:
 except ImportError:
     from session_environment import classify_display_environment
 
-try:
-    from ..installation import input_group_hint, is_nix_install, repair_hint
-except ImportError:
-    from installation import input_group_hint, is_nix_install, repair_hint
-
 from ._shared import (HYPRWHSPR_ROOT, SERVICE_NAME, _check_ydotool_version,
                       _is_niri_session, _validate_hyprwhspr_root)
-
-
-def _has_non_ydotool_injection_path() -> bool:
-    """Whether the active session has a detected injection path besides ydotool."""
-    session_type = os.environ.get('XDG_SESSION_TYPE', '').lower()
-    if session_type == 'x11':
-        return shutil.which('xdotool') is not None
-    if shutil.which('wtype') is not None:
-        return True
-    if shutil.which('hyprctl') is None:
-        return False
-    desktops = (
-        os.environ.get('XDG_CURRENT_DESKTOP', ''),
-        os.environ.get('XDG_SESSION_DESKTOP', ''),
-        os.environ.get('DESKTOP_SESSION', ''),
-    )
-    return bool(os.environ.get('HYPRLAND_INSTANCE_SIGNATURE')) or any(
-        token.strip().lower() == 'hyprland'
-        for value in desktops
-        for token in value.replace(';', ':').replace(',', ':').split(':')
-    )
-
-
-def _validate_uinput_access(ydotool_available: bool) -> bool:
-    """Report whether the private ydotoold daemon can access its uinput device.
-
-    Returns False only when ydotool is the sole detected injection path and its
-    required device is unavailable. Otherwise this is an actionable warning: a
-    compositor-native backend can still dispatch paste shortcuts.
-    """
-    uinput_path = Path('/dev/uinput')
-    if uinput_path.exists() and os.geteuid() == 0:
-        log_warning("⚠ Running validation as root cannot verify whether the hyprwhspr user service can access /dev/uinput.")
-        print("  Re-run 'hyprwhspr validate' without sudo.")
-        return True
-
-    accessible = uinput_path.exists() and os.access(uinput_path, os.R_OK | os.W_OK)
-    if accessible:
-        log_success("✓ /dev/uinput is readable and writable")
-        return True
-
-    other_path_available = _has_non_ydotool_injection_path()
-    required = ydotool_available and not other_path_available
-    detail = "does not exist" if not uinput_path.exists() else "is not readable and writable"
-    message = f"/dev/uinput {detail}; the private ydotool fallback cannot start."
-    if required:
-        log_error(f"✗ {message}")
-    elif other_path_available:
-        log_warning(f"⚠ {message} Other detected injection paths remain available.")
-    else:
-        log_warning(f"⚠ {message} No other injection path was detected.")
-    if is_nix_install():
-        print(f"  Add your user to the input group: {input_group_hint()}")
-    else:
-        print("  Run 'hyprwhspr setup' to configure uinput permissions.")
-    print("  If you were just added to the input group, log out and back in (or reboot) so membership becomes active.")
-    return not required
 
 
 # ==================== Backend Management Commands ====================
@@ -201,25 +139,6 @@ def _detect_current_backend(existing_cfg: Optional[dict] = None) -> Optional[str
                 except Exception:
                     pass
             # cohere-transcribe configured but not installed - fall through to return None
-        if backend == 'parakeet-cpp':
-            try:
-                from ..parakeet_cpp_runtime import is_installed
-            except ImportError:
-                from parakeet_cpp_runtime import is_installed
-            return 'parakeet-cpp' if is_installed(config=ConfigManager()) else None
-        if backend == 'qwen3-asr':
-            # No venv import to probe: inference lives in the llama.cpp sidecar,
-            # so presence is the binary plus the configured model pair.
-            try:
-                try:
-                    from ..qwen3_asr_runtime import is_installed
-                except ImportError:
-                    from qwen3_asr_runtime import is_installed
-                if is_installed(config=ConfigManager()):
-                    return 'qwen3-asr'
-            except Exception:
-                pass
-            # qwen3-asr configured but not installed - fall through to return None
         if backend in ['cpu', 'nvidia', 'amd', 'vulkan', 'pywhispercpp']:
             # Verify it's actually installed in venv
             venv_python = VENV_DIR / 'bin' / 'python'
@@ -393,12 +312,8 @@ def backend_repair_command():
             else 'rest_api_provider'
         )
         provider = config_manager.get_setting(provider_key, None)
-        try:
-            required_imports = resolve_dependency_plan(configured_backend, provider).required_imports
-        except Exception:
-            # A missing or unreadable manifest is itself a broken install; fall
-            # back to the plan's static import list so the health check still runs.
-            required_imports = dependency_required_imports(configured_backend, provider)
+        plan = resolve_dependency_plan(configured_backend, provider)
+        required_imports = plan.required_imports
     except Exception:
         pass
 
@@ -802,10 +717,9 @@ def validate_command():
         else:
             log_warning("⚠ pywhispercpp not available")
             print("")
-            print(repair_hint(
-                "To use local transcription, run: hyprwhspr setup\n"
-                "This will install the backend (CPU/NVIDIA/AMD) of your choice.\n"
-                "(or use REST API backend by setting 'transcription_backend': 'rest-api' in config.json)"))
+            print("To use local transcription, run: hyprwhspr setup")
+            print("This will install the backend (CPU/NVIDIA/AMD) of your choice.")
+            print("(or use REST API backend by setting 'transcription_backend': 'rest-api' in config.json)")
             print("")
         
         # Check base model (only for pywhispercpp backends)
@@ -832,22 +746,19 @@ def validate_command():
         log_error("  ydotool is required for paste injection.")
         all_ok = False
 
-    if not _validate_uinput_access(ydotool_ok):
-        all_ok = False
-
     # Validate configuration for potential conflicts
     # (ConfigManager comes from the module-level import; a nested relative
     # re-import here used to fail silently and skip this whole check)
     try:
         config = ConfigManager()
-        external_bindings = config.get_setting('external_bindings', False)
+        use_hypr_bindings = config.get_setting('use_hypr_bindings', False)
         grab_keys = config.get_setting('grab_keys', False)
 
-        if external_bindings:
-            log_info("ℹ Using external bindings (evdev disabled)")
+        if use_hypr_bindings:
+            log_info("ℹ Using Hyprland compositor bindings (evdev disabled)")
             if grab_keys:
-                log_warning("⚠ Warning: external_bindings=true but grab_keys=true")
-                log_warning("  Recommendation: Set grab_keys=false when using external bindings")
+                log_warning("⚠ Warning: use_hypr_bindings=true but grab_keys=true")
+                log_warning("  Recommendation: Set grab_keys=false when using compositor bindings")
     except Exception:
         pass  # Config validation is optional, don't fail if it errors
 

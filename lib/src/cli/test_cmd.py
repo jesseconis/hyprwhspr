@@ -15,14 +15,19 @@ except ImportError:
     from backend_installer import PYWHISPERCPP_MODELS_DIR
 
 try:
-    from ..backend_utils import is_valid_http_url, normalize_backend, redact_url
+    from ..backend_utils import normalize_backend
 except ImportError:
-    from backend_utils import is_valid_http_url, normalize_backend, redact_url
+    from backend_utils import normalize_backend
 
 try:
     from ..credential_manager import get_credential
 except ImportError:
     from credential_manager import get_credential
+
+try:
+    from ..provider_registry import get_provider
+except ImportError:
+    from provider_registry import get_provider
 
 try:
     from ..output_control import log_info, log_success, log_warning, log_error
@@ -75,11 +80,7 @@ def test_command(live: bool = False, mic_only: bool = False):
             # Initialize audio capture
             audio = AudioCapture(device_id=device_id, config_manager=config)
 
-            selection_error = audio.get_input_selection_error()
-            if selection_error:
-                log_error(selection_error)
-                all_passed = False
-            elif audio.is_available():
+            if audio.is_available():
                 device_info = audio.get_current_device_info()
                 if device_info:
                     log_success(f"Using: {device_info['name']}")
@@ -121,14 +122,7 @@ def test_command(live: bool = False, mic_only: bool = False):
             log_error("REST endpoint URL not configured")
             all_passed = False
         else:
-            log_success(f"Endpoint: {redact_url(endpoint_url)}")
-            fallbacks = config.get_setting('rest_fallback_endpoint_urls', [])
-            for fallback in fallbacks if isinstance(fallbacks, list) else []:
-                fallback = fallback.strip() if isinstance(fallback, str) else fallback
-                if is_valid_http_url(fallback):
-                    log_success(f"Fallback: {redact_url(fallback)}")
-                else:
-                    log_warning(f"Fallback ignored (not an http(s) URL): {redact_url(fallback) or fallback!r}")
+            log_success(f"Endpoint: {endpoint_url}")
 
             # Check credentials
             provider_id = config.get_setting('rest_api_provider')
@@ -159,18 +153,24 @@ def test_command(live: bool = False, mic_only: bool = False):
         if not provider_id:
             log_error("WebSocket provider not configured")
             all_passed = False
-        elif not model_id:
+        elif not model_id and provider_id != 'realtimestt':
             log_error("WebSocket model not configured")
             all_passed = False
         else:
-            api_key = get_credential(provider_id)
-            if api_key:
+            provider = get_provider(provider_id)
+            requires_api_key = bool(
+                provider.get('requires_api_key', True) if provider else True
+            )
+            api_key = get_credential(provider_id) if requires_api_key else None
+            if not requires_api_key:
+                log_success(
+                    f"Provider: {provider_id}, Model: {model_id or 'server-managed'}"
+                )
+                log_success("Credentials not required")
+                backend_ready = True
+            elif api_key:
                 log_success(f"Provider: {provider_id}, Model: {model_id}")
                 log_success("Credentials configured")
-                backend_ready = True
-            elif provider_id == 'custom':
-                log_success(f"Provider: custom, Model: {model_id}")
-                log_warning("No API key (most self-hosted servers need none)")
                 backend_ready = True
             else:
                 log_error(f"API key not found for provider: {provider_id}")
@@ -212,37 +212,6 @@ def test_command(live: bool = False, mic_only: bool = False):
         except ImportError:
             log_error("transformers not installed. Run: hyprwhspr setup and select cohere-transcribe")
             all_passed = False
-
-    elif backend == 'parakeet-cpp':
-        try:
-            from ..parakeet_cpp_runtime import is_installed
-        except ImportError:
-            from parakeet_cpp_runtime import is_installed
-        if is_installed(config):
-            log_success('Parakeet.cpp runtime and model available (experimental)')
-            backend_ready = True
-        else:
-            log_error('Parakeet.cpp unavailable; run hyprwhspr setup and reinstall')
-            all_passed = False
-    elif backend == 'qwen3-asr':
-        # Nothing to import: inference runs in the llama.cpp sidecar.
-        try:
-            from ..qwen3_asr_runtime import (DEFAULT_MODEL, model_installed,
-                                             resolve_device, runtime_installed)
-        except ImportError:
-            from qwen3_asr_runtime import (DEFAULT_MODEL, model_installed,
-                                           resolve_device, runtime_installed)
-        device = resolve_device(config)
-        model_name = config.get_setting('qwen3_asr_model', DEFAULT_MODEL)
-        if not runtime_installed(device):
-            log_error(f"Qwen3-ASR llama.cpp runtime ({device}) not installed. Run: hyprwhspr setup")
-            all_passed = False
-        elif not model_installed(model_name):
-            log_error(f"Qwen3-ASR model not installed: {model_name}. Run: hyprwhspr model download")
-            all_passed = False
-        else:
-            log_success(f"Qwen3-ASR available ({device}), model: {model_name}")
-            backend_ready = True
 
     elif backend in ('pywhispercpp', 'nvidia', 'cpu', 'vulkan'):
         # Test pywhispercpp model availability (covers all local whisper variants)
@@ -314,7 +283,6 @@ def test_command(live: bool = False, mic_only: bool = False):
                 all_passed = False
         else:
             # Use test.wav
-            log_info("Using bundled test audio; run `hyprwhspr test --live` to verify microphone capture")
             test_wav_path = Path(HYPRWHSPR_ROOT) / 'share' / 'assets' / 'test.wav'
 
             if not test_wav_path.exists():

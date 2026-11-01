@@ -13,13 +13,6 @@ from typing import Optional
 
 from rich.prompt import Prompt, Confirm
 
-from .onnx import resolve_model, prepare_selection, save_selection
-
-try:
-    from ..onnx_model import DEFAULT_MODEL as DEFAULT_ONNX_MODEL
-except ImportError:
-    from onnx_model import DEFAULT_MODEL as DEFAULT_ONNX_MODEL
-
 try:
     from ..config_manager import ConfigManager
 except ImportError:
@@ -31,11 +24,11 @@ except ImportError:
     from paths import CONFIG_FILE
 
 try:
-    from ..backend_utils import (BACKEND_DISPLAY_NAMES, BACKEND_SUMMARIES,
-                                 LOCAL_INSTALL_BACKENDS, normalize_backend)
+    from ..backend_utils import (BACKEND_DISPLAY_NAMES, LOCAL_INSTALL_BACKENDS,
+                                 normalize_backend)
 except ImportError:
-    from backend_utils import (BACKEND_DISPLAY_NAMES, BACKEND_SUMMARIES,
-                               LOCAL_INSTALL_BACKENDS, normalize_backend)
+    from backend_utils import (BACKEND_DISPLAY_NAMES, LOCAL_INSTALL_BACKENDS,
+                               normalize_backend)
 
 try:
     from ..backend_installer import install_backend, VENV_DIR
@@ -44,13 +37,13 @@ except ImportError:
 
 try:
     from ..provider_registry import (
-        PROVIDERS, get_provider, list_providers, get_model_config,
-        validate_api_key, get_models_for_backend, get_realtime_mode
+        PROVIDERS, get_provider, list_providers, get_provider_models,
+        get_model_config, validate_api_key
     )
 except ImportError:
     from provider_registry import (
-        PROVIDERS, get_provider, list_providers, get_model_config,
-        validate_api_key, get_models_for_backend, get_realtime_mode
+        PROVIDERS, get_provider, list_providers, get_provider_models,
+        get_model_config, validate_api_key
     )
 
 try:
@@ -71,11 +64,9 @@ except ImportError:
 
 from ._shared import (HYPRWHSPR_ROOT, SERVICE_NAME, USER_HOME,
                       _check_mise_active, _check_python_compatibility,
-                      _accessibility_bridge_enabled,
-                      _is_gnome_or_mutter_session, _is_kde_plasma_session,
-                      _is_x11_session)
+                      _is_gnome_or_mutter_session)
 from .config import setup_config
-from .install import _hypr_config_dir, _hyprland_uses_lua, _setup_hyprland_bindings
+from .install import _setup_hyprland_bindings
 from .keyboard import _run_keyboard_selection
 from .maintenance import (_cleanup_backend, _detect_current_backend,
                           validate_command)
@@ -109,109 +100,6 @@ def _bool_default(cfg: dict, key: str, fallback: bool) -> bool:
     return val if isinstance(val, bool) else fallback
 
 
-def _atspi_package_hint() -> str:
-    """Distro-appropriate package names for the AT-SPI Python bindings."""
-    if Path('/etc/debian_version').exists():
-        return "python3-gi gir1.2-atspi-2.0 at-spi2-core"
-    if Path('/etc/fedora-release').exists():
-        return "python3-gobject at-spi2-core"
-    if Path('/etc/os-release').exists() and 'suse' in Path('/etc/os-release').read_text(encoding='utf-8').lower():
-        return "python3-gobject typelib-1_0-Atspi-2_0 at-spi2-core"
-    return "python-gobject at-spi2-core (Arch naming)"
-
-
-def _check_atspi_availability() -> bool:
-    """True when the service Python can import the AT-SPI bindings.
-
-    Mirrors the probe in TextInjector._get_active_window_info(): the bindings are
-    loaded in a child process because dbind can abort the interpreter outright when
-    the accessibility bus is missing.
-    """
-    check_code = (
-        "import gi; gi.require_version('Atspi', '2.0'); "
-        "from gi.repository import Atspi"
-    )
-    venv_python = VENV_DIR / 'bin' / 'python'
-    interpreter = str(venv_python) if venv_python.exists() else sys.executable
-    try:
-        result = subprocess.run(
-            [interpreter, '-c', check_code],
-            check=False, capture_output=True, text=True, timeout=10,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
-def _offer_accessibility_bridge(desktop: str, desktop_is_gnome: bool = True) -> bool:
-    """Offer to enable the AT-SPI accessibility bridge for paste-shortcut detection.
-
-    GNOME and KDE both run native-Wayland windows that no compositor IPC of ours can
-    see, so `_get_active_window_info()` falls back to AT-SPI. That probe only sees
-    applications when the bridge is on; without it every terminal is mistaken for a
-    GUI app and paste falls back to Ctrl+V.
-
-    `desktop_is_gnome` selects the enable mechanism, not the wording — the two
-    desktops expose the same setting through different front ends.
-
-    Returns True only when the bridge is actually enabled, so the caller can still
-    offer the `paste_mode` fallback to anyone who declines or lacks the bindings.
-    """
-    # The bindings gate everything below: without them the probe in
-    # TextInjector._get_active_window_info() exits on `import gi` no matter what
-    # the bridge property says, so this must be tested before reporting success.
-    if not _check_atspi_availability():
-        print(f"\n{desktop} auto-picks the paste shortcut per app (terminal vs. GUI) via")
-        print("the accessibility bridge, which needs the AT-SPI Python bindings.")
-        print(f"\nNote: AT-SPI Python bindings not found. Install: {_atspi_package_hint()}")
-        print("Window detection stays unavailable until they are installed.")
-        return False
-
-    # Re-running setup on a machine that already has the bridge on must not end up
-    # warning that window detection is unavailable, so report it as enabled and
-    # skip a prompt that has nothing left to do.
-    if _accessibility_bridge_enabled() is True:
-        print(f"\n{desktop} accessibility bridge: already enabled "
-              "(paste shortcuts are auto-detected per app).")
-        return True
-
-    print(f"\n{desktop} can auto-pick the paste shortcut per app (terminal vs. GUI) via the")
-    print("accessibility bridge. Without it, paste falls back to Ctrl+V (wrong in terminals).")
-
-    if not Confirm.ask(
-        "Enable the accessibility bridge for automatic paste-shortcut detection?",
-        default=True,
-    ):
-        return False
-
-    # GNOME's own knob is the gsettings key (it is what the session honours, and
-    # persists across relogin). KDE ships no such schema — even where `gsettings`
-    # is installed for GTK apps, org.gnome.desktop.interface may be absent — so
-    # write the org.a11y.Status property the bridge actually reads.
-    if desktop_is_gnome and shutil.which('gsettings'):
-        enable_cmd = ['gsettings', 'set', 'org.gnome.desktop.interface',
-                      'toolkit-accessibility', 'true']
-        revert_hint = "gsettings set org.gnome.desktop.interface toolkit-accessibility false"
-    elif shutil.which('busctl'):
-        enable_cmd = ['busctl', '--user', 'set-property', 'org.a11y.Bus',
-                      '/org/a11y/bus', 'org.a11y.Status', 'IsEnabled', 'b', 'true']
-        revert_hint = ("busctl --user set-property org.a11y.Bus /org/a11y/bus "
-                       "org.a11y.Status IsEnabled b false")
-    else:
-        print("Neither 'gsettings' nor 'busctl' found — cannot enable it automatically.")
-        return False
-
-    result = run_command(enable_cmd, check=False)
-    if result.returncode == 0:
-        print(f"Enabled (revert: {revert_hint}).")
-        print("Apps started before this may need a restart to be detected.")
-        return True
-
-    print("Could not enable it automatically — run this manually:")
-    print(f"  {' '.join(enable_cmd)}")
-    return False
-
-
 def _choice_default(value, ordered_values, fallback: str) -> str:
     """1-based choice string for `value` within `ordered_values`, else `fallback`."""
     try:
@@ -220,59 +108,16 @@ def _choice_default(value, ordered_values, fallback: str) -> str:
         return fallback
 
 
-# Reverse of the menu inside _prompt_backend_selection: name -> choice.
-# Every Whisper engine, including the hidden whisper.cpp CPU/CUDA ones, lands on Whisper.
+# Reverse of the backend_map inside _prompt_backend_selection: name -> choice.
 _BACKEND_CHOICE = {
-    'onnx-asr': '1', 'parakeet-cpp': '1',
-    'faster-whisper': '2', 'pywhispercpp': '2', 'cpu': '2', 'nvidia': '2', 'vulkan': '2',
-    'cohere-transcribe': '3', 'qwen3-asr': '4', 'rest-api': '5', 'realtime-ws': '6',
+    'onnx-asr': '1', 'faster-whisper': '2', 'pywhispercpp': '3', 'cpu': '3',
+    'nvidia': '4', 'vulkan': '5', 'cohere-transcribe': '6', 'rest-api': '7',
+    'realtime-ws': '8',
 }
-_WHISPER_BACKENDS = ('faster-whisper', 'pywhispercpp', 'cpu', 'nvidia', 'vulkan')
-_CLOUD_BACKENDS = ('rest-api', 'remote', 'realtime-ws')
-
-
-def _prompt_parakeet_selection(existing_cfg, current_backend):
-    """One Parakeet menu: model and engine together. Returns (backend, onnx_model)."""
-    current_model = resolve_model(existing_cfg or {})[0]
-    options = [
-        ('onnx-asr', DEFAULT_ONNX_MODEL, 'Parakeet v3      ONNX · default'),
-        ('onnx-asr', 'orukeet', 'Orukeet          ONNX · faster, most accurate'),
-        ('parakeet-cpp', None, 'Parakeet.cpp     CPU/Vulkan · fastest'),
-    ]
-    choices = ['1', '2', '3']
-    if current_backend == 'parakeet-cpp':
-        default = '3'
-    elif current_backend == 'onnx-asr' and current_model == 'orukeet':
-        default = '2'
-    elif current_backend == 'onnx-asr' and current_model != DEFAULT_ONNX_MODEL:
-        # A hand-set onnx_asr_model survives Enter.
-        print(f"  Enter keeps: {current_model}")
-        choices, default = [''] + choices, ''
-    else:
-        default = '1'
-    for i, (_, _, label) in enumerate(options, 1):
-        print(f"  [{i}] {label}")
-    choice = Prompt.ask("Select Parakeet", choices=choices, default=default)
-    if not choice:
-        return 'onnx-asr', current_model
-    backend, model, _ = options[int(choice) - 1]
-    return backend, model
-
-
-def _resolve_whisper_engine(current_backend):
-    """Keep an installed Whisper engine; else faster-whisper, or whisper.cpp for AMD/Intel."""
-    if current_backend in _WHISPER_BACKENDS:
-        return 'cpu' if current_backend == 'pywhispercpp' else current_backend
-    # Lazy: detection may install vulkan-tools, so it runs only when Whisper is picked.
-    try:
-        from ..backend_installer import detect_gpu_type
-    except ImportError:
-        from backend_installer import detect_gpu_type
-    return 'vulkan' if detect_gpu_type() == 'vulkan' else 'faster-whisper'
 
 
 def _prompt_backend_selection(existing_cfg: Optional[dict] = None):
-    """Prompt for a backend. Returns (backend, cleanup_venv, wants_reinstall, onnx_model)."""
+    """Prompt user for backend selection with current state detection"""
     current_backend = _detect_current_backend(existing_cfg)
 
     print("\n" + "="*60)
@@ -280,22 +125,30 @@ def _prompt_backend_selection(existing_cfg: Optional[dict] = None):
     print("="*60)
 
     if current_backend:
-        print(f"\nCurrent backend: {BACKEND_DISPLAY_NAMES.get(current_backend, current_backend)}")
+        backend_names = BACKEND_DISPLAY_NAMES
+        print(f"\nCurrent backend: {backend_names.get(current_backend, current_backend)}")
     else:
         print("\nNo backend currently configured.")
 
-    print("\nLocal:")
-    print("  [1] Parakeet     fast · CPU/GPU · 25 European languages")
-    print("  [2] Whisper      99 languages · translation")
-    print("  [3] Cohere       most accurate · NVIDIA")
-    print("  [4] Qwen3-ASR    Chinese · Japanese · Korean · experimental")
-    print("Cloud:")
-    print("  [5] REST API     OpenAI · Groq · Cohere · custom")
-    print("  [6] Realtime WS  OpenAI · Gemini · ElevenLabs · self-hosted")
+    print("\nChoose your transcription backend:")
+    print()
+    print("Local In-Memory Backends:")
+    print("  [1] Parakeet TDT V3       - Optimized for light hardware (autodetects CPU/GPU)")
+    print("  [2] faster-whisper        - CTranslate2 + INT8 quantization, CPU or NVIDIA GPU")
+    print("  [3] Whisper (CPU)         - whisper.cpp, works everywhere")
+    print("  [4] Whisper (NVIDIA)      - whisper.cpp + CUDA, premium local transcription for NVIDIA GPUs")
+    print("  [5] Whisper (Vulkan)      - whisper.cpp + Vulkan, ideal for AMD/Intel GPUs")
+    print("  [6] Cohere Transcribe     - #1 Open ASR leaderboard, 14 languages, ~4-5 GB VRAM (fp16)")
+    print()
+    print("Cloud/REST Backends:")
+    print("  [7] REST API              - OpenAI, Groq, or custom endpoint")
+    print("  [8] Realtime WS           - Low-latency streaming")
     print()
 
-    # Seed the default with the installed backend, else the configured one, so
-    # a re-run keeps it on Enter.
+    # Seed the prompt default with the currently configured/installed backend so
+    # a re-run keeps it (Enter = keep). Prefer the verified install; fall back to
+    # the raw config value so a configured backend still preselects even if the
+    # venv check returned None.
     default_src = current_backend
     if not default_src:
         try:
@@ -308,50 +161,82 @@ def _prompt_backend_selection(existing_cfg: Optional[dict] = None):
             default_src = None
     default_backend_choice = (_BACKEND_CHOICE.get(normalize_backend(default_src), '1')
                               if default_src else '1')
-    if current_backend:
-        current_backend = normalize_backend(current_backend)
 
     while True:
         try:
-            choice = Prompt.ask("Select backend", choices=['1', '2', '3', '4', '5', '6'],
-                                default=default_backend_choice)
-            onnx_model = None
-            if choice == '1':
-                selected, onnx_model = _prompt_parakeet_selection(existing_cfg, current_backend)
-            elif choice == '2':
-                selected = _resolve_whisper_engine(current_backend)
-                print(f"  Engine: {BACKEND_DISPLAY_NAMES.get(selected, selected)}")
-            else:
-                selected = {'3': 'cohere-transcribe', '4': 'qwen3-asr',
-                            '5': 'rest-api', '6': 'realtime-ws'}[choice]
+            choice = Prompt.ask("Select backend", choices=['1', '2', '3', '4', '5', '6', '7', '8'], default=default_backend_choice)
+            backend_map = {
+                '1': 'onnx-asr',
+                '2': 'faster-whisper',
+                '3': 'cpu',
+                '4': 'nvidia',
+                '5': 'vulkan',
+                '6': 'cohere-transcribe',
+                '7': 'rest-api',
+                '8': 'realtime-ws',
+            }
+            selected = backend_map[choice]
 
+            # Backend display names for warnings/messages
+            backend_names = {
+                'onnx-asr': 'Parakeet TDT V3 (onnx-asr)',
+                'cpu': 'Whisper CPU',
+                'nvidia': 'Whisper NVIDIA (CUDA)',
+                'faster-whisper': 'faster-whisper (CTranslate2)',
+                'cohere-transcribe': 'Cohere Transcribe 2B',
+                'amd': 'Whisper AMD/Intel (Vulkan)',
+                'vulkan': 'Whisper AMD/Intel (Vulkan)',
+                'rest-api': 'REST API',
+                'realtime-ws': 'Realtime WebSocket',
+                'pywhispercpp': 'pywhispercpp'
+            }
+
+            # Warn if switching to different backend
             switching_local_backends = False
             if current_backend and current_backend != selected:
-                print(f"\nSwitching from {BACKEND_DISPLAY_NAMES.get(current_backend, current_backend)}"
-                      f" to {BACKEND_DISPLAY_NAMES.get(selected, selected)}.")
-                if current_backend not in _CLOUD_BACKENDS and selected not in _CLOUD_BACKENDS:
+                print(f"\n⚠️  Switching from {backend_names.get(current_backend, current_backend)} to {backend_names.get(selected, selected)}")
+
+                if current_backend not in ['rest-api', 'remote', 'realtime-ws'] and selected not in ['rest-api', 'remote', 'realtime-ws']:
+                    print("This will recreate the venv and install the new backend cleanly.")
+                    if not Confirm.ask("Continue?", default=True):
+                        continue
                     switching_local_backends = True
-                elif selected in _CLOUD_BACKENDS:
-                    cleanup_venv = Confirm.ask("Remove the local venv to free space?", default=False)
-                    return (selected, cleanup_venv, False, None)
+                elif selected in ['rest-api', 'realtime-ws']:
+                    backend_type_name = 'REST API' if selected == 'rest-api' else 'Realtime WebSocket'
+                    print(f"Switching to {backend_type_name} backend.")
+                    print("The local backend venv will no longer be needed.")
+                    cleanup_venv = Confirm.ask("Remove the venv to free up space?", default=False)
+                    print(f"\n✓ Selected: {BACKEND_DISPLAY_NAMES.get(selected, selected)}")
+                    return (selected, cleanup_venv, False)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
 
+            # If re-selecting same backend, offer reinstall option
             if current_backend == selected and selected in LOCAL_INSTALL_BACKENDS:
-                # Picking another ONNX model is a model change, not a reinstall.
-                if (selected == 'onnx-asr'
-                        and onnx_model != resolve_model(existing_cfg or {})[0]):
-                    return (selected, False, False, onnx_model)
-                print(f"\n{BACKEND_DISPLAY_NAMES.get(selected, selected)} is already installed.")
-                if not Confirm.ask("Reinstall backend?", default=False):
-                    return (selected, False, False, onnx_model)
-            elif current_backend == selected and selected in _CLOUD_BACKENDS:
-                print(f"\n{BACKEND_DISPLAY_NAMES.get(selected, selected)} is already configured.")
-                if not Confirm.ask("Reconfigure backend?", default=False):
-                    return (selected, False, False, None)
+                print(f"\n{BACKEND_DISPLAY_NAMES.get(selected, selected)} backend is already installed.")
+                reinstall = Confirm.ask("Reinstall backend?", default=False)
+                if not reinstall:
+                    print("Keeping existing installation.")
+                    return (selected, False, False)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
+                # If yes to reinstall, continue to return with wants_reinstall=True
+            elif current_backend == selected and selected == 'realtime-ws':
+                print(f"\n{BACKEND_DISPLAY_NAMES.get(selected, selected)} backend is already configured.")
+                reconfigure = Confirm.ask("Reconfigure backend?", default=False)
+                if not reconfigure:
+                    print("Keeping existing configuration.")
+                    return (selected, False, False)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
+                # If yes to reconfigure, continue to return with wants_reinstall=True for correct state tracking
+            elif current_backend == selected and selected in ['rest-api', 'remote']:
+                print(f"\n{BACKEND_DISPLAY_NAMES.get(selected, selected)} backend is already configured.")
+                reconfigure = Confirm.ask("Reconfigure backend?", default=False)
+                if not reconfigure:
+                    print("Keeping existing configuration.")
+                    return (selected, False, False)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
+                # If yes to reconfigure, continue to return with wants_reinstall=True for correct state tracking
 
-            print(f"\n✓ Selected: {BACKEND_DISPLAY_NAMES.get(selected, selected)}")
-            # Reinstalling or switching local backends rebuilds a clean venv.
+            print(f"\n✓ Selected: {backend_names.get(selected, selected)}")
+            # Force rebuild when: reinstalling same backend OR switching between local backends
+            # This ensures a clean venv without stale packages from the previous backend
             wants_reinstall = (current_backend == selected) or switching_local_backends
-            return (selected, False, wants_reinstall, onnx_model)
+            return (selected, False, wants_reinstall)  # Return tuple: (backend, cleanup_venv, wants_reinstall)
         except KeyboardInterrupt:
             print("\n\nCancelled by user.")
             raise
@@ -421,24 +306,6 @@ def _prompt_faster_whisper_model_selection(current_model: Optional[str] = None) 
             continue
 
 
-# Self-hosted server presets: they only fill in how the server speaks, so a
-# server that isn't listed works the same way through the options in the docs.
-_SELF_HOSTED_KEYS = (
-    'websocket_protocol', 'websocket_sample_rate', 'websocket_session_format', 'websocket_live_text',
-)
-_REALTIME_SERVER_PRESETS = (
-    # (label, blurb, default URL, default model, options)
-    ('NeMo-Speech.cpp', 'self-hosted · English · live typing',
-     'ws://127.0.0.1:8080/v1/realtime', 'nemotron-speech-streaming-en-0.6b', {
-         'websocket_sample_rate': 16000,
-         'websocket_session_format': 'flat',
-         'websocket_live_text': 'append_only',
-     }),
-    ('Phonon', 'self-hosted · English', '', 'phonon-2', {'websocket_protocol': 'phonon'}),
-    ('Other server', 'any OpenAI Realtime-compatible endpoint', '', '', {}),
-)
-
-
 def _prompt_realtime_provider_model_selection():
     """
     Prompt user for realtime provider and model selection in one flat list.
@@ -450,7 +317,7 @@ def _prompt_realtime_provider_model_selection():
     print("\n" + "="*60)
     print("Realtime Provider and Model Selection")
     print("="*60)
-    print("\nChoose a realtime WebSocket provider and model:")
+    print("\nChoose a realtime streaming provider and model:")
     print()
 
     realtime_options = []
@@ -458,32 +325,36 @@ def _prompt_realtime_provider_model_selection():
         if not provider.get('websocket_endpoint'):
             continue
 
-        for model_id, model_data in get_models_for_backend(provider_id, 'realtime-ws').items():
+        for model_id, model_data in provider.get('models', {}).items():
+            if not model_data.get('realtime_model', False):
+                continue
             realtime_options.append((provider_id, provider, model_id, model_data))
             print(
                 f"  [{len(realtime_options)}] "
                 f"{provider['name']}: {model_data['name']} - {model_data['description']}"
             )
 
-    first_server = len(realtime_options) + 1
-    for offset, (label, blurb, *_rest) in enumerate(_REALTIME_SERVER_PRESETS):
-        print(f"  [{first_server + offset}] {label} - {blurb}")
+    custom_choice = len(realtime_options) + 1
+    print(f"  [{custom_choice}] Custom WebSocket endpoint")
     print()
 
-    choices = [str(i) for i in range(1, first_server + len(_REALTIME_SERVER_PRESETS))]
+    choices = [str(i) for i in range(1, custom_choice + 1)]
 
     while True:
         try:
             choice = Prompt.ask("Select provider and model", choices=choices, default='1')
             choice_num = int(choice)
 
-            if choice_num >= first_server:
-                label, _blurb, default_url, default_model, preset = _REALTIME_SERVER_PRESETS[choice_num - first_server]
-                print(f"\n✓ Selected: {label}")
+            if choice_num == custom_choice:
+                print("\n" + "="*60)
+                print("Custom WebSocket Configuration")
+                print("="*60)
+                print("\nConfigure a custom realtime WebSocket backend.")
+                print()
 
-                websocket_url = Prompt.ask("WebSocket URL", default=default_url or None)
+                websocket_url = Prompt.ask("WebSocket URL (e.g., wss://api.example.com/v1/realtime)", default="")
                 if not websocket_url:
-                    log_error("A WebSocket URL is required")
+                    log_error("WebSocket URL is required for custom realtime backends")
                     if not Confirm.ask("Try again?", default=True):
                         return None
                     continue
@@ -493,52 +364,61 @@ def _prompt_realtime_provider_model_selection():
                     if not Confirm.ask("Continue anyway?", default=True):
                         continue
 
-                model_id = Prompt.ask("Model", default=default_model or None)
+                model_id = Prompt.ask("Model identifier", default="")
                 if not model_id:
-                    log_error("A model name is required")
+                    log_error("Model identifier is required for custom realtime backends")
                     if not Confirm.ask("Try again?", default=True):
                         return None
                     continue
 
+                has_api_key = Confirm.ask("Do you have an API key?", default=False)
                 api_key = None
-                if Confirm.ask("API key? Most self-hosted servers need none", default=False):
+                if has_api_key:
                     api_key = getpass.getpass("Enter API key: ")
                     if api_key:
                         save_credential('custom', api_key)
 
-                custom_config = {'websocket_url': websocket_url, **preset}
-                if preset.get('websocket_live_text') == 'append_only':
-                    custom_config['realtime_live_typing'] = Confirm.ask(
-                        "Type words while you speak? (experimental)", default=True)
+                custom_config = {'websocket_url': websocket_url}
                 return ('custom', model_id, api_key, custom_config)
 
             provider_id, provider, model_id, model_data = realtime_options[choice_num - 1]
             print(f"\n✓ Selected: {provider['name']}: {model_data['name']}")
 
-            existing_key = get_credential(provider_id)
-            if existing_key:
-                masked = mask_api_key(existing_key)
-                print(f"\nFound existing API key: {masked}")
-                use_existing = Confirm.ask("Use existing API key?", default=True)
-                if use_existing:
-                    api_key = existing_key
+            api_key = None
+            if provider.get('requires_api_key', True):
+                existing_key = get_credential(provider_id)
+                if existing_key:
+                    masked = mask_api_key(existing_key)
+                    print(f"\nFound existing API key: {masked}")
+                    use_existing = Confirm.ask("Use existing API key?", default=True)
+                    if use_existing:
+                        api_key = existing_key
+                    else:
+                        api_key = getpass.getpass(f"Enter {provider['api_key_description']}: ")
                 else:
                     api_key = getpass.getpass(f"Enter {provider['api_key_description']}: ")
-            else:
-                api_key = getpass.getpass(f"Enter {provider['api_key_description']}: ")
 
-            is_valid, error_msg = validate_api_key(provider_id, api_key)
-            if not is_valid:
-                log_warning(f"API key validation: {error_msg}")
-                if not Confirm.ask("Continue anyway?", default=True):
-                    continue
+                is_valid, error_msg = validate_api_key(provider_id, api_key)
+                if not is_valid:
+                    log_warning(f"API key validation: {error_msg}")
+                    if not Confirm.ask("Continue anyway?", default=True):
+                        continue
 
-            if save_credential(provider_id, api_key):
-                log_success("API key saved securely")
-            else:
-                log_warning("Failed to save API key, but continuing with configuration")
+                if save_credential(provider_id, api_key):
+                    log_success("API key saved securely")
+                else:
+                    log_warning("Failed to save API key, but continuing with configuration")
 
-            return (provider_id, model_id, api_key, None)
+            custom_config = None
+            if provider_id == 'realtimestt':
+                default_url = provider['websocket_endpoint']
+                websocket_url = Prompt.ask(
+                    "RealtimeSTT WebSocket URL",
+                    default=default_url,
+                )
+                custom_config = {'websocket_url': websocket_url}
+
+            return (provider_id, model_id, api_key, custom_config)
 
         except KeyboardInterrupt:
             print("\n\nCancelled by user.")
@@ -577,14 +457,25 @@ def _prompt_remote_provider_selection(filter_realtime: bool = False):
                 continue
 
             # Only show providers that have realtime-capable models
-            realtime_model_ids = list(get_models_for_backend(provider_id, 'realtime-ws'))
+            models = get_provider_models(provider_id) or {}
+            realtime_model_ids = [
+                model_id
+                for model_id, model_data in models.items()
+                if model_data.get('realtime_model', False)
+            ]
             if realtime_model_ids:
                 providers_list.append((provider_id, provider_name, realtime_model_ids))
     else:
-        # REST providers: only include providers offering at least one REST model
+        # REST providers: only include providers with at least one REST-visible model
+        # (i.e. not marked hidden in provider_registry)
         providers_list = []
         for provider_id, provider_name, _model_ids in all_providers_list:
-            visible_model_ids = list(get_models_for_backend(provider_id, 'rest-api'))
+            models = get_provider_models(provider_id) or {}
+            visible_model_ids = [
+                model_id
+                for model_id, model_data in models.items()
+                if not model_data.get('hidden', False)
+            ]
             if visible_model_ids:
                 providers_list.append((provider_id, provider_name, visible_model_ids))
     
@@ -618,10 +509,19 @@ def _prompt_remote_provider_selection(filter_realtime: bool = False):
                 print("="*60)
                 print()
                 
-                backend = 'realtime-ws' if filter_realtime else 'rest-api'
+                models = get_provider_models(provider_id)
                 model_list = []
-
-                for model_id, model_data in get_models_for_backend(provider_id, backend).items():
+                
+                # Filter models based on backend type
+                for model_id, model_data in models.items():
+                    if filter_realtime:
+                        # Only include realtime models (marked with realtime_model flag)
+                        if not model_data.get('realtime_model', False):
+                            continue
+                    else:
+                        # For REST API, hide models marked as hidden
+                        if model_data.get('hidden', False):
+                            continue
                     model_list.append((model_id, model_data))
                     print(f"  [{len(model_list)}] {model_data['name']} - {model_data['description']}")
                 
@@ -701,16 +601,8 @@ def _prompt_remote_provider_selection(filter_realtime: bool = False):
                 model_name = Prompt.ask("Model name", default="") or None
 
                 # Optional API key
+                has_api_key = Confirm.ask("Do you have an API key?", default=False)
                 api_key = None
-                existing_key = get_credential('custom')
-                if existing_key:
-                    print(f"\nFound existing API key: {mask_api_key(existing_key)}")
-                    if Confirm.ask("Use existing API key?", default=True):
-                        api_key = existing_key
-                if api_key:
-                    has_api_key = False
-                else:
-                    has_api_key = Confirm.ask("Do you have an API key?", default=False)
                 if has_api_key:
                     # Use getpass for secure password input (masks input, doesn't echo to terminal)
                     api_key = getpass.getpass("Enter API key: ")
@@ -762,7 +654,7 @@ def _prompt_remote_provider_selection(filter_realtime: bool = False):
             continue
 
 
-def _generate_remote_config(provider_id: str, model_id: Optional[str], api_key: str, custom_config: Optional[dict] = None, backend_type: str = 'rest-api', existing_cfg: Optional[dict] = None) -> dict:
+def _generate_remote_config(provider_id: str, model_id: Optional[str], api_key: str, custom_config: Optional[dict] = None, backend_type: str = 'rest-api') -> dict:
     """
     Generate remote backend configuration based on provider/model selection.
     
@@ -772,7 +664,6 @@ def _generate_remote_config(provider_id: str, model_id: Optional[str], api_key: 
         api_key: API key to use
         custom_config: Custom config dict for custom backends
         backend_type: Backend type ('rest-api' or 'realtime-ws')
-        existing_cfg: Current config, to keep REST fallbacks for an unchanged endpoint
     
     Returns:
         Configuration dictionary ready to be saved
@@ -783,37 +674,26 @@ def _generate_remote_config(provider_id: str, model_id: Optional[str], api_key: 
             'websocket_provider': provider_id,
             'websocket_model': model_id
         }
-        # setup_config merges into the existing config: write None rather than
-        # omit, or a custom URL from an earlier setup overrides the provider's
-        # own endpoint.
-        config['websocket_url'] = (custom_config or {}).get('websocket_url')
-        for key in _SELF_HOSTED_KEYS:
-            config[key] = (custom_config or {}).get(key)
-        # Asked only for append-only servers; anything else turns it off.
-        config['realtime_live_typing'] = bool((custom_config or {}).get('realtime_live_typing'))
+        # Protocol adapters and custom backends may supply an explicit URL.
+        if custom_config and 'websocket_url' in custom_config:
+            config['websocket_url'] = custom_config['websocket_url']
         return config
     
     config = {
-        'transcription_backend': 'rest-api',
-        # Deprecated plaintext key: the backend falls back to it when
-        # rest_api_provider is None, so clear it or it reaches this endpoint.
-        'rest_api_key': None,
-        # setup_config merges into the existing config: a fallback endpoint
-        # left from an earlier provider would receive the new provider's
-        # credential, so every generated REST config starts with none.
-        'rest_fallback_endpoint_urls': [],
+        'transcription_backend': 'rest-api'
     }
-
+    
     if custom_config:
         # Custom backend
         config['rest_endpoint_url'] = custom_config['endpoint']
-        # Store provider identifier instead of API key
-        # API key is already saved securely via credential_manager.
-        # Written even when empty: setup_config merges into the existing
-        # config, and a stale provider would send its key to this endpoint.
-        config['rest_api_provider'] = 'custom' if api_key else None
-        config['rest_headers'] = custom_config.get('headers') or {}
-        config['rest_body'] = custom_config.get('body') or {}
+        if api_key:
+            # Store provider identifier instead of API key
+            # API key is already saved securely via credential_manager
+            config['rest_api_provider'] = 'custom'
+        if custom_config.get('headers'):
+            config['rest_headers'] = custom_config['headers']
+        if custom_config.get('body'):
+            config['rest_body'] = custom_config['body']
     else:
         # Known provider
         model_config = get_model_config(provider_id, model_id)
@@ -824,26 +704,13 @@ def _generate_remote_config(provider_id: str, model_id: Optional[str], api_key: 
         # Store provider identifier instead of API key
         # API key is already saved securely via credential_manager
         config['rest_api_provider'] = provider_id
-        config['rest_headers'] = {}  # Clear custom headers from an earlier setup
         config['rest_body'] = model_config['body'].copy()
-
-    # Fallbacks are mirrors that get this endpoint's key: keep them only if
-    # the endpoint and provider are unchanged.
-    existing = existing_cfg or {}
-    fallbacks = existing.get('rest_fallback_endpoint_urls') or []
-    if (fallbacks and existing.get('rest_endpoint_url') == config['rest_endpoint_url']
-            and existing.get('rest_api_provider') == config['rest_api_provider']):
-        config['rest_fallback_endpoint_urls'] = list(fallbacks)
-    elif fallbacks:
-        log_warning("Endpoint changed: fallback endpoints cleared")
     
     return config
 
 
 def _setup_command_symlink():
     """Offer to create ~/.local/bin/hyprwhspr symlink for git clone installs"""
-    if os.environ.get("HYPRWHSPR_GENERATION"):
-        return
     # Only relevant for non-package installs (git clones)
     if HYPRWHSPR_ROOT == '/usr/lib/hyprwhspr':
         return  # Package install, symlink not needed
@@ -908,8 +775,16 @@ def setup_command(python_path: Optional[str] = None):
     print("\nThis setup will guide you through configuring hyprwhspr.")
     print("Skip any step by answering 'no'.\n")
 
-    if _check_mise_active()[0]:
-        log_info('Using the selected interpreter without changing Python manager configuration.')
+    # Check for MISE interference and handle automatically
+    mise_active, _ = _check_mise_active()
+    if mise_active:
+        # Try to deactivate MISE (may be a shell function)
+        if shutil.which('mise'):
+            try:
+                run_command(['bash', '-c', 'mise deactivate'], check=False, capture_output=True)
+            except Exception:
+                pass
+        log_info("MISE deactivated for installation")
 
     # Early Python version compatibility check
     # This warns users upfront if their Python is too new for local ML backends
@@ -944,14 +819,11 @@ def setup_command(python_path: Optional[str] = None):
     backend_result = _prompt_backend_selection(existing_cfg)
     if not backend_result:
         log_error("Backend selection is required. Exiting.")
-        return False
+        return
     
     # Handle tuple or string return (backward compatibility)
-    onnx_model = None
     if isinstance(backend_result, tuple):
-        if len(backend_result) == 4:
-            backend, cleanup_venv, wants_reinstall, onnx_model = backend_result
-        elif len(backend_result) == 3:
+        if len(backend_result) == 3:
             backend, cleanup_venv, wants_reinstall = backend_result
         elif len(backend_result) == 2:
             backend, cleanup_venv = backend_result
@@ -972,13 +844,9 @@ def setup_command(python_path: Optional[str] = None):
         current_backend = normalize_backend(current_backend)
     backend_normalized = normalize_backend(backend)
     
-    onnx_selection = None
-    if backend_normalized == 'onnx-asr':
-        onnx_selection = resolve_model(existing_cfg, onnx_model)
-
     # Handle backend switching
-    if current_backend and current_backend != backend_normalized and not os.environ.get("HYPRWHSPR_GENERATION"):
-        if current_backend not in ['rest-api', 'remote', 'realtime-ws'] and not ({current_backend, backend_normalized} <= {'onnx-asr', 'parakeet-cpp'}):
+    if current_backend and current_backend != backend_normalized:
+        if current_backend not in ['rest-api', 'remote', 'realtime-ws']:
             # Switching from local to something else
             if not _cleanup_backend(current_backend):
                 log_warning("Failed to clean up old backend, continuing anyway...")
@@ -1003,11 +871,28 @@ def setup_command(python_path: Optional[str] = None):
             print("\n" + "="*60)
             print("Backend Installation")
             print("="*60)
-            print(f"\n{BACKEND_SUMMARIES.get(backend_normalized, backend_normalized)}")
-            print("Downloads can take several minutes.")
-            # A yes to "Reinstall backend?" already confirmed this.
-            reinstalling = current_backend == backend_normalized
-            if not reinstalling and not Confirm.ask("Proceed with backend installation?", default=True):
+            if backend_normalized == 'onnx-asr':
+                print("\nThis will install the ONNX-ASR backend for hyprwhspr.")
+                print("This backend automatically detects and uses GPU acceleration when available,")
+                print("or falls back to CPU-optimized mode. Uses ONNX runtime for fast transcription.")
+                print("This may take several minutes as it downloads models and dependencies.")
+            elif backend_normalized == 'faster-whisper':
+                print("\nThis will install the faster-whisper backend (CTranslate2).")
+                print("Works on CPU and NVIDIA GPUs. INT8 quantization is fast and memory-efficient.")
+                print("On NVIDIA: large-v3-turbo runs in ~3.1 GB VRAM. On CPU: INT8 is faster than pywhispercpp.")
+                print("Built-in Silero VAD reduces hallucination loops on longer recordings.")
+                print("Models are downloaded automatically on first use.")
+            elif backend_normalized == 'cohere-transcribe':
+                print("\nThis will install the Cohere Transcribe backend (transformers).")
+                print("2B parameter Conformer model — #1 on the Open ASR Leaderboard (English), 14 languages.")
+                print("Requires ~4-5 GB VRAM with fp16 (default) or ~8-9 GB with fp32.")
+                print("Falls back to CPU if no GPU is available (slow — not recommended for live dictation).")
+                print("Model weights (~4 GB) will be downloaded from HuggingFace during setup.")
+                print("This may take several minutes depending on your connection speed.")
+            else:
+                print(f"\nThis will install the {backend_normalized.upper()} backend for pywhispercpp.")
+                print("This may take several minutes as it compiles from source.")
+            if not Confirm.ask("Proceed with backend installation?", default=True):
                 log_warning("Skipping backend installation. You can install it later.")
                 log_warning("Backend installation is required for local transcription to work.")
                 backend_install_skipped = True
@@ -1043,13 +928,9 @@ def setup_command(python_path: Optional[str] = None):
                 # Use normalized backend to ensure 'amd' -> 'vulkan' for new installs
                 if not install_backend(backend_normalized, force_rebuild=wants_reinstall, custom_python=python_path):
                     log_error("Backend installation failed. Setup cannot continue.")
-                    return False
+                    return
                 
     
-    if onnx_selection and not backend_install_skipped:
-        current = resolve_model(existing_cfg) if current_backend == backend_normalized else None
-        onnx_selection = prepare_selection(onnx_selection, current)
-
     # Step 2: Provider/model selection (if REST API backend)
     remote_config = None
     selected_model = None
@@ -1059,23 +940,22 @@ def setup_command(python_path: Optional[str] = None):
         provider_result = _prompt_remote_provider_selection()
         if not provider_result:
             log_error("Provider selection cancelled. Exiting.")
-            return False
+            return
         
         provider_id, model_id, api_key, custom_config = provider_result
         
         # Generate remote configuration
         try:
-            remote_config = _generate_remote_config(provider_id, model_id, api_key, custom_config, backend_type='rest-api',
-                                                    existing_cfg=existing_cfg)
+            remote_config = _generate_remote_config(provider_id, model_id, api_key, custom_config, backend_type='rest-api')
             log_success("Remote configuration generated")
         except Exception as e:
             log_error(f"Failed to generate remote configuration: {e}")
-            return False
+            return
     elif backend_normalized == 'realtime-ws':
         provider_result = _prompt_realtime_provider_model_selection()
         if not provider_result:
             log_error("Provider selection cancelled. Exiting.")
-            return False
+            return
         
         provider_id, model_id, api_key, custom_config = provider_result
         
@@ -1085,14 +965,10 @@ def setup_command(python_path: Optional[str] = None):
             log_success("Realtime WebSocket configuration generated")
         except Exception as e:
             log_error(f"Failed to generate realtime configuration: {e}")
-            return False
+            return
         
-        realtime_mode = get_realtime_mode(provider_id, model_id)
-        remote_config['realtime_mode'] = realtime_mode
-        if realtime_mode == 'converse':
-            log_info("Realtime mode: converse (spoken AI replies)")
-        else:
-            log_info("Realtime mode: transcribe (speech-to-text)")
+        remote_config['realtime_mode'] = 'transcribe'
+        log_info("Realtime mode: transcribe")
     
     # Step 1.4: Ensure venv and base dependencies for cloud backends
     if backend_normalized in ['rest-api', 'remote', 'realtime-ws']:
@@ -1108,15 +984,14 @@ def setup_command(python_path: Optional[str] = None):
             execute_dependency_plan(plan, custom_python=python_path)
         except Exception as e:
             log_error(f"Failed to install Python dependencies: {e}")
-            return False
+            return
         log_success("Python dependencies installed and verified")
     
     # Model selection for local backends
     if not backend_install_skipped:
-        if backend_normalized not in ['rest-api', 'remote', 'realtime-ws', 'onnx-asr', 'parakeet-cpp', 'faster-whisper', 'cohere-transcribe', 'qwen3-asr']:
+        if backend_normalized not in ['rest-api', 'remote', 'realtime-ws', 'onnx-asr', 'faster-whisper', 'cohere-transcribe']:
             # Local backend - prompt for model selection
-            # Note: ONNX-ASR, faster-whisper, cohere-transcribe and qwen3-asr
-            # all carry their own models and never use Whisper.cpp ones.
+            # Note: ONNX-ASR, faster-whisper, and cohere-transcribe don't use Whisper.cpp models
             selected_model = _prompt_model_selection(current_model=existing_cfg.get('model'))
         elif backend_normalized == 'faster-whisper':
             faster_whisper_model = _prompt_faster_whisper_model_selection(current_model=existing_cfg.get('faster_whisper_model'))
@@ -1180,6 +1055,26 @@ def setup_command(python_path: Optional[str] = None):
             print(f"\nNote: 'notify-send' not found. Install: {notify_pkg}")
 
         setup_mic_osd_choice = Confirm.ask("Show recording status as desktop notifications?", default=_bool_default(existing_cfg, 'mic_osd_enabled', True))
+
+        # GNOME picks the paste shortcut per app (terminal → Ctrl+Shift+V, GUI → Ctrl+V)
+        # by detecting the focused window via AT-SPI, which needs the GNOME accessibility
+        # bridge enabled. Without it, detection fails and paste falls back to Ctrl+V.
+        print("\nGNOME can auto-pick the paste shortcut per app (terminal vs. GUI) via the")
+        print("accessibility bridge. Without it, paste falls back to Ctrl+V (wrong in terminals).")
+        if shutil.which('gsettings') and Confirm.ask(
+            "Enable the GNOME accessibility bridge for automatic paste-shortcut detection?",
+            default=True,
+        ):
+            result = run_command(
+                ['gsettings', 'set', 'org.gnome.desktop.interface', 'toolkit-accessibility', 'true'],
+                check=False,
+            )
+            if result.returncode == 0:
+                print("Enabled (revert: gsettings set org.gnome.desktop.interface toolkit-accessibility false).")
+                print("Apps started before this may need a restart to be detected.")
+            else:
+                print("Could not enable it automatically — run this manually:")
+                print("  gsettings set org.gnome.desktop.interface toolkit-accessibility true")
     else:
         print("\nShows a visual overlay during recording with animated bars")
         print("and a pulsing indicator. Requires GTK4, PyCairo, and gtk4-layer-shell.")
@@ -1206,30 +1101,6 @@ def setup_command(python_path: Optional[str] = None):
             print(f"\nDependencies not found. Install: {pkg_hint}")
             setup_mic_osd_choice = Confirm.ask("Enable mic-osd anyway (will work after installing deps)?", default=_bool_default(existing_cfg, 'mic_osd_enabled', False))
 
-    # Step 3b-ii: Focused-window detection for paste-shortcut auto-selection.
-    # Compositors we can query directly (Hyprland, niri) and XWayland windows need
-    # nothing here. GNOME and KDE run native-Wayland windows that only the AT-SPI
-    # bridge exposes, so offer to turn it on. This is about paste, not the status
-    # indicator, hence its own step outside the branch above.
-    # Plasma on X11 already resolves windows through xdotool, so the bridge buys
-    # it nothing there.
-    # An X11 session resolves windows through xdotool + xprop, so the bridge buys
-    # it nothing — but only when both are actually installed. Without them
-    # `_get_active_window_info()` falls through to the AT-SPI probe even on X11
-    # (it runs whenever DISPLAY is set), so the offer still helps there.
-    x11_tools_cover_detection = (
-        _is_x11_session()
-        and bool(shutil.which('xdotool'))
-        and bool(shutil.which('xprop'))
-    )
-    gnome_needs_bridge = is_mutter_session and not x11_tools_cover_detection
-    kde_needs_bridge = _is_kde_plasma_session() and not x11_tools_cover_detection
-    a11y_bridge_enabled = False
-    if gnome_needs_bridge:
-        a11y_bridge_enabled = _offer_accessibility_bridge("GNOME", desktop_is_gnome=True)
-    elif kde_needs_bridge:
-        a11y_bridge_enabled = _offer_accessibility_bridge("KDE Plasma", desktop_is_gnome=False)
-
     # Step 3c: Audio ducking setup
     print("\n" + "="*60)
     print("Audio Ducking")
@@ -1239,22 +1110,8 @@ def setup_command(python_path: Optional[str] = None):
 
     setup_audio_ducking_choice = Confirm.ask("Enable audio ducking?", default=_bool_default(existing_cfg, 'audio_ducking', True))
     audio_ducking_percent = 50  # Default
-    audio_ducking_mode = 'duck'
     if setup_audio_ducking_choice:
-        print("\nHow should other audio be quieted?")
-        print("  duck  = lower the volume of every app (recommended)")
-        print("  pause = pause media players (browser, Spotify, mpv) and resume after,")
-        print("          then duck whatever has no player controls")
-        existing_mode = str(existing_cfg.get('audio_ducking_mode', 'duck')).lower()
-        if existing_mode not in ('duck', 'pause'):
-            existing_mode = 'duck'
-        audio_ducking_mode = Prompt.ask("Mode", choices=['duck', 'pause'], default=existing_mode)
-
-        if audio_ducking_mode == 'pause':
-            # Pause mode still ducks apps without MPRIS controls (PlaybackSuppressor)
-            print("\nApps without player controls are lowered instead. By how much?")
-        else:
-            print("\nHow much to reduce volume BY during recording?")
+        print("\nHow much to reduce volume BY during recording?")
         print("  50 = reduce to 50% of original (recommended)")
         print("  70 = reduce to 30% of original (aggressive)")
         print("  30 = reduce to 70% of original (subtle)")
@@ -1269,8 +1126,8 @@ def setup_command(python_path: Optional[str] = None):
     # Detect if user is running Hyprland
     is_hyprland_session = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE') is not None
     current_desktop = os.environ.get('XDG_CURRENT_DESKTOP', '').lower()
-    hypr_config_dir = _hypr_config_dir()
-    hypr_config_exists = any((hypr_config_dir / name).exists() for name in ('hyprland.lua', 'hyprland.conf', 'bindings.conf'))
+    hypr_config_dir = USER_HOME / '.config' / 'hypr'
+    hypr_config_exists = (hypr_config_dir / 'hyprland.conf').exists() or (hypr_config_dir / 'bindings.conf').exists()
 
     # Only show Hyprland section if relevant
     if is_hyprland_session or hypr_config_exists or 'hyprland' in current_desktop:
@@ -1279,17 +1136,17 @@ def setup_command(python_path: Optional[str] = None):
         print("="*60)
         print("\nUse Hyprland's native compositor bindings instead of evdev keyboard grabbing.")
         print("Better compatibility with keyboard remappers.")
-        print("Requires adding bindings to ~/.config/hypr/hyprland.conf, bindings.conf or hyprland.lua")
+        print("Requires adding bindings to ~/.config/hypr/hyprland.conf or bindings.conf")
 
         if is_hyprland_session:
             print("\nHyprland session detected.")
-            setup_hyprland_choice = Confirm.ask("Configure Hyprland compositor bindings?", default=_bool_default(existing_cfg, 'external_bindings', True))
+            setup_hyprland_choice = Confirm.ask("Configure Hyprland compositor bindings?", default=_bool_default(existing_cfg, 'use_hypr_bindings', True))
         elif hypr_config_exists:
             print(f"\nHyprland configuration detected at: {hypr_config_dir}")
-            setup_hyprland_choice = Confirm.ask("Configure Hyprland compositor bindings?", default=_bool_default(existing_cfg, 'external_bindings', True))
+            setup_hyprland_choice = Confirm.ask("Configure Hyprland compositor bindings?", default=_bool_default(existing_cfg, 'use_hypr_bindings', True))
         else:
             print("\nHyprland configuration not found.")
-            setup_hyprland_choice = Confirm.ask("Set up Hyprland compositor bindings anyway?", default=_bool_default(existing_cfg, 'external_bindings', False))
+            setup_hyprland_choice = Confirm.ask("Set up Hyprland compositor bindings anyway?", default=_bool_default(existing_cfg, 'use_hypr_bindings', False))
     else:
         # Not a Hyprland system - skip this section entirely
         setup_hyprland_choice = False
@@ -1340,8 +1197,10 @@ def setup_command(python_path: Optional[str] = None):
                 if api_key:
                     masked = mask_api_key(api_key)
                     print(f"API Key: {masked}")
-                elif provider_id != 'custom':
+                elif provider_id not in ('custom', 'realtimestt'):
                     print(f"API Key: not found in credential store for provider {provider_id}")
+                else:
+                    print("API Key: not required")
         else:
             print(f"Endpoint: {remote_config.get('rest_endpoint_url', 'N/A')}")
             if remote_config.get('rest_body'):
@@ -1366,13 +1225,9 @@ def setup_command(python_path: Optional[str] = None):
     elif selected_model:
         print(f"Model: {selected_model}")
     elif backend_normalized == 'onnx-asr':
-        print(f"Model: {onnx_selection[0]}")
+        print("Model: nemo-parakeet-tdt-0.6b-v3 (~1 GB, downloaded during setup)")
     elif backend_normalized == 'cohere-transcribe':
         print("Model: CohereLabs/cohere-transcribe-03-2026 (~4 GB, downloaded during setup)")
-    elif backend_normalized == 'parakeet-cpp':
-        print('Model: Parakeet TDT v3 Q8_0 (experimental)')
-    elif backend_normalized == 'qwen3-asr':
-        print("Model: Qwen3-ASR 1.7B Q8_0 (~2.4 GB, downloaded during setup)")
     print(f"Waybar integration: {'Yes' if setup_waybar_choice else 'No'}")
     if noctalia_installed:
         print(f"Noctalia integration: {'Yes' if setup_noctalia_choice else 'No'}")
@@ -1382,7 +1237,7 @@ def setup_command(python_path: Optional[str] = None):
     else:
         print(f"{_status_label}: {'Yes' if setup_mic_osd_choice else 'No'}")
     if setup_audio_ducking_choice:
-        print(f"Audio ducking: Yes ({audio_ducking_mode} mode, {audio_ducking_percent}% reduction)")
+        print(f"Audio ducking: Yes ({audio_ducking_percent}% reduction)")
     else:
         print("Audio ducking: No")
     print(f"Hyprland compositor bindings: {'Yes' if setup_hyprland_choice else 'No'}")
@@ -1398,21 +1253,18 @@ def setup_command(python_path: Optional[str] = None):
 
     # Paste mode detection notice — only shown when auto-detection won't work at runtime.
     # Per-app paste detection: Hyprland uses hyprctl, Niri uses niri msg
-    # (NIRI_SOCKET), XWayland uses xdotool, and GNOME/KDE use the AT-SPI
-    # accessibility bridge (offered above). A pure-Wayland compositor with none of
-    # these can't tell terminals from other apps, so terminal paste (Ctrl+Shift+V)
-    # isn't auto-selected there.
+    # (NIRI_SOCKET), XWayland uses xdotool, and GNOME uses the AT-SPI accessibility
+    # bridge (offered above). A pure-Wayland compositor with none of these can't
+    # tell terminals from other apps, so terminal paste (Ctrl+Shift+V) isn't
+    # auto-selected there.
     _has_hyprctl = bool(shutil.which('hyprctl'))
     _has_niri = bool(shutil.which('niri')) and bool(os.environ.get('NIRI_SOCKET'))
     _has_xdotool = bool(shutil.which('xdotool'))
-    # Only an actually-enabled bridge counts as a route: declining the prompt, or
-    # missing bindings, leaves the user with no detection and needing the advice.
-    _has_a11y_route = a11y_bridge_enabled
-    if not _has_a11y_route and not _has_hyprctl and not _has_niri and not _has_xdotool:
+    if not is_mutter_session and not _has_hyprctl and not _has_niri and not _has_xdotool:
         print("\nNote: Window detection unavailable on this system (no hyprctl, niri session, or xdotool).")
         print("Paste will default to Ctrl+V, which works in most apps but not terminals.")
         print("If a paste ever lands in the wrong place, you can override the key combo")
-        print("with paste_mode — see docs/usage/PASTE.md.")
+        print("with paste_mode — see docs/CONFIGURATION.md (Paste mode).")
 
     print()
 
@@ -1428,9 +1280,7 @@ def setup_command(python_path: Optional[str] = None):
     # Execute selected steps
     try:
         # Step 1: Config
-        if onnx_selection:
-            save_selection(ConfigManager(), onnx_selection)
-        elif remote_config:
+        if remote_config:
             setup_config(backend=backend_normalized, remote_config=remote_config)
         else:
             setup_config(backend=backend_normalized, model=selected_model)
@@ -1462,9 +1312,8 @@ def setup_command(python_path: Optional[str] = None):
         config = ConfigManager()
         config.set_setting('audio_ducking', setup_audio_ducking_choice)
         if setup_audio_ducking_choice:
-            config.set_setting('audio_ducking_mode', audio_ducking_mode)
             config.set_setting('audio_ducking_percent', audio_ducking_percent)
-            log_success(f"Audio ducking enabled ({audio_ducking_mode} mode, {audio_ducking_percent}% reduction)")
+            log_success(f"Audio ducking enabled ({audio_ducking_percent}% reduction)")
         else:
             log_info("Audio ducking disabled")
         config.save_config()
@@ -1488,7 +1337,7 @@ def setup_command(python_path: Optional[str] = None):
             print("="*60)
             # Update config to use Hyprland bindings
             config = ConfigManager()
-            config.set_setting('external_bindings', True)
+            config.set_setting('use_hypr_bindings', True)
             config.set_setting('grab_keys', False)
             config.save_config()
             log_success("Configuration updated for Hyprland compositor bindings")
@@ -1496,8 +1345,6 @@ def setup_command(python_path: Optional[str] = None):
             # Add bindings to Hyprland config file
             if _setup_hyprland_bindings():
                 log_success("Hyprland bindings added to config file")
-            elif _hyprland_uses_lua():
-                pass  # Manual Lua step already printed
             else:
                 log_warning("Could not add Hyprland bindings automatically")
                 log_warning("See README for manual setup instructions")
@@ -1591,35 +1438,6 @@ def setup_command(python_path: Optional[str] = None):
 
 # ==================== Permissions Setup ====================
 
-UINPUT_RULE_CONTENT = '# Allow members of the input group to access uinput device\nKERNEL=="uinput", GROUP="input", MODE="0660"\n'
-
-
-def _select_uinput_rule(rules_dir=Path('/etc/udev/rules.d')):
-    """Adopt only the exact historical generated rule; preserve unrelated rules."""
-    legacy = rules_dir / '99-uinput.rules'
-    modern = rules_dir / '99-hyprwhspr-uinput.rules'
-    try:
-        if legacy.is_symlink() or not legacy.is_file() or legacy.read_text(encoding='utf-8') != UINPUT_RULE_CONTENT:
-            return modern
-    except (OSError, UnicodeError) as exc:
-        log_warning(f'Could not inspect legacy uinput rule: {legacy}: {exc}; leaving it unchanged')
-        return modern
-    # Both managed and unmanaged uninstalls read this receipt, so it is recorded
-    # either way; only 'added' decides whether removal may touch the file.
-    try:
-        try:
-            from ..managed_install import record_ownership, digest
-        except ImportError:
-            from managed_install import record_ownership, digest
-        if not record_ownership('permission', {'kind': 'rule', 'path': str(legacy), 'added': False,
-                                               'adopted_legacy': True, 'sha256': digest(legacy)}):
-            raise record_ownership.last_error
-    except (OSError, ValueError, TypeError, ImportError) as exc:
-        log_warning(f'Could not record existing uinput rule ownership: {legacy}: {exc}; preserving it')
-    log_info(f'Recognized pre-existing uinput rule: {legacy}; no duplicate rule needed')
-    return legacy
-
-
 def setup_permissions():
     """Setup permissions (requires sudo)"""
     log_info("Setting up permissions...")
@@ -1634,37 +1452,8 @@ def setup_permissions():
 
     # Add user to required groups
     try:
-        before_groups = None
-        # Establish prior membership for every install flavour, so uninstall can
-        # tell a membership we added from one the user already had.
-        import grp
-        import pwd
-        try:
-            primary_gid = pwd.getpwnam(username).pw_gid
-            gids = set(os.getgrouplist(username, primary_gid)) | {primary_gid}
-            before_groups = {}
-            for group in ('input', 'audio', 'tty'):
-                try:
-                    before_groups[group] = grp.getgrnam(group).gr_gid in gids
-                except KeyError:
-                    log_warning(f'Could not establish prior membership in {group}; preserving permission ownership uncertainty')
-        except (KeyError, OSError) as exc:
-            log_warning(f'Could not inspect prior groups for {username}: {exc}; continuing without claiming group ownership')
         result = run_sudo_command(['usermod', '-a', '-G', 'input,audio,tty', username], check=False)
         if result.returncode == 0:
-            if before_groups is not None:
-                # Recorded for every install flavour: both uninstallers drive
-                # group removal purely from this receipt.
-                try:
-                    try:
-                        from ..managed_install import record_ownership
-                    except ImportError:
-                        from managed_install import record_ownership
-                    for group, present in before_groups.items():
-                        record_ownership('permission', {'kind': 'group', 'user': username,
-                                                        'group': group, 'added': not present})
-                except ImportError as exc:
-                    log_warning(f'Groups added, but ownership could not be recorded: {exc}')
             log_success("Added user to required groups")
         else:
             log_warning(f"Failed to add user to groups (exit code {result.returncode})")
@@ -1694,32 +1483,17 @@ def setup_permissions():
     # is a stable fallback: uaccess only covers the *active* session. The `input`
     # group is needed mainly for the global hotkey, which reads /dev/input/event*
     # via evdev (no uaccess ACL there) — not for the ydotool paste path.
-    udev_rule = _select_uinput_rule()
-    udev_rule_created = False
+    udev_rule = Path('/etc/udev/rules.d/99-uinput.rules')
     if not udev_rule.exists():
         log_info("Creating udev rule...")
-        rule_content = UINPUT_RULE_CONTENT
+        rule_content = '# Allow members of the input group to access uinput device\nKERNEL=="uinput", GROUP="input", MODE="0660"\n'
         try:
             result = run_sudo_command(['tee', str(udev_rule)], input_data=rule_content.encode(), check=False)
             if result.returncode == 0:
-                # The rule exists and works; failing to record ownership is not a
-                # failed rule. Unmanaged uninstall reads this receipt too, so record
-                # it regardless of whether a managed generation is active.
-                try:
-                    try:
-                        from ..managed_install import record_ownership, digest
-                    except ImportError:
-                        from managed_install import record_ownership, digest
-                    if not record_ownership('permission', {'kind': 'rule', 'path': str(udev_rule),
-                                                           'added': True, 'sha256': digest(udev_rule)}):
-                        raise record_ownership.last_error
-                except (OSError, ValueError, TypeError, ImportError) as exc:
-                    log_warning(f'Created the udev rule but could not record ownership: {exc}')
                 log_success("udev rule created")
-                udev_rule_created = True
             else:
                 log_warning(f"Failed to create udev rule (exit code {result.returncode})")
-                log_info("You may need to run manually: sudo tee /etc/udev/rules.d/99-hyprwhspr-uinput.rules")
+                log_info("You may need to run manually: sudo tee /etc/udev/rules.d/99-uinput.rules")
                 any_failures = True
         except Exception as e:
             log_warning(f"Failed to create udev rule: {e}")
@@ -1727,30 +1501,19 @@ def setup_permissions():
     else:
         log_info("udev rule already exists")
 
-    # Reload udev when this run changed the rules, or when /dev/uinput is still
-    # not writable. udev only applies GROUP=/MODE= on a device event, so a rule
-    # left by an earlier failed run — or written by hand, as the hint above asks
-    # — does nothing for the already-present node until it is re-triggered. This
-    # is the documented repair path ("re-run hyprwhspr setup"), so it must not be
-    # skipped just because the rule file happens to exist.
-    uinput_device = Path('/dev/uinput')
-    if udev_rule_created or (uinput_device.exists() and not os.access(uinput_device, os.W_OK)):
-        try:
-            result1 = run_sudo_command(['udevadm', 'control', '--reload-rules'], check=False)
-            result2 = run_sudo_command(['udevadm', 'trigger', '--name-match=uinput'], check=False)
-            if (result1.returncode == 0 and result2.returncode == 0) or os.access(uinput_device, os.W_OK):
-                # `udevadm trigger` can report EINVAL on otherwise correctly
-                # configured systems; a writable device means it did its job.
-                log_success("udev rules reloaded")
-            else:
-                log_warning("Failed to reload udev rules")
-                log_info("You may need to run manually: sudo udevadm control --reload-rules && sudo udevadm trigger")
-                any_failures = True
-        except Exception as e:
-            log_warning(f"Failed to reload udev rules: {e}")
+    # Reload udev
+    try:
+        result1 = run_sudo_command(['udevadm', 'control', '--reload-rules'], check=False)
+        result2 = run_sudo_command(['udevadm', 'trigger', '--name-match=uinput'], check=False)
+        if result1.returncode == 0 and result2.returncode == 0:
+            log_success("udev rules reloaded")
+        else:
+            log_warning("Failed to reload udev rules")
+            log_info("You may need to run manually: sudo udevadm control --reload-rules && sudo udevadm trigger")
             any_failures = True
-    else:
-        log_info("udev rules already applied")
+    except Exception as e:
+        log_warning(f"Failed to reload udev rules: {e}")
+        any_failures = True
 
     if any_failures:
         log_warning("Some permission setup commands failed. You may need to run them manually as root.")

@@ -24,29 +24,16 @@ except ImportError:
     from backend_utils import normalize_backend
 
 try:
-    from ..backend_installer import get_install_state, STATE_FILE
-except ImportError:
-    from backend_installer import get_install_state, STATE_FILE
-
-try:
     from ..output_control import (log_info, log_success, log_warning, log_error,
                                   run_command)
 except ImportError:
     from output_control import (log_info, log_success, log_warning, log_error,
                                 run_command)
 
-try:
-    from ..installation import is_nix_install
-except ImportError:
-    from installation import is_nix_install
-
 from ._shared import SERVICE_NAME
 from .models import (model_status, onnx_asr_model_status,
-                     faster_whisper_model_status, cohere_transcribe_model_status,
-                     qwen3_asr_model_status, parakeet_cpp_model_status)
+                     faster_whisper_model_status, cohere_transcribe_model_status)
 from .waybar import waybar_status
-from .noctalia import (_noctalia_detected, _noctalia_integration_installed,
-                       noctalia_status)
 
 
 # ==================== Status Command ====================
@@ -54,23 +41,6 @@ from .noctalia import (_noctalia_detected, _noctalia_integration_installed,
 def status_command():
     """Overall status check"""
     log_info("Checking hyprwhspr status...")
-
-    print("\n[Installation]")
-    state, error = ('nix', None) if is_nix_install() else get_install_state()
-    if state == 'nix':
-        log_success('Installation: Nix-managed (beta, Whisper.cpp CPU)')
-    elif state == 'completed':
-        log_success("Installation state: completed")
-    elif state == 'failed':
-        log_error("Installation state: failed")
-    else:
-        log_warning(f"Installation state: {state}")
-    if error:
-        print("Last installation error:")
-        error_lines = error.splitlines()
-        print('\n'.join(error_lines[:20]))
-        if len(error_lines) > 20:
-            print(f"… diagnostic truncated; full details: {STATE_FILE}")
     
     # Check systemd service
     print("\n[Systemd Service]")
@@ -90,16 +60,6 @@ def status_command():
     # Check waybar config
     print("\n[Waybar Integration]")
     waybar_status()
-
-    # Check Noctalia integration (only meaningful when the shell is present,
-    # and only in detail once the integration has actually been installed)
-    print("\n[Noctalia Integration]")
-    if not _noctalia_detected():
-        log_info("Noctalia not detected - skipping")
-    elif not _noctalia_integration_installed():
-        log_info("Noctalia detected, integration not installed (run: hyprwhspr noctalia install)")
-    else:
-        noctalia_status()
     
     # Check user config
     print("\n[User Config]")
@@ -124,11 +84,7 @@ def status_command():
         elif backend == 'onnx-asr':
             onnx_asr_model_status()
         elif backend == 'cohere-transcribe':
-            cohere_transcribe_model_status(config)
-        elif backend == 'parakeet-cpp':
-            parakeet_cpp_model_status(config)
-        elif backend == 'qwen3-asr':
-            qwen3_asr_model_status(config)
+            cohere_transcribe_model_status()
         else:
             model_status()
     except Exception:
@@ -153,7 +109,7 @@ def check_permissions():
     user_groups = [g.gr_name for g in grp.getgrall() if username in g.gr_mem]
     user_groups.append(grp.getgrgid(os.getgid()).gr_name)
     
-    required_groups = ['input'] if is_nix_install() else ['input', 'audio', 'tty']
+    required_groups = ['input', 'audio', 'tty']
     for group in required_groups:
         if group in user_groups:
             log_success(f"User in '{group}' group")

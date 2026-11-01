@@ -57,10 +57,6 @@ class RecordingControlServerTests(unittest.TestCase):
             ("start", "pt-BR"),
         )
         self.assertIsNone(RecordingControlServer.parse_commands("\ninvalid\nstartling\n"))
-        self.assertEqual(
-            RecordingControlServer.parse_commands("start\nrelease\n"),
-            ("release", None),
-        )
 
     def test_prepare_fifo_reuses_fifo_and_replaces_regular_file(self):
         self.fifo.write_text("legacy")
@@ -83,29 +79,6 @@ class RecordingControlServerTests(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: self.commands == [("start", "EN-us")]))
         self.fifo.unlink()
         self.assertTrue(self._wait_for(self.fifo.is_fifo))
-
-    def test_command_written_during_slow_dispatch_is_not_dropped(self):
-        entered, release = threading.Event(), threading.Event()
-
-        def on_command(action, language):
-            self.commands.append((action, language))
-            if action == "start":
-                entered.set()
-                release.wait(2)
-
-        self.server._on_command = on_command
-        self.assertTrue(self.server.prepare_fifo())
-        self.assertTrue(self.server.start())
-        fd = os.open(self.fifo, os.O_WRONLY)
-        os.write(fd, b"start\n")
-        os.close(fd)
-        self.assertTrue(entered.wait(2))
-        # Like the CLI: a non-blocking writer while start is still running.
-        fd = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
-        os.write(fd, b"cancel\n")
-        os.close(fd)
-        release.set()
-        self.assertTrue(self._wait_for(lambda: self.commands == [("start", None), ("cancel", None)]))
 
     def test_empty_fifo_writer_reopens_reader_after_eof(self):
         self.assertTrue(self.server.prepare_fifo())
@@ -161,39 +134,13 @@ class RecordingControlServerTests(unittest.TestCase):
         self.recording = True
         self.assertTrue(self.server.prepare_fifo())
         self.assertTrue(self.server.start())
-        self.server._write_fifo = mock.Mock(wraps=self.server._write_fifo)
         client = self._connect(b"capture:fr\n")
         self.assertTrue(self._wait_for(self.server.has_capture_subscriber))
         time.sleep(0.05)
-        self.server._write_fifo.assert_not_called()
         self.assertEqual(self.commands, [])
         self.server.notify_capture("bonjour", final=True)
         self.assertEqual(client.recv(100), b"bonjour")
         client.close()
-
-    def test_fifo_write_waits_for_a_late_reader(self):
-        os.mkfifo(self.fifo)
-        received = []
-
-        def late_reader():
-            time.sleep(0.2)
-            fd = os.open(self.fifo, os.O_RDONLY)
-            try:
-                received.append(os.read(fd, 64))
-            finally:
-                os.close(fd)
-
-        reader = threading.Thread(target=late_reader, daemon=True)
-        reader.start()
-        self.assertTrue(self.server._write_fifo("start:Ja-JP\n"))
-        reader.join(2)
-        self.assertEqual(received, [b"start:Ja-JP\n"])
-
-    def test_fifo_write_gives_up_without_a_reader(self):
-        os.mkfifo(self.fifo)
-        started = time.monotonic()
-        self.assertFalse(self.server._write_fifo("start\n", wait=0.1))
-        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_idle_capture_self_triggers_with_language(self):
         self.assertTrue(self.server.prepare_fifo())
@@ -202,44 +149,6 @@ class RecordingControlServerTests(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: self.commands == [("start", "Ja-JP")]))
         self.server.notify_capture("", final=True)
         client.close()
-
-    def test_trace_capture_uses_distinct_subscriber_mode(self):
-        self.assertTrue(self.server.prepare_fifo())
-        self.assertTrue(self.server.start())
-        client = self._connect(b"capture_trace:de\n")
-        self.assertTrue(self._wait_for(self.server.is_trace_capture))
-        self.assertTrue(self._wait_for(lambda: self.commands == [("start", "de")]))
-        payload = '{"raw":"Grüße","preprocessed":"Grüße"}\n'
-        self.recording = True
-        self.server.notify_capture(payload, final=True)
-        self.server.notify_capture('{"raw":"duplicate"}\n', final=True)
-        received = b""
-        while True:
-            chunk = client.recv(4096)
-            if not chunk:
-                break
-            received += chunk
-        self.assertEqual(received.decode("utf-8"), payload)
-        self.recording = False
-        self.server.notify_capture("", final=True)
-        client.close()
-
-    def test_disconnected_trace_session_still_suppresses_processing_injection(self):
-        self.recording = True
-        self.assertTrue(self.server.prepare_fifo())
-        self.assertTrue(self.server.start())
-        client = self._connect(b"capture_trace\n")
-        self.assertTrue(self._wait_for(self.server.is_trace_capture))
-
-        # Recording has stopped, but transcription is still in flight.
-        self.recording = False
-        client.close()
-        self.assertTrue(self._wait_for(lambda: self.server._capture_subscriber is None))
-        self.assertTrue(self.server.has_capture_subscriber())
-        self.assertTrue(self.server.is_trace_capture())
-
-        self.server.notify_capture("", final=True)
-        self.assertFalse(self.server.has_capture_subscriber())
 
     def test_disconnect_sends_cancel(self):
         def record_after_start(action, language):

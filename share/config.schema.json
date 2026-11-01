@@ -5,29 +5,6 @@
   "description": "Configuration schema for hyprwhspr speech-to-text system",
   "type": "object",
   "additionalProperties": true,
-  "$defs": {
-    "ydotoolModifierKey": {
-      "oneOf": [
-        {
-          "type": "string",
-          "minLength": 1,
-          "description": "Physical key name such as capslock, rightmeta, or KEY_CAPSLOCK; decimal strings are interpreted as Linux evdev keycodes."
-        },
-        {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 767,
-          "description": "Linux evdev keycode."
-        }
-      ]
-    }
-  },
-  "patternProperties": {
-    "^whisper_prompt_[a-z]{2}$": {
-      "type": "string",
-      "description": "Prompt used when transcribing this language, eg whisper_prompt_de"
-    }
-  },
   "properties": {
     "$schema": {
       "type": "string",
@@ -64,10 +41,10 @@
       "default": false,
       "description": "Exclusive keyboard grab. False is safer; true suppresses shortcut from other apps. Disable for compatibility with keyboard remappers (keyd, kmonad)."
     },
-    "external_bindings": {
+    "use_hypr_bindings": {
       "type": "boolean",
       "default": false,
-      "description": "Disable hyprwhspr's keyboard shortcuts; a compositor or hotkey daemon bound to `hyprwhspr record toggle` drives recording instead. Formerly use_hypr_bindings."
+      "description": "Use Hyprland compositor bindings instead of evdev (disables GlobalShortcuts)"
     },
     "selected_device_path": {
       "type": ["string", "null"],
@@ -93,22 +70,17 @@
     "audio_device_id": {
       "type": ["integer", "string", "null"],
       "default": null,
-      "description": "PortAudio device index, or a PulseAudio/PipeWire source name (from `pactl list short sources`). The index can change on reboot; a source name is captured through the sound server, keeping any processing applied to it."
+      "description": "PortAudio device index, or a PulseAudio/PipeWire source name (from `pactl list short sources`). The index can change on reboot; the source name is matched against PortAudio devices."
     },
     "audio_device_name": {
       "type": ["string", "null"],
       "default": null,
-      "description": "Device or source name substring (more stable across reboots); a full PulseAudio/PipeWire source name is also accepted. Captured through the sound server so EasyEffects/noise suppression still apply. Prefix with `hw:` to open raw ALSA hardware instead, bypassing all sound-server processing."
+      "description": "PortAudio/PulseAudio device-name substring (more stable across reboots). A PulseAudio/PipeWire source name is also accepted."
     },
     "audio_device_vendor_id": {
       "type": ["string", "null"],
       "default": null,
       "description": "USB vendor ID for audio device (most stable identifier, from udev)"
-    },
-    "debug_recordings": {
-      "type": "boolean",
-      "default": false,
-      "description": "Keep the last 3 raw recordings in $XDG_RUNTIME_DIR/hyprwhspr/recordings for debugging bad transcriptions."
     },
     "keepalive_stream": {
       "type": "boolean",
@@ -167,31 +139,10 @@
       "default": true,
       "description": "Enable built-in speech-to-symbol replacements (e.g., 'quote' to '\"')"
     },
-    "hallucination_markers": {
-      "type": "array",
-      "items": { "type": "string" },
-      "default": [
-        "blank audio", "blank", "silence", "no speech",
-        "you", "thank you", "thanks for watching", "thank you for watching",
-        "video playback", "music", "music playing", "keyboard clicking"
-      ],
-      "description": "Stock phrases Whisper emits for non-speech audio; matching transcriptions are discarded instead of pasted"
-    },
-    "append_trailing_space": {
-      "type": ["boolean", "string"],
-      "enum": [true, false, "auto"],
-      "default": "auto",
-      "description": "Append a space after each transcription: true always, false never, 'auto' skips it when the text ends in a CJK character"
-    },
     "whisper_prompt": {
       "type": "string",
-      "default": "",
-      "description": "Prompt passed to Whisper to guide transcription style, for every language"
-    },
-    "whisper_prompt_en": {
-      "type": "string",
       "default": "Transcribe with proper capitalization, including sentence beginnings, proper nouns, titles, and standard English capitalization rules.",
-      "description": "Prompt used for English audio; add whisper_prompt_<lang> keys for other languages"
+      "description": "Prompt passed to Whisper to guide transcription style"
     },
     "task": {
       "type": "string",
@@ -221,12 +172,6 @@
       "default": false,
       "description": "True = clear clipboard after delay, false = keep clipboard contents"
     },
-    "clipboard_settle_delay": {
-      "type": "number",
-      "minimum": 0,
-      "default": 0.15,
-      "description": "Seconds between successful clipboard copy and paste; lower values may reduce compatibility."
-    },
     "clipboard_clear_delay": {
       "type": "number",
       "minimum": 0,
@@ -239,12 +184,6 @@
       "default": null,
       "description": "Paste key combination, or null to auto-detect from the focused application."
     },
-    "hyprland_paste_backend": {
-      "type": "string",
-      "enum": ["auto", "ydotool"],
-      "default": "auto",
-      "description": "Hyprland paste and auto-submit backend. auto uses native dispatch with fallbacks; ydotool uses only ydotool and reports failures without fallback. Ignored on other desktops."
-    },
     "paste_keycode_wev": {
       "type": ["integer", "null"],
       "default": null,
@@ -254,22 +193,6 @@
       "type": "integer",
       "default": 47,
       "description": "Linux evdev keycode for the paste key. Default 47 = KEY_V (QWERTY). Set to the keycode for the physical key that produces 'v' on your layout."
-    },
-    "ydotool_modifier_overrides": {
-      "type": "object",
-      "default": {},
-      "description": "Physical key overrides for logical modifiers sent by ydotool, whether selected explicitly or used as a fallback. Named keys are recommended; positive Linux evdev keycodes are accepted for advanced configurations.",
-      "properties": {
-        "ctrl": { "$ref": "#/$defs/ydotoolModifierKey" },
-        "control": { "$ref": "#/$defs/ydotoolModifierKey" },
-        "shift": { "$ref": "#/$defs/ydotoolModifierKey" },
-        "alt": { "$ref": "#/$defs/ydotoolModifierKey" },
-        "super": { "$ref": "#/$defs/ydotoolModifierKey" },
-        "cmd": { "$ref": "#/$defs/ydotoolModifierKey" },
-        "meta": { "$ref": "#/$defs/ydotoolModifierKey" },
-        "logo": { "$ref": "#/$defs/ydotoolModifierKey" }
-      },
-      "additionalProperties": false
     },
     "applications": {
       "type": "object",
@@ -312,58 +235,14 @@
     },
     "transcription_backend": {
       "type": "string",
-      "enum": ["pywhispercpp", "cpu", "nvidia", "vulkan", "amd", "rest-api", "realtime-ws", "onnx-asr", "parakeet-cpp", "faster-whisper", "cohere-transcribe", "qwen3-asr"],
+      "enum": ["pywhispercpp", "cpu", "nvidia", "vulkan", "amd", "rest-api", "realtime-ws", "onnx-asr", "faster-whisper", "cohere-transcribe"],
       "default": "pywhispercpp",
       "description": "Transcription backend to use"
-    },
-    "parakeet_cpp_device": {
-      "type": "string",
-      "enum": ["auto", "cpu", "vulkan"],
-      "default": "auto",
-      "description": "Experimental Parakeet.cpp runtime; auto preserves a compatible installed runtime."
-    },
-    "qwen3_asr_model": {
-      "type": "string",
-      "enum": ["1.7b-q8_0", "0.6b-q8_0"],
-      "default": "1.7b-q8_0",
-      "description": "Qwen3-ASR GGUF decoder/projector pair"
-    },
-    "qwen3_asr_device": {
-      "type": "string",
-      "enum": ["auto", "cpu", "vulkan"],
-      "default": "auto",
-      "description": "llama.cpp runtime variant; auto prefers an installed runtime, then a hardware Vulkan GPU, then CPU"
-    },
-    "qwen3_asr_timeout": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 600,
-      "default": 180,
-      "description": "Qwen3-ASR sidecar request timeout in seconds"
-    },
-    "qwen3_asr_ctx_size": {
-      "type": ["integer", "null"],
-      "minimum": 512,
-      "maximum": 65536,
-      "default": 8192,
-      "description": "Qwen3-ASR llama-server context size in tokens; null keeps llama.cpp's default (32000). The KV cache (~112 KiB/token for the 1.7B model) scales with this"
     },
     "rest_endpoint_url": {
       "type": ["string", "null"],
       "default": null,
       "description": "Full HTTP or HTTPS URL for remote transcription endpoint"
-    },
-    "rest_fallback_endpoint_urls": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "format": "uri",
-        "pattern": "^https?://",
-        "minLength": 1
-      },
-      "uniqueItems": true,
-      "default": [],
-      "description": "Ordered mirror URLs of rest_endpoint_url, tried when an endpoint is unreachable or returns HTTP 429/5xx"
     },
     "rest_api_provider": {
       "type": ["string", "null"],
@@ -402,47 +281,17 @@
     "websocket_provider": {
       "type": ["string", "null"],
       "default": null,
-      "description": "Provider identifier for WebSocket credential lookup (e.g., 'openai', 'google', 'elevenlabs')"
+      "description": "Provider/protocol identifier for WebSocket transcription (e.g., 'openai', 'google', 'elevenlabs', 'realtimestt')"
     },
     "websocket_model": {
       "type": ["string", "null"],
       "default": null,
-      "description": "Model identifier for WebSocket backend (e.g., 'gpt-transcribe', 'gemini-3.1-flash-live-preview')"
+      "description": "Model identifier for WebSocket backend (e.g., 'gpt-realtime-whisper'). Optional when the RealtimeSTT server owns model selection."
     },
     "websocket_url": {
       "type": ["string", "null"],
       "default": null,
       "description": "Explicit WebSocket URL (auto-derived from provider if null)"
-    },
-    "websocket_protocol": {
-      "type": ["string", "null"],
-      "enum": ["openai-realtime", "phonon", "gemini-live", "elevenlabs", null],
-      "default": null,
-      "description": "Custom server protocol. null = openai-realtime."
-    },
-    "websocket_sample_rate": {
-      "type": ["integer", "null"],
-      "minimum": 8000,
-      "maximum": 96000,
-      "default": null,
-      "description": "Custom server audio rate. null = protocol default."
-    },
-    "websocket_session_format": {
-      "type": ["string", "null"],
-      "enum": ["nested", "flat", null],
-      "default": null,
-      "description": "Custom openai-realtime session shape. flat for older servers (NeMo-Speech.cpp); transcribe only."
-    },
-    "realtime_live_typing": {
-      "type": "boolean",
-      "default": false,
-      "description": "Experimental: type words while you speak. Needs an append_only model."
-    },
-    "websocket_live_text": {
-      "type": ["string", "null"],
-      "enum": ["none", "revisable", "append_only", null],
-      "default": null,
-      "description": "Custom server live text. revisable: OSD preview. append_only: words never change; enables live typing."
     },
     "realtime_timeout": {
       "type": "integer",
@@ -462,23 +311,11 @@
       "default": "transcribe",
       "description": "'transcribe' for speech-to-text, 'converse' for voice-to-AI"
     },
-    "realtime_transcription_session_type": {
-      "type": "string",
-      "enum": ["transcription", "realtime"],
-      "default": "transcription",
-      "description": "Transcribe-mode session type; 'realtime' for proxies that demand it"
-    },
     "realtime_transcription_delay": {
       "type": "string",
       "enum": ["minimal", "low", "medium", "high", "xhigh"],
       "default": "low",
-      "description": "Latency/accuracy delay setting for OpenAI continuous transcription models"
-    },
-    "realtime_conversation_history": {
-      "type": "string",
-      "enum": ["session", "turn"],
-      "default": "turn",
-      "description": "OpenAI Realtime converse history: retain the session or delete completed turns"
+      "description": "Latency/accuracy delay setting for OpenAI gpt-realtime-whisper transcription"
     },
     "pywhispercpp_use_vad": {
       "type": "boolean",
@@ -488,13 +325,13 @@
     "onnx_asr_model": {
       "type": "string",
       "default": "nemo-parakeet-tdt-0.6b-v3",
-      "description": "ONNX ASR model name: Parakeet v3 (default), orukeet (optional INT8 fine-tune), or a custom model"
+      "description": "ONNX ASR model name (CPU-optimized)"
     },
     "onnx_asr_quantization": {
       "type": ["string", "null"],
       "enum": ["int8", null],
       "default": "int8",
-      "description": "Quantization mode for ONNX ASR. 'int8' (default) or null for FP32. Orukeet ignores this."
+      "description": "Quantization mode for ONNX ASR. 'int8' for CPU performance, null for fp32."
     },
     "onnx_asr_use_vad": {
       "type": "boolean",
@@ -522,7 +359,7 @@
       "type": "string",
       "enum": ["auto", "int8", "float16", "int8_float16", "float32"],
       "default": "auto",
-      "description": "'auto' uses int8 on CUDA and CPU. float16 (CUDA) or float32 trade memory for precision."
+      "description": "'auto' uses int8 on CUDA, float32 on CPU. Set to 'int8' explicitly on CPU for faster inference at some accuracy cost."
     },
     "faster_whisper_vad_filter": {
       "type": "boolean",
@@ -601,14 +438,125 @@
     },
     "mic_osd_style": {
       "type": "string",
-      "enum": ["waveform", "vu_meter", "pill"],
+      "enum": ["waveform", "vu_meter", "pill", "spectrum"],
       "default": "waveform",
-      "description": "Visualization style for the mic OSD overlay. 'waveform' shows the full themed waveform with transcript preview, 'vu_meter' a VU meter, and 'pill' a compact monochrome status pill with optional live transcript. Restart the service after changing."
+      "description": "Visualization style for the mic OSD overlay. 'waveform' shows the full themed waveform, 'vu_meter' a VU meter, 'pill' a compact monochrome status pill, and 'spectrum' a mirrored frequency display. Restart the service after changing."
+    },
+    "mic_osd_bottom_margin": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2000,
+      "default": 130,
+      "description": "Distance in pixels between the bottom edge of the layer-shell OSD and the screen edge. Hot-reloaded by the OSD."
+    },
+    "mic_osd_spectrum_width": {
+      "type": "integer",
+      "minimum": 280,
+      "maximum": 1600,
+      "default": 520,
+      "description": "Width in pixels of the spectrum OSD. Hot-reloaded by the OSD."
+    },
+    "mic_osd_spectrum_meter_height": {
+      "type": "integer",
+      "minimum": 44,
+      "maximum": 360,
+      "default": 86,
+      "description": "Fixed height in pixels reserved for spectrum bars. Transcript lines dynamically add height below it. Hot-reloaded by the OSD."
+    },
+    "mic_osd_spectrum_background_opacity": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.46,
+      "description": "Spectrum panel background opacity. Multiplied by any alpha in the active theme background color."
+    },
+    "mic_osd_spectrum_border_opacity": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.3,
+      "description": "Spectrum panel border opacity."
+    },
+    "mic_osd_spectrum_gain": {
+      "type": "number",
+      "minimum": 0.05,
+      "maximum": 20,
+      "default": 1.35,
+      "description": "Post-analysis visual gain for spectrum bars. This does not alter recorded audio."
+    },
+    "mic_osd_spectrum_noise_floor_db": {
+      "type": "number",
+      "minimum": -120,
+      "maximum": -20,
+      "default": -72,
+      "description": "FFT level treated as the bottom of the spectrum display. Raise it to suppress ambient movement; lower it for quiet microphones."
+    },
+    "mic_osd_spectrum_peak_db": {
+      "type": "number",
+      "minimum": -80,
+      "maximum": 0,
+      "default": -24,
+      "description": "FFT level that reaches full bar height and the peak gradient color. Lower/more-negative values make the display more sensitive."
+    },
+    "mic_osd_spectrum_curve": {
+      "type": "number",
+      "minimum": 0.25,
+      "maximum": 4,
+      "default": 1.1,
+      "description": "Spectrum response curve. Values below 1 emphasize quiet detail; values above 1 suppress it."
+    },
+    "mic_osd_spectrum_rise_ms": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1000,
+      "default": 35,
+      "description": "Attack smoothing in milliseconds. Lower values react faster; 0 is immediate."
+    },
+    "mic_osd_spectrum_fall_ms": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 2000,
+      "default": 150,
+      "description": "Decay smoothing in milliseconds. Lower values fall faster; 0 is immediate."
+    },
+    "mic_osd_transcript_font_family": {
+      "type": "string",
+      "minLength": 1,
+      "default": "sans-serif",
+      "description": "Cairo font family for the dynamically wrapped spectrum transcript."
+    },
+    "mic_osd_transcript_font_size": {
+      "type": "number",
+      "minimum": 8,
+      "maximum": 72,
+      "default": 18,
+      "description": "Font size in pixels for the dynamically wrapped spectrum transcript."
+    },
+    "mic_osd_transcript_max_lines": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30,
+      "default": 6,
+      "description": "Legacy setting retained for compatibility. Spectrum previews now grow to the available monitor-height limit rather than a fixed line count."
+    },
+    "mic_osd_transcript_line_spacing": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 3,
+      "default": 1.25,
+      "description": "Line-height multiplier for the dynamically wrapped spectrum transcript."
+    },
+    "mic_osd_transcript_opacity": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.96,
+      "description": "Opacity of dynamically wrapped transcript text."
     },
     "mic_osd_pill_transcript_enabled": {
       "type": "boolean",
       "default": false,
-      "description": "Show a live transcript above the pill OSD. Requires a realtime-ws backend that streams partial transcripts (OpenAI, ElevenLabs)."
+      "description": "Show a live transcript above the pill OSD. Requires a realtime-ws backend that streams partial transcripts (OpenAI, ElevenLabs, or RealtimeSTT)."
     },
     "mic_osd_pill_transcript_word_limit": {
       "type": "integer",
@@ -635,16 +583,52 @@
       "default": true,
       "description": "Enable mute detection to cancel recording when mic is muted"
     },
+    "voxd_integration": {
+      "type": "boolean",
+      "default": false,
+      "description": "Hold a voxd input lease during actual dictation capture: pause voxd playback and request speech-input lighting. Restart required."
+    },
+    "voxd_socket": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "voxd Unix socket path. Null uses VOXD_SOCKET, then XDG_RUNTIME_DIR/voxd.sock or /tmp/voxd-<uid>.sock. Restart required."
+    },
+    "audio_ducking_hooks": {
+      "type": "array",
+      "default": [],
+      "description": "Independent background commands tied to recording. Session mode uses recording heartbeats and EOF; persistent mode adds idle state and ready/ok acknowledgements. Commands must restore on lease expiry. Restart required.",
+      "items": {
+        "type": "object",
+        "required": ["command"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string"},
+          "enabled": {"type": "boolean", "default": true},
+          "persistent": {
+            "type": "boolean",
+            "default": false,
+            "description": "Start the command while idle and reconnect in background. Requires ready/ok stdout acknowledgements and idle/recording stdin protocol."
+          },
+          "command": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+            "description": "Trusted executable and argument array, without implicit shell expansion. Use absolute paths."
+          },
+          "restore_timeout": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 60,
+            "default": 10,
+            "description": "Seconds allowed for command exit after EOF, before process-group termination."
+          }
+        }
+      }
+    },
     "audio_ducking": {
       "type": "boolean",
       "default": false,
-      "description": "Quiet other audio during recording"
-    },
-    "audio_ducking_mode": {
-      "type": "string",
-      "enum": ["duck", "pause"],
-      "default": "duck",
-      "description": "How to quiet other audio: 'duck' lowers every application stream's volume; 'pause' pauses MPRIS media players (browser, Spotify, mpv) and resumes them afterwards, ducking only what is left"
+      "description": "Reduce system volume during recording"
     },
     "audio_ducking_percent": {
       "type": "integer",
@@ -694,14 +678,7 @@
       "minimum": 0,
       "maximum": 30,
       "default": 0,
-      "description": "Auto-stop recording after this many seconds of silence in toggle/auto/continuous modes. 0 (default) = disabled. The timer only arms after speech is detected, so it won't fire while you compose your first sentence."
-    },
-    "push_to_talk_lock_seconds": {
-      "type": "number",
-      "minimum": 0,
-      "maximum": 30,
-      "default": 0.0,
-      "description": "Push-to-talk hold-to-lock: hold the key this many seconds and the recording latches on (hands-free). The next press ends it. External bindings must send `release` on key-up (`stop` never latches). 0 (default) = disabled, classic push-to-talk."
+      "description": "Auto-stop recording after this many seconds of silence in toggle/auto modes. 0 (default) = disabled. The timer only arms after speech is detected, so it won't fire while you compose your first sentence."
     }
   }
 }

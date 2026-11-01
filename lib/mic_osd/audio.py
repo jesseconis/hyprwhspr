@@ -13,17 +13,10 @@ import time
 import threading
 import numpy as np
 
-# Imported on first AudioMonitor: it starts PortAudio, whose exit-time
-# Pa_Terminate can abort on a broken stream (#282). Feed-only runs skip it.
-sd = None
-
-
-def _load_sounddevice():
-    global sd
-    if sd is None:
-        import sounddevice
-        sd = sounddevice
-    return sd
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
 
 
 class FeedLevelSource:
@@ -106,6 +99,9 @@ class AudioMonitor:
             samplerate: Audio sample rate in Hz
             blocksize: Number of samples per callback
         """
+        if sd is None:
+            raise ImportError("sounddevice is required for audio monitoring")
+        
         self.callback = callback
         self.samplerate = samplerate
         self.blocksize = blocksize
@@ -140,14 +136,14 @@ class AudioMonitor:
     def get_default_device(self):
         """Get info about the default input device."""
         try:
-            return _load_sounddevice().query_devices(kind='input')
+            return sd.query_devices(kind='input')
         except Exception as e:
             return {"name": f"Error: {e}"}
     
     def list_devices(self):
         """List all available audio input devices."""
         devices = []
-        for i, dev in enumerate(_load_sounddevice().query_devices()):
+        for i, dev in enumerate(sd.query_devices()):
             if dev['max_input_channels'] > 0:
                 devices.append({
                     'index': i,
@@ -166,11 +162,6 @@ class AudioMonitor:
         """
         if self.running:
             return
-
-        try:
-            sd = _load_sounddevice()
-        except (ImportError, OSError) as e:
-            raise RuntimeError(f"sounddevice unavailable: {e}")
 
         # Use the device's native rate; a hardcoded 44100 fails with
         # PaErrorCode -9997 on 48 kHz-only hardware (issue #205).
@@ -203,22 +194,13 @@ class AudioMonitor:
         self.running = False
         
         if self.stream:
-            stream, self.stream = self.stream, None
-
-            # Off-thread so a broken stream can't hang shutdown; stop() must
-            # finish before close() (#282)
-            def teardown():
-                try:
-                    stream.stop()
-                except Exception:
-                    pass
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-            worker = threading.Thread(target=teardown, daemon=True)
-            worker.start()
-            worker.join(timeout=2.0)
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            finally:
+                self.stream = None
         
         # Reset levels
         with self._lock:

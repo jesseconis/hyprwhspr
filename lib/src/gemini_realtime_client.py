@@ -89,8 +89,7 @@ class GeminiRealtimeClient(WebSocketRealtimeClientBase):
         # Send setup message
         setup_message = {'setup': setup_config}
         try:
-            with self._ws_send_lock:
-                ws.send(json.dumps(setup_message))
+            ws.send(json.dumps(setup_message))
             self._log('Config sent')
         except Exception as e:
             self._log(f'Failed to send config: {e}')
@@ -217,8 +216,7 @@ class GeminiRealtimeClient(WebSocketRealtimeClientBase):
             pcm_bytes = self._float32_to_pcm16(silence)
             base64_audio = base64.b64encode(pcm_bytes).decode('utf-8')
 
-            with self._ws_send_lock:
-                self.ws.send(json.dumps(self._audio_ws_message(base64_audio)))
+            self.ws.send(json.dumps(self._audio_ws_message(base64_audio)))
             self._log('Sent silence tail for VAD flush')
         except Exception as e:
             self._log(f'Failed to send silence tail: {e}')

@@ -10,16 +10,6 @@ import time
 from typing import Optional, Callable
 
 try:
-    from .installation import require_supported_backend
-except ImportError:
-    from installation import require_supported_backend
-
-try:
-    from .service_log import log
-except ImportError:
-    from service_log import log
-
-try:
     from .dependencies import require_package
 except ImportError:
     from dependencies import require_package
@@ -32,9 +22,9 @@ except ImportError:
     from config_manager import ConfigManager
 
 try:
-    from .backend_utils import normalize_backend, redact_url, release_memory
+    from .backend_utils import normalize_backend
 except ImportError:
-    from backend_utils import normalize_backend, redact_url, release_memory
+    from backend_utils import normalize_backend
 
 try:
     from .backend_installer import PYWHISPERCPP_MODELS_DIR
@@ -64,8 +54,6 @@ class WhisperManager:
         # Realtime partial-preview callback; owned by the manager (not the
         # realtime backend) so it survives backend re-creation on resume
         self._realtime_partial_callback = None
-        # Structured live-text listener (committed, tail) for live typing
-        self._realtime_live_listener = None
 
         # Thread safety for model operations
         # Serializes local model use and backend replacement.  An RLock keeps
@@ -120,7 +108,6 @@ class WhisperManager:
             self.temp_dir = self.config.get_temp_directory()
 
             backend = self._current_backend_name()
-            require_supported_backend(backend)
 
             # pywhispercpp hardware variants (cpu/nvidia/vulkan) and unknown
             # names fall back to the default pywhispercpp backend
@@ -134,90 +121,57 @@ class WhisperManager:
                 try:
                     old.cleanup()
                 except Exception as e:
-                    log(f"[WARN] Failed to clean up previous backend: {e}")
+                    print(f"[WARN] Failed to clean up previous backend: {e}", flush=True)
 
             self._backend = backend_cls(self)
             initialized = self._backend.initialize()
-            if initialized and self._backend.streams_audio:
+            if initialized and self._backend.name == 'realtime-ws':
                 self._backend.apply_partial_callback(
                     self._realtime_partial_callback
                 )
             return initialized
 
         except Exception as e:
-            log(f"ERROR: Failed to initialize Whisper manager: {e}")
+            print(f"ERROR: Failed to initialize Whisper manager: {e}")
             return False
 
     def get_realtime_streaming_callback(self) -> Optional[Callable]:
-        """Audio-chunk callback of a streaming backend (realtime-ws), else None."""
-        backend = self._backend
-        return backend.get_streaming_callback() if backend is not None else None
+        """
+        Get the streaming callback for realtime-ws backend.
 
-    def realtime_connect_failure(self) -> Optional[str]:
-        """Why realtime recovery last failed ('connecting'/'cooldown'/'failed'), else None.
-
-        Reads the backend directly rather than _active_realtime_backend(), which
-        excludes exactly the torn-down case we most need to explain.
+        Returns:
+            Callback function if realtime-ws backend is active, None otherwise
         """
         backend = self._backend
-        return backend.last_connect_failure if backend is not None else None
+        if backend is not None and backend.name == 'realtime-ws':
+            return backend.get_streaming_callback()
+        return None
 
     def _active_realtime_backend(self):
-        """The streaming backend when it has a live client, else None."""
+        """The realtime-ws backend when it has a live client, else None."""
         backend = self._backend
-        if backend is not None and backend.streams_audio and backend.is_loaded:
+        if (backend is not None and backend.name == 'realtime-ws'
+                and backend.is_loaded):
             return backend
         return None
 
     def realtime_client_missing(self) -> bool:
-        """True when the streaming backend has no client (destructive close)."""
+        """True when the configured realtime-ws backend has no client (destructive close)."""
         backend = self._backend
-        return backend is not None and backend.streams_audio and not backend.is_loaded
-
-    def set_realtime_live_listener(self, listener) -> None:
-        """Set the listener for structured live text (committed, tail)."""
-        self._realtime_live_listener = listener
-        backend = self._backend
-        if backend is not None and backend.streams_audio:
-            backend.apply_live_listener(listener)
-
-    def realtime_live_typing_supported(self) -> bool:
-        """The active realtime model's live text is append-only."""
-        backend = self._active_realtime_backend()
-        return bool(backend is not None and backend.live_typing_supported)
-
-    def realtime_busy(self) -> bool:
-        """True while a one-stream-per-recording client still finishes the last recording."""
-        backend = self._active_realtime_backend()
-        return bool(backend is not None and backend.is_busy)
+        return (backend is not None and backend.name == 'realtime-ws'
+                and not backend.is_loaded)
 
     def set_realtime_partial_callback(self, callback: Optional[Callable[[str], None]]) -> None:
         """Set callback for realtime partial transcript previews."""
         self._realtime_partial_callback = callback
         backend = self._backend
-        if backend is not None:
+        if backend is not None and backend.name == 'realtime-ws':
             backend.apply_partial_callback(callback)
-
-    def configured_backend_loads_in_background(self) -> bool:
-        """Whether the configured backend's load can outlast startup (read from its class)."""
-        return BACKENDS.get(self._current_backend_name(), PywhispercppBackend).loads_in_background
 
     def _current_backend_name(self) -> str:
         """Normalized name of the configured transcription backend."""
         return normalize_backend(
             self.config.get_setting('transcription_backend', 'pywhispercpp'))
-
-    def active_backend_is_local(self) -> bool:
-        """True when the active backend runs a local model (vs. a remote API/WebSocket).
-
-        Falls back to the configured backend name when no backend object exists
-        yet, so callers can classify a backend that failed to initialize.
-        """
-        backend = self._backend
-        if backend is not None:
-            return backend.is_local
-        backend_cls = BACKENDS.get(self._current_backend_name())
-        return backend_cls.is_local if backend_cls is not None else True
 
     def update_realtime_language(self, language: Optional[str]) -> None:
         """Apply a language override to a connected realtime client (no-op otherwise)."""
@@ -236,7 +190,7 @@ class WhisperManager:
         backend = self._active_realtime_backend()
         if backend:
             note = f' ({reason})' if reason else ''
-            log(f'[CLEANUP] Closing realtime WebSocket{note}')
+            print(f'[CLEANUP] Closing realtime WebSocket{note}', flush=True)
             backend.close()
 
     def reinitialize_after_resume(self, only_if_idle: bool = False) -> bool:
@@ -259,7 +213,7 @@ class WhisperManager:
             idle = time.monotonic() - self._last_use_time
             if not (idle > 1800 and self._last_use_time > 0):
                 return True
-            log(f"[RECOVERY] Reinitializing {self._current_backend_name()} model after audio recovery (suspend/resume detected)")
+            print(f"[RECOVERY] Reinitializing {self._current_backend_name()} model after audio recovery (suspend/resume detected)", flush=True)
 
         return backend.reinitialize()
 
@@ -285,23 +239,23 @@ class WhisperManager:
 
         # Check if we have valid audio data
         if audio_data is None:
-            log("No audio data provided to transcribe")
+            print("No audio data provided to transcribe", flush=True)
             return ""
 
         if len(audio_data) == 0:
-            log("Empty audio data provided to transcribe")
+            print("Empty audio data provided to transcribe", flush=True)
             return ""
 
         # Validate audio data format and content
         try:
             # Ensure it's a numpy array
             if not isinstance(audio_data, np.ndarray):
-                log(f"Invalid audio data type: {type(audio_data)}, expected numpy.ndarray")
+                print(f"Invalid audio data type: {type(audio_data)}, expected numpy.ndarray", flush=True)
                 return ""
             
             # Check shape (should be 1D)
             if audio_data.ndim != 1:
-                log(f"Invalid audio data shape: {audio_data.shape}, expected 1D array")
+                print(f"Invalid audio data shape: {audio_data.shape}, expected 1D array", flush=True)
                 # Try to flatten if 2D with single channel
                 if audio_data.ndim == 2 and audio_data.shape[1] == 1:
                     audio_data = audio_data.flatten()
@@ -310,7 +264,7 @@ class WhisperManager:
             
             # Check dtype (should be float32)
             if audio_data.dtype != np.float32:
-                log(f"Converting audio data from {audio_data.dtype} to float32")
+                print(f"Converting audio data from {audio_data.dtype} to float32", flush=True)
                 audio_data = audio_data.astype(np.float32)
             
             # Ensure contiguous in memory (required by whisper C++ code)
@@ -319,28 +273,28 @@ class WhisperManager:
             
             # Check for NaN or inf values (invalid audio)
             if np.any(np.isnan(audio_data)) or np.any(np.isinf(audio_data)):
-                log("Audio data contains NaN or inf values - invalid")
+                print("Audio data contains NaN or inf values - invalid", flush=True)
                 return ""
             
             # Check if audio is all zeros (silence)
             if np.all(audio_data == 0.0):
-                log("Audio data is all zeros (silence) - skipping transcription")
+                print("Audio data is all zeros (silence) - skipping transcription", flush=True)
                 return ""
 
             # Check if audio is too short (less than 0.1 seconds)
             min_samples = int(sample_rate * 0.1)  # 0.1 seconds minimum
             if len(audio_data) < min_samples:
-                log(f"Audio too short: {len(audio_data)} samples (minimum {min_samples})")
+                print(f"Audio too short: {len(audio_data)} samples (minimum {min_samples})", flush=True)
                 return ""
             
             # Check audio level (RMS) - if too quiet, might be invalid
             rms = np.sqrt(np.mean(audio_data**2))
             if rms < 1e-6:  # Extremely quiet
-                log(f"Audio level too low (RMS: {rms:.2e}) - likely invalid")
+                print(f"Audio level too low (RMS: {rms:.2e}) - likely invalid", flush=True)
                 return ""
                 
         except Exception as e:
-            log(f"[ERROR] Audio data validation failed: {e}")
+            print(f"[ERROR] Audio data validation failed: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return ""
@@ -362,12 +316,12 @@ class WhisperManager:
             # this just commits and waits for the result
             active = self._backend
             if active is None:
-                log('[REALTIME] Backend not initialized')
+                print('[REALTIME] Backend not initialized', flush=True)
                 return ""
             return active.transcribe(audio_data, sample_rate, language_override=language_override)
 
         if self._backend is None:
-            log('[ERROR] No transcription backend initialized')
+            print('[ERROR] No transcription backend initialized', flush=True)
             return ""
 
         # Use model lock to prevent concurrent transcription calls and
@@ -395,9 +349,9 @@ class WhisperManager:
             return True
         reinit = self._backend.reinitialize
 
-        log(f"[MODEL] Long idle detected - reinitializing {backend} model (suspend/resume likely)")
+        print(f"[MODEL] Long idle detected - reinitializing {backend} model (suspend/resume likely)", flush=True)
         if not reinit():
-            log("[MODEL] Reinitialization failed, transcription may fail")
+            print("[MODEL] Reinitialization failed, transcription may fail", flush=True)
             return False
         return True
 
@@ -418,7 +372,7 @@ class WhisperManager:
         """
         backend = normalize_backend(self.config.get_setting('transcription_backend', 'pywhispercpp'))
         if backend in ('rest-api', 'realtime-ws'):
-            log("[MODEL] Unload not applicable for non-local backend")
+            print("[MODEL] Unload not applicable for non-local backend", flush=True)
             return False
 
         with self._model_lock:
@@ -426,16 +380,26 @@ class WhisperManager:
                 if self._backend is not None:
                     self._backend.unload()
 
-                if release_memory():
-                    log("[MODEL] CUDA cache cleared")
+                # Trigger Python GC so C++ destructors and ONNX sessions release immediately
+                import gc
+                gc.collect()
+
+                # Free cached CUDA allocations if torch is present
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        print("[MODEL] CUDA cache cleared", flush=True)
+                except ImportError:
+                    pass
 
                 self.ready = False
                 self._model_manually_unloaded = True
-                log("[MODEL] Model unloaded from memory — GPU resources freed")
+                print("[MODEL] Model unloaded from memory — GPU resources freed", flush=True)
                 return True
 
             except Exception as e:
-                log(f"[MODEL] ERROR: Failed to unload model: {e}")
+                print(f"[MODEL] ERROR: Failed to unload model: {e}", flush=True)
                 return False
 
     def reload_model(self) -> bool:
@@ -445,23 +409,23 @@ class WhisperManager:
         Returns:
             True if model loaded successfully, False otherwise.
         """
-        log("[MODEL] Reloading model...")
+        print("[MODEL] Reloading model...", flush=True)
         result = self.initialize()
         if result:
             # Clear the flag only after initialize() fully completes so that
             # _start_recording()'s guard stays active until the model is ready.
             with self._model_lock:
                 self._model_manually_unloaded = False
-            log("[MODEL] Model reloaded successfully")
+            print("[MODEL] Model reloaded successfully", flush=True)
         else:
-            log("[MODEL] ERROR: Failed to reload model")
+            print("[MODEL] ERROR: Failed to reload model", flush=True)
         return result
 
     def set_threads(self, num_threads: int) -> bool:
         """Update the number of threads used by the backend."""
         set_threads = getattr(self._backend, 'set_threads', None)
         if set_threads is None:
-            log("ERROR: Backend does not support changing threads")
+            print("ERROR: Backend does not support changing threads")
             return False
         with self._model_lock:
             return set_threads(int(num_threads))
@@ -478,8 +442,8 @@ class WhisperManager:
         """
         set_model = getattr(self._backend, 'set_model', None)
         if set_model is None:
-            log("ERROR: Cannot change model when using REST API backend - switch to pywhispercpp")
-            log("Model selection is handled by the REST API endpoint")
+            print("ERROR: Cannot change model when using REST API backend - switch to pywhispercpp")
+            print("Model selection is handled by the REST API endpoint")
             return False
         with self._model_lock:
             return set_model(model_name)
@@ -523,10 +487,7 @@ class WhisperManager:
         backend = self._current_backend_name()
 
         if backend == 'rest-api':
-            endpoint_url = redact_url(self.config.get_setting('rest_endpoint_url')) or 'not configured'
-            fallbacks = self.config.get_setting('rest_fallback_endpoint_urls', [])
-            if isinstance(fallbacks, list) and fallbacks:
-                return f"REST API ({endpoint_url}, +{len(fallbacks)} fallback{'s' if len(fallbacks) > 1 else ''})"
+            endpoint_url = self.config.get_setting('rest_endpoint_url', 'not configured')
             return f"REST API ({endpoint_url})"
         if backend not in BACKENDS:
             # pywhispercpp hardware variants (cpu/nvidia/vulkan)

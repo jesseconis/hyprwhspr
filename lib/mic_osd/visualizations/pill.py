@@ -6,7 +6,7 @@ import time
 import cairo
 import numpy as np
 
-from .base import AutoGain, BaseVisualization, StateManager, VisualizerState
+from .base import BaseVisualization, StateManager, VisualizerState
 
 
 class PillVisualization(BaseVisualization):
@@ -42,8 +42,6 @@ class PillVisualization(BaseVisualization):
         self.bar_heights = np.zeros(self.num_bars, dtype=np.float64)
         self.state_manager = StateManager()
         self._last_update = time.monotonic()
-        # INPUT_GAIN was the old fixed value, now the floor for hot mics
-        self.auto_gain = AutoGain(min_gain=self.INPUT_GAIN, noise_floor=0.002)
 
     @staticmethod
     def _rounded_rect(cr: cairo.Context, x: float, y: float, width: float,
@@ -85,23 +83,12 @@ class PillVisualization(BaseVisualization):
 
         if state == VisualizerState.RECORDING:
             audio = self._resample(samples, self.num_bars)
-            # level is pre-scaled (raw RMS x10), so this substitute is on a
-            # different scale than the buckets — keep it out of the gain
-            # envelope, which would read it as a 10x louder mic.
-            from_samples = bool(np.any(audio))
-            if not from_samples:
+            if not np.any(audio):
                 audio[:] = max(0.0, float(level))
 
-            # Gate mic noise out of the RMS feed, then compress so speech fills
-            # the pill. Both track the input's own level: a fixed gate would
-            # swallow a quiet mic whole, whose speech sits under it.
-            if from_samples:
-                gain = self.auto_gain.update(float(audio.max()))
-                gate = self.auto_gain.gate(self.NOISE_GATE)
-            else:
-                gain, gate = self.INPUT_GAIN, self.NOISE_GATE
+            # Gate mic noise out of the RMS feed, then compress so speech fills the pill.
             energy = np.sqrt(np.clip(
-                np.maximum(audio - gate, 0.0) * gain,
+                np.maximum(audio - self.NOISE_GATE, 0.0) * self.INPUT_GAIN,
                 0.0,
                 1.0,
             ))

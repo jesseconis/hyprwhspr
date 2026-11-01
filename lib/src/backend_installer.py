@@ -6,19 +6,13 @@ Handles installation of pywhispercpp backends (CPU/NVIDIA/AMD)
 import os
 import sys
 import json
-import platform
 import subprocess
-import tempfile
 import hashlib
 import shutil
-import glob
-import re
 import urllib.request
 import uuid
-import tarfile
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict
 
 # Import output control system
 try:
@@ -50,18 +44,6 @@ try:
 except ImportError:
     from nvidia_probe import responding_gpu_listing
 
-try:
-    from . import visualizer_runtime
-except ImportError:
-    import visualizer_runtime
-
-try:
-    from . import qwen3_asr_runtime
-    from .qwen3_asr_runtime import QWEN3_ASR_MODELS, QWEN3_ASR_MODELS_DIR
-except ImportError:
-    import qwen3_asr_runtime
-    from qwen3_asr_runtime import QWEN3_ASR_MODELS, QWEN3_ASR_MODELS_DIR
-
 
 def run_sudo_command(cmd: list, check: bool = True, input_data: Optional[bytes] = None,
                      verbose: Optional[bool] = None) -> subprocess.CompletedProcess:
@@ -88,19 +70,17 @@ if '.local/share/mise' in sys.executable:
                 HYPRWHSPR_ROOT = '/usr/lib/hyprwhspr'
 
 USER_BASE = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local' / 'share')) / 'hyprwhspr'
-VENV_DIR = Path(os.environ['HYPRWHSPR_BACKEND_ENV']) if os.environ.get('HYPRWHSPR_BACKEND_ENV') else USER_BASE / 'venv'
+VENV_DIR = USER_BASE / 'venv'
 PYWHISPERCPP_MODELS_DIR = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local' / 'share')) / 'pywhispercpp' / 'models'
 STATE_DIR = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local' / 'state')) / 'hyprwhspr'
 STATE_FILE = STATE_DIR / 'install-state.json'
 PYWHISPERCPP_SRC_DIR = USER_BASE / 'pywhispercpp-src'
-PYWHISPERCPP_PINNED_COMMIT = "f7bf62118c0a33a43cf8aabb58eef16cea5d16c4"
+PYWHISPERCPP_PINNED_COMMIT = "294e1e15f1fa3991aaa8db5f5e9afb97ade5ba5f"
 
 # Pre-built wheel configuration
 WHEEL_BASE_URL = "https://github.com/goodroot/hyprwhspr/releases/download/wheels-v2"
 WHEEL_CACHE_DIR = USER_BASE / 'wheel-cache'
-PYWHISPERCPP_VERSION = "1.5.1"
-# Wheel build tag; bump to publish a rebuilt wheel of the same version
-PYWHISPERCPP_WHEEL_BUILD = 1
+PYWHISPERCPP_VERSION = "1.5.0"
 
 
 class DependencyPlanError(RuntimeError):
@@ -153,16 +133,6 @@ def resolve_dependency_plan(backend: str, provider: Optional[str] = None,
                          accelerated_variant, DependencyPlanError)
 
 
-def dependency_required_imports(backend: str, provider: Optional[str] = None,
-                                accelerated_variant: Optional[str] = None) -> tuple:
-    """Return a plan's required imports without touching the manifest files.
-
-    Health checks need this list even on an install whose requirements files
-    are missing, where the full plan resolution cannot be completed.
-    """
-    return _PLAN_SPECS[_plan_key(backend, provider, accelerated_variant)][1]
-
-
 def dependency_manifests(backend: str, provider: Optional[str] = None) -> list[Path]:
     """Compatibility wrapper returning the selected manifest include closure."""
     return list(resolve_dependency_plan(backend, provider).manifests)
@@ -182,14 +152,6 @@ def _safe_decode(output) -> str:
 
 # Maximum Python version compatible with ML packages (onnxruntime, etc.)
 MAX_COMPATIBLE_PYTHON = (3, 14)
-SYSTEM_PYTHON_CANDIDATES = (
-    '/usr/bin/python3',
-    '/usr/bin/python',
-    '/bin/python3',
-    '/bin/python',
-    '/usr/local/bin/python3',
-    '/usr/local/bin/python',
-)
 
 
 def _get_python_version(python_path: str) -> Optional[Tuple[int, int]]:
@@ -262,10 +224,9 @@ def _find_compatible_python(max_version: Tuple[int, int] = MAX_COMPATIBLE_PYTHON
     Find a compatible Python for venv creation.
 
     Fallback chain:
-    1. Ordered unversioned system candidates if compatible
-    2. Versioned Python 3 executables from max_version down to 3.11
-    3. The current interpreter, but only when it is not environment-managed
-    4. Error with actionable guidance
+    1. System python3 if version <= max_version
+    2. python3.14, python3.13, python3.12, python3.11 in /usr/bin, /usr/local/bin
+    3. Error with actionable message
 
     Args:
         max_version: Maximum allowed Python version as (major, minor) tuple
@@ -276,32 +237,36 @@ def _find_compatible_python(max_version: Tuple[int, int] = MAX_COMPATIBLE_PYTHON
     Raises:
         SystemExit if no compatible Python found
     """
-    for candidate in SYSTEM_PYTHON_CANDIDATES:
-        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+    # Check if current Python is mise-managed
+    current_is_mise = '.local/share/mise' in sys.executable
+    mise_active = _check_mise_active()
+
+    # 1. Check current/system Python
+    if mise_active or current_is_mise:
+        # Use system Python when MISE is active
+        current_python = _get_system_python()
+    else:
+        current_python = sys.executable
+
+    current_version = _get_python_version(current_python)
+    if current_version and current_version <= max_version:
+        return (current_python, f"Python {current_version[0]}.{current_version[1]}")
+
+    # 2. Search for python3.14, python3.13, python3.12, python3.11 in common paths
+    for minor in [14, 13, 12, 11]:
+        # Skip versions that are too new
+        if (3, minor) > max_version:
             continue
-        version = _get_python_version(candidate)
-        if version and version <= max_version:
-            return candidate, f"Python {version[0]}.{version[1]}"
 
-    # Rolling distributions can advance /usr/bin/python3 before ML wheels catch
-    # up while retaining a separately installed compatible interpreter.
-    if max_version[0] == 3:
-        for minor in range(max_version[1], 10, -1):
-            for prefix in ('/usr/bin', '/usr/local/bin'):
-                candidate = f'{prefix}/python3.{minor}'
-                if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
-                    continue
-                version = _get_python_version(candidate)
-                if version and version <= max_version:
-                    return candidate, f"Python {version[0]}.{version[1]}"
+        for prefix in ['/usr/bin', '/usr/local/bin']:
+            path = f"{prefix}/python3.{minor}"
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                # Verify it actually works
+                test_version = _get_python_version(path)
+                if test_version and test_version <= max_version:
+                    return (path, f"python3.{minor}")
 
-    current_version = _get_python_version(sys.executable)
-    if not _current_python_is_managed() and current_version and current_version <= max_version:
-        return sys.executable, f"Python {current_version[0]}.{current_version[1]}"
-
-    if _current_python_is_managed():
-        log_error("Only an activated or version-manager Python is available.")
-        log_error("Pass --python /path/to/python explicitly to select a managed interpreter.")
+    # 3. Error with guidance
     _python_compatibility_error(current_version)
     # _python_compatibility_error calls sys.exit, but for type checker:
     raise SystemExit(1)
@@ -330,26 +295,122 @@ def _check_mise_active() -> bool:
     return False
 
 
-def _current_python_is_managed() -> bool:
-    """Return whether implicit use of the running interpreter would be unsafe."""
-    executable = str(Path(sys.executable).resolve())
-    user_home = str(Path.home().resolve()) + os.sep
-    return bool(
-        os.environ.get('VIRTUAL_ENV')
-        or sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
-        or _check_mise_active()
-        or any(marker in executable for marker in ('/.local/share/mise/', '/.pyenv/', '/.asdf/'))
-        or executable.startswith(user_home)
-    )
-
-
 def _create_mise_free_environment() -> dict:
-    """Avoid mise command shims while preserving user pip configuration."""
-    try:
-        from .managed_install import legacy_build_env
-    except ImportError:
-        from managed_install import legacy_build_env
-    return legacy_build_env()
+    """
+    Create environment with MISE deactivated for subprocesses.
+
+    This prevents MISE from interfering with Python version detection
+    during pip install operations and venv creation.
+
+    Returns:
+        Environment dict suitable for subprocess.run(env=...)
+    """
+    env = os.environ.copy()
+
+    # Remove MISE-related environment variables
+    mise_vars = ['MISE_SHELL', '__MISE_ACTIVATE', 'MISE_DATA_DIR']
+    for var in mise_vars:
+        env.pop(var, None)
+
+    # Clean PATH of MISE entries
+    path = env.get('PATH', '')
+    if '.local/share/mise' in path:
+        paths = path.split(':')
+        paths = [p for p in paths if '.local/share/mise' not in p]
+        
+        # If all paths were filtered out, fall back to essential system paths
+        # This prevents empty PATH which would break subprocess execution
+        if not paths:
+            essential_paths = ['/usr/bin', '/usr/local/bin', '/bin', '/usr/sbin', '/sbin']
+            paths = [p for p in essential_paths if os.path.exists(p)]
+            # If even essential paths don't exist (unlikely), at least set a minimal PATH
+            if not paths:
+                paths = ['/usr/bin', '/bin']
+        
+        env['PATH'] = ':'.join(paths)
+
+    return env
+
+
+def _get_system_python() -> str:
+    """
+    Get the system Python path, avoiding mise-managed Python.
+
+    When mise is active, this function uses a mise-free environment
+    to find the actual system Python (typically /usr/bin/python3).
+
+    Returns:
+        Path to system Python executable, or sys.executable as fallback
+    """
+    # Common system Python paths (Arch Linux)
+    system_paths = ['/usr/bin/python3', '/usr/bin/python']
+    
+    # Check if current Python is mise-managed
+    current_is_mise = '.local/share/mise' in sys.executable
+    
+    # If mise is active, use mise-free environment to find system Python
+    if _check_mise_active() or current_is_mise:
+        mise_free_env = _create_mise_free_environment()
+        
+        # Try system paths first
+        for python_path in system_paths:
+            if os.path.exists(python_path) and os.access(python_path, os.X_OK):
+                # Verify it's actually Python
+                try:
+                    result = run_command(
+                        [python_path, '--version'],
+                        check=False,
+                        capture_output=True,
+                        env=mise_free_env
+                    )
+                    if result.returncode == 0:
+                        return python_path
+                except Exception:
+                    continue
+        
+        # Fallback: check additional common system paths directly
+        # (more robust than relying on 'which' command which may not be available)
+        additional_paths = [
+            '/usr/local/bin/python3',
+            '/usr/local/bin/python',
+            '/bin/python3',
+            '/bin/python'
+        ]
+        for python_path in additional_paths:
+            if os.path.exists(python_path) and os.access(python_path, os.X_OK):
+                try:
+                    result = run_command(
+                        [python_path, '--version'],
+                        check=False,
+                        capture_output=True,
+                        env=mise_free_env
+                    )
+                    if result.returncode == 0:
+                        return python_path
+                except Exception:
+                    continue
+        
+        # Last resort: try 'which' command if available
+        try:
+            result = run_command(
+                ['which', 'python3'],
+                check=False,
+                capture_output=True,
+                env=mise_free_env
+            )
+            if result.returncode == 0 and result.stdout:
+                found_path = result.stdout.strip()
+                if found_path and os.path.exists(found_path) and '.local/share/mise' not in found_path:
+                    return found_path
+        except Exception:
+            pass
+        
+        # If we couldn't find system Python but mise is active, warn about fallback
+        if (_check_mise_active() or current_is_mise) and '.local/share/mise' in sys.executable:
+            log_warning("Could not find system Python - falling back to current Python (may be mise-managed)")
+    
+    # Default: return current executable (may be mise-managed, but better than nothing)
+    return sys.executable
 
 
 # ==================== Pre-built Wheel Support ====================
@@ -367,8 +428,12 @@ def _detect_venv_python_version() -> str:
 
 def _detect_cuda_version() -> Optional[str]:
     """Detect installed CUDA version from nvcc or nvidia-smi"""
+    import re
+
     # Try nvcc first (more reliable for build compatibility)
-    nvcc_path = _cuda_nvcc_path()
+    nvcc_path = shutil.which('nvcc')
+    if not nvcc_path:
+        nvcc_path = '/opt/cuda/bin/nvcc' if Path('/opt/cuda/bin/nvcc').exists() else None
 
     if nvcc_path:
         try:
@@ -399,7 +464,7 @@ def _detect_cuda_version() -> Optional[str]:
 def _get_wheel_variant(cuda_version: Optional[str]) -> Optional[str]:
     """CUDA wheel variant for the detected CUDA version, or None to source-build.
 
-    Vulkan wheels use VULKAN_WHEEL_VARIANT directly; CPU installs come from PyPI.
+    We self-host CUDA wheels only; CPU installs come from PyPI.
     """
     if not cuda_version:
         return None
@@ -413,81 +478,23 @@ def _get_wheel_variant(cuda_version: Optional[str]) -> Optional[str]:
     return None
 
 
-VULKAN_WHEEL_VARIANT = "vulkan"
-# glibc of the Debian trixie image the Vulkan wheels are built on
-VULKAN_WHEEL_MIN_GLIBC = (2, 41)
-# Runtime plus what ggml-vulkan's CMake needs for a source build:
-# find_package(Vulkan COMPONENTS glslc) and find_package(SPIRV-Headers CONFIG)
-VULKAN_PACMAN_PACKAGES = ['vulkan-headers', 'vulkan-icd-loader', 'shaderc', 'spirv-headers', 'vulkan-tools']
-VULKAN_BUILD_PACKAGE_HINTS = (
-    "Debian/Ubuntu: sudo apt install libvulkan-dev glslc spirv-headers",
-    "Fedora: sudo dnf install vulkan-headers vulkan-loader-devel glslc spirv-headers-devel",
-    "openSUSE: sudo zypper install vulkan-devel shaderc spirv-headers",
-    "Arch: sudo pacman -S vulkan-headers shaderc spirv-headers",
-)
-_VULKAN_HEADER_PATHS = ('/usr/include/vulkan/vulkan.h', '/usr/local/include/vulkan/vulkan.h')
-_SPIRV_HEADERS_CONFIG_GLOBS = tuple(
-    f"{prefix}/{libdir}/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake"
-    for prefix in ('/usr', '/usr/local')
-    for libdir in ('share', 'lib', 'lib64', 'lib/*'))
-
-
-def _missing_vulkan_build_tools() -> list:
-    """Names of the Vulkan source-build prerequisites that cannot be found."""
-    missing = []
-    if not any(Path(p).exists() for p in _VULKAN_HEADER_PATHS):
-        missing.append('Vulkan headers')
-    if not shutil.which('glslc'):
-        missing.append('glslc')
-    if not any(glob.glob(pattern) for pattern in _SPIRV_HEADERS_CONFIG_GLOBS):
-        missing.append('SPIRV-Headers')
-    return missing
-
-
-def _glibc_version() -> Optional[tuple]:
-    """(major, minor) of the running glibc, or None for another or unknown libc."""
-    libc, version = platform.libc_ver()
-    if libc != 'glibc':
-        return None
-    try:
-        major, minor = version.split('.')[:2]
-        return int(major), int(minor)
-    except ValueError:
-        return None
-
-
 def _get_wheel_filename(python_version: str, variant: str, for_download: bool = True) -> str:
     """Construct wheel filename for given Python version and variant
 
     Args:
         python_version: e.g., '3.11'
-        variant: 'cuda12' or VULKAN_WHEEL_VARIANT (the self-hosted variants)
+        variant: 'cuda12' (CUDA wheels are the only variant we self-host)
         for_download: If True, include variant suffix (for GitHub). If False, standard pip format.
     """
     # Python 3.11 -> cp311
     py_tag = f"cp{python_version.replace('.', '')}"
-    base = f"pywhispercpp-{PYWHISPERCPP_VERSION}-{PYWHISPERCPP_WHEEL_BUILD}-{py_tag}-{py_tag}-linux_x86_64"
+    base = f"pywhispercpp-{PYWHISPERCPP_VERSION}-{py_tag}-{py_tag}-linux_x86_64"
     if for_download:
-        # GitHub release filename: pywhispercpp-<version>-<build>-cp311-cp311-linux_x86_64+cuda12.whl
+        # GitHub release filename: pywhispercpp-<version>-cp311-cp311-linux_x86_64+cuda12.whl
         return f"{base}+{variant}.whl"
     else:
-        # Standard pip-compatible filename: pywhispercpp-<version>-<build>-cp311-cp311-linux_x86_64.whl
+        # Standard pip-compatible filename: pywhispercpp-<version>-cp311-cp311-linux_x86_64.whl
         return f"{base}.whl"
-
-
-def _published_wheel_sha256(download_filename: str) -> Optional[str]:
-    """SHA-256 the wheels-v2 SHA256SUMS.txt lists for a file, or None if unlisted or unreachable."""
-    try:
-        with urllib.request.urlopen(f"{WHEEL_BASE_URL}/SHA256SUMS.txt", timeout=30) as response:
-            sums = response.read().decode('utf-8', 'replace')
-    except Exception as e:
-        log_debug(f"Could not fetch wheel checksums: {e}")
-        return None
-    for line in sums.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[1].lstrip('*') == download_filename:
-            return parts[0].lower()
-    return None
 
 
 def download_pywhispercpp_wheel(variant: Optional[str] = None) -> Optional[Path]:
@@ -495,8 +502,8 @@ def download_pywhispercpp_wheel(variant: Optional[str] = None) -> Optional[Path]
     Download pre-built pywhispercpp wheel if available.
 
     Args:
-        variant: Optional variant ('cuda12' or VULKAN_WHEEL_VARIANT). If None,
-                 auto-detects based on system CUDA. CPU installs come from PyPI, not here.
+        variant: Optional variant override ('cuda12'). If None, auto-detects
+                 based on system CUDA. CPU installs come from PyPI, not here.
 
     Returns:
         Path to downloaded wheel file (with pip-compatible name), or None if unavailable/failed.
@@ -524,20 +531,10 @@ def download_pywhispercpp_wheel(variant: Optional[str] = None) -> Optional[Path]
     download_path = variant_cache_dir / download_filename
     install_path = variant_cache_dir / install_filename
 
-    expected_sha256 = _published_wheel_sha256(download_filename)
-
-    # A cached wheel (pip-compatible name in the variant subdirectory) only gets
-    # there after its checksum verified, and published wheels are never
-    # overwritten, so it stays usable offline. Re-check it when the list is reachable.
-    if install_path.exists():
-        if expected_sha256 is None or compute_file_hash(install_path) == expected_sha256:
-            log_info(f"Using cached wheel: {variant}/{install_filename}")
-            return install_path
-        install_path.unlink()
-
-    if expected_sha256 is None:
-        log_debug(f"Pre-built wheel not published or checksum list unavailable: {download_filename}")
-        return None
+    # Check if already cached (check the pip-compatible filename in variant subdirectory)
+    if install_path.exists() and install_path.stat().st_size > 10 * 1024 * 1024:  # >10MB
+        log_info(f"Using cached wheel: {variant}/{install_filename}")
+        return install_path
 
     log_info(f"Downloading pre-built wheel: {download_filename}")
 
@@ -560,17 +557,17 @@ def download_pywhispercpp_wheel(variant: Optional[str] = None) -> Optional[Path]
 
         urllib.request.urlretrieve(wheel_url, download_path, reporthook=show_progress)
 
-        # Verify download against the published checksum
-        if download_path.exists() and compute_file_hash(download_path) == expected_sha256:
+        # Verify download
+        if download_path.exists() and download_path.stat().st_size > 10 * 1024 * 1024:
             # Rename to pip-compatible filename (strip variant suffix)
             if download_path != install_path:
                 if install_path.exists():
                     install_path.unlink()
                 download_path.rename(install_path)
-            log_success(f"Pre-built wheel downloaded and verified: {install_filename}")
+            log_success(f"Pre-built wheel downloaded: {install_filename}")
             return install_path
         else:
-            log_warning("Downloaded wheel does not match its published checksum; discarding it")
+            log_warning("Downloaded wheel appears invalid (too small)")
             if download_path.exists():
                 download_path.unlink()
             return None
@@ -612,25 +609,6 @@ def install_pywhispercpp_from_wheel(pip_bin: Path, wheel_path: Path) -> bool:
     except subprocess.CalledProcessError as e:
         log_warning(f"Wheel installation failed: {e}")
         return False
-
-
-def _wheel_native_libs_load(pip_bin: Path) -> bool:
-    """True when the installed pywhispercpp extension and its bundled libraries load.
-
-    pip succeeds even when a library the wheel links against is missing; this
-    catches that while a source build can still take over.
-    """
-    try:
-        result = subprocess.run([str(Path(pip_bin).parent / 'python'), '-c', 'import _pywhispercpp'],
-                                capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log_warning(f"Could not load the installed wheel: {e}")
-        return False
-    if result.returncode != 0:
-        detail = (result.stderr.strip().splitlines() or ['no output'])[-1]
-        log_warning(f"Installed wheel does not load: {detail}")
-        return False
-    return True
 
 
 # ==================== State Management ====================
@@ -748,9 +726,11 @@ def get_install_state() -> Tuple[str, Optional[str]]:
 def compute_file_hash(file_path: Path) -> str:
     """Compute SHA256 hash of a file"""
     if file_path.exists():
-        # file_digest streams in large chunks; the old 4 KB loop crawled on GB models.
+        sha256_hash = hashlib.sha256()
         with open(file_path, 'rb') as f:
-            return hashlib.file_digest(f, 'sha256').hexdigest()
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
     return ''
 
 
@@ -770,147 +750,31 @@ def check_model_validity(model_file: Path) -> bool:
 
 # ==================== Helper Functions ====================
 
-_MIN_CUDA_GCC_MAJOR = 6  # CUDA's host_config.h rejects GCC versions below 6.
-
-
-def _cuda_nvcc_path() -> Optional[str]:
-    """Return an existing nvcc path using the same lookup order as CUDA setup."""
-    configured = os.environ.get('CUDACXX')
-    if configured:
-        configured_path = shutil.which(configured) if '/' not in configured else configured
-        if configured_path and Path(configured_path).exists():
-            return configured_path
-
-    path_nvcc = shutil.which('nvcc')
-    if path_nvcc:
-        return path_nvcc
-
-    for candidate in ('/opt/cuda/bin/nvcc', '/usr/bin/nvcc'):
-        if Path(candidate).exists():
-            return candidate
-    return None
-
-
-def _cuda_host_config_paths():
-    """Yield likely host_config.h paths for the active CUDA toolkit."""
-    nvcc_path = _cuda_nvcc_path()
-    if not nvcc_path:
-        return
-
-    toolkit_root = Path(nvcc_path).resolve().parent.parent
-    yield toolkit_root / 'include' / 'crt' / 'host_config.h'
-    yield toolkit_root / 'targets' / 'x86_64-linux' / 'include' / 'crt' / 'host_config.h'
-    yield from sorted(toolkit_root.glob('targets/*/include/crt/host_config.h'))
-
-
-def _cuda_max_supported_gcc_version() -> Optional[Tuple[int, Optional[int]]]:
-    """Read CUDA's GCC (major, optional minor) ceiling, or None if unknown."""
-    for host_config in _cuda_host_config_paths():
-        try:
-            contents = host_config.read_text(encoding='utf-8', errors='ignore')
-        except OSError:
-            continue
-
-        # Only trust the preprocessor guard that emits NVCC's unsupported GNU
-        # version error.  host_config.h also contains unrelated GCC feature
-        # checks, which are not compatibility ceilings.
-        guards = re.finditer(
-            r'^\s*#\s*(?:if|elif)\s+(?P<condition>[^\n]*\b__GNUC__\s*>\s*\d+[^\n]*)$',
-            contents,
-            re.MULTILINE,
-        )
-        for guard in guards:
-            body = re.split(
-                r'^\s*#\s*(?:if|elif|else|endif)\b',
-                contents[guard.end():],
-                maxsplit=1,
-                flags=re.MULTILINE,
-            )[0]
-            if 'unsupported GNU version' not in body:
-                continue
-            condition = guard.group('condition')
-            major_match = re.search(r'__GNUC__\s*>\s*(\d+)', condition)
-            if not major_match:
-                continue
-            major = int(major_match.group(1))
-            if major < _MIN_CUDA_GCC_MAJOR:
-                continue
-            minor_match = re.search(
-                r'__GNUC__\s*==\s*' + re.escape(major_match.group(1)) +
-                r'.*?__GNUC_MINOR__\s*>\s*(\d+)',
-                condition,
-            )
-            return major, int(minor_match.group(1)) if minor_match else None
-    return None
-
-
-def _compiler_version(compiler: str) -> Optional[Tuple[int, int]]:
-    """Return a compiler's reported (major, minor) version, if available."""
-    try:
-        result = run_command([compiler, '-dumpfullversion'], check=False, capture_output=True)
-        if result and result.returncode == 0:
-            match = re.match(r'\s*(\d+)(?:\.(\d+))?', _safe_decode(result.stdout))
-            if match:
-                return int(match.group(1)), int(match.group(2) or 0)
-    except Exception:
-        pass
-    return None
-
-
-def _is_cuda_gcc_compatible(
-    version: Optional[Tuple[int, int]], max_version: Tuple[int, Optional[int]]
-) -> bool:
-    """Whether a GCC version fits CUDA's parsed host-compiler ceiling."""
-    if version is None or version[0] < _MIN_CUDA_GCC_MAJOR:
-        return False
-    max_major, max_minor = max_version
-    return version[0] < max_major or (
-        version[0] == max_major and (max_minor is None or version[1] <= max_minor)
-    )
-
-
 def detect_cuda_host_compiler() -> Optional[str]:
-    """Select CUDA's newest supported GCC, returning None when none is installed.
-
-    An unknown toolkit ceiling retains the system g++ optimistically; a known
-    ceiling without a compatible compiler returns None so CUDA setup uses CPU.
-    """
+    """Detect appropriate CUDA host compiler"""
     # Allow explicit override
     cuda_host = os.environ.get('HYPRWHSPR_CUDA_HOST')
     if cuda_host and Path(cuda_host).exists() and os.access(cuda_host, os.X_OK):
         return cuda_host
-    if cuda_host:
-        log_warning(f"HYPRWHSPR_CUDA_HOST is not an executable file: {cuda_host}; auto-detecting")
-
-    default_compiler = shutil.which('g++')
-    max_version = _cuda_max_supported_gcc_version()
-    if max_version is None:
-        if default_compiler:
-            log_warning(
-                "Could not determine CUDA's supported GCC version; using system g++ "
-                "(set HYPRWHSPR_CUDA_HOST to override)"
-            )
-        return default_compiler
-
-    max_major, max_minor = max_version
-    max_display = f"{max_major}.{max_minor}" if max_minor is not None else str(max_major)
-
-    if default_compiler:
-        default_version = _compiler_version(default_compiler)
-        if _is_cuda_gcc_compatible(default_version, max_version):
-            return default_compiler
-
-    for major in range(max_major, _MIN_CUDA_GCC_MAJOR - 1, -1):
-        candidate = shutil.which(f'g++-{major}')
-        if not candidate:
-            continue
-        candidate_version = _compiler_version(candidate)
-        if _is_cuda_gcc_compatible(candidate_version, max_version):
-            return candidate
-
-    log_warning(f"No installed g++ is compatible with CUDA's GCC <= {max_display} requirement")
-    log_warning(f"Install a GCC {max_major} toolchain (on Arch: yay -S gcc{max_major} gcc{max_major}-libs)")
-    log_warning("Or set HYPRWHSPR_CUDA_HOST to a compatible g++ executable")
+    
+    # Check GCC version
+    try:
+        result = run_command(['gcc', '-dumpfullversion'], check=False, capture_output=True)
+        if result.returncode == 0:
+            gcc_version = _safe_decode(result.stdout).strip()
+            gcc_major = int(gcc_version.split('.')[0])
+            
+            # If GCC >= 15, prefer gcc14 if present
+            if gcc_major >= 15:
+                if shutil.which('g++-14'):
+                    return '/usr/bin/g++-14'
+    except Exception:
+        pass
+    
+    # Default to g++
+    if shutil.which('g++'):
+        return shutil.which('g++')
+    
     return None
 
 
@@ -987,7 +851,11 @@ def setup_nvidia_support() -> bool:
     log_success("NVIDIA GPU detected")
     
     # Check for nvcc
-    nvcc_path = _cuda_nvcc_path()
+    nvcc_path = None
+    if Path('/opt/cuda/bin/nvcc').exists():
+        nvcc_path = '/opt/cuda/bin/nvcc'
+    elif shutil.which('nvcc'):
+        nvcc_path = shutil.which('nvcc')
     
     if nvcc_path:
         # Set environment variables
@@ -1023,7 +891,13 @@ def setup_nvidia_support() -> bool:
             return False
 
         # Check for nvcc after installation attempt
-        nvcc_path_after_install = _cuda_nvcc_path()
+        nvcc_path_after_install = None
+        if Path('/opt/cuda/bin/nvcc').exists():
+            nvcc_path_after_install = '/opt/cuda/bin/nvcc'
+        elif Path('/usr/bin/nvcc').exists():
+            nvcc_path_after_install = '/usr/bin/nvcc'
+        elif shutil.which('nvcc'):
+            nvcc_path_after_install = shutil.which('nvcc')
         
         if nvcc_path_after_install:
             # Use the directory where nvcc was actually found
@@ -1040,6 +914,19 @@ def setup_nvidia_support() -> bool:
     if host_compiler:
         os.environ['CUDAHOSTCXX'] = host_compiler
         log_info(f"CUDA host compiler: {host_compiler}")
+        
+        if host_compiler == '/usr/bin/g++':
+            try:
+                result = run_command(['gcc', '-dumpfullversion'], check=False, capture_output=True)
+                if result.returncode == 0:
+                    gcc_version = _safe_decode(result.stdout).strip()
+                    gcc_major = int(gcc_version.split('.')[0])
+                    if gcc_major >= 15:
+                        log_warning(f"GCC {gcc_major} with NVCC can fail; consider:")
+                        log_warning("  yay -S gcc14 gcc14-libs")
+                        log_warning("  export HYPRWHSPR_CUDA_HOST=/usr/bin/g++-14")
+            except Exception:
+                pass
     else:
         log_warning("No suitable host compiler found; will build CPU-only")
         return False
@@ -1170,24 +1057,41 @@ def setup_vulkan_support() -> bool:
     """
     log_info("Setting up Vulkan support...")
 
-    # 1. Install Vulkan runtime and source-build dependencies (Arch only). Other
-    # distros may not need build tools at all when the pre-built wheel applies;
-    # install_pywhispercpp_vulkan checks them before a source build.
+    # 1. Install Vulkan dependencies (both runtime and development headers)
     if shutil.which('pacman'):
         log_info("Installing Vulkan dependencies...")
+        vulkan_pkgs = ['vulkan-headers', 'vulkan-icd-loader', 'shaderc', 'vulkan-tools']
         try:
             result = run_sudo_command(
-                ['pacman', '-S', '--needed', '--noconfirm'] + VULKAN_PACMAN_PACKAGES,
+                ['pacman', '-S', '--needed', '--noconfirm'] + vulkan_pkgs,
                 check=False
             )
             if not result or result.returncode != 0:
-                log_warning("Could not install Vulkan packages, checking for an existing Vulkan setup")
+                log_warning("Failed to install some Vulkan packages")
+                return False
         except Exception as e:
-            log_warning(f"Could not install Vulkan dependencies ({e}), checking for an existing Vulkan setup")
+            log_error(f"Failed to install Vulkan dependencies: {e}")
+            return False
+    else:
+        # Check if Vulkan development files are available
+        log_info("Checking for Vulkan development files...")
+        # Look for vulkan headers in common locations
+        vulkan_header_paths = [
+            '/usr/include/vulkan/vulkan.h',
+            '/usr/local/include/vulkan/vulkan.h',
+        ]
+        has_vulkan_dev = any(Path(p).exists() for p in vulkan_header_paths)
+        if not has_vulkan_dev:
+            log_warning("Vulkan development headers not found")
+            log_info("Please install Vulkan development packages:")
+            log_info("  Debian/Ubuntu: sudo apt install libvulkan-dev vulkan-tools shaderc")
+            log_info("  Fedora: sudo dnf install vulkan-headers vulkan-loader-devel shaderc")
+            log_info("  openSUSE: sudo zypper install vulkan-devel shaderc")
+            return False
 
     # 2. Verify Vulkan is now available
     if not shutil.which('vulkaninfo'):
-        log_warning("vulkaninfo not found - install vulkan-tools")
+        log_warning("vulkaninfo not available after installation")
         return False
 
     try:
@@ -1343,379 +1247,12 @@ def setup_python_venv(force_rebuild: bool = False, custom_python: Optional[str] 
     return pip_bin
 
 
-_IMPORT_PROBE = r'''
-import contextlib, importlib.metadata, importlib.util, io, json, sys, traceback
-name = sys.argv[1]
-data = {"import_name": name}
-try:
-    spec = importlib.util.find_spec(name)
-    data["module_origin"] = getattr(spec, "origin", None)
-except BaseException:
-    data["module_origin"] = None
-    data["find_spec_traceback"] = traceback.format_exc()
-try:
-    spec = importlib.util.find_spec("numpy")
-    data["numpy_origin"] = getattr(spec, "origin", None)
-    import numpy
-    data["numpy_version"] = numpy.__version__
-except BaseException:
-    data["numpy_traceback"] = traceback.format_exc()
-try:
-    data["distributions"] = sorted(set(
-        importlib.metadata.packages_distributions().get(name, [])
-    ))
-except BaseException:
-    data["distributions"] = []
-stdout, stderr = io.StringIO(), io.StringIO()
-if len(sys.argv) > 2 and sys.argv[2] == "snapshot":
-    data["ok"] = data.get("module_origin") is not None
-else:
-    try:
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            __import__(name)
-        data["ok"] = True
-    except BaseException:
-        data["ok"] = False
-        data["traceback"] = traceback.format_exc()
-data["import_stdout"] = stdout.getvalue()
-data["import_stderr"] = stderr.getvalue()
-data["prefix"] = sys.prefix
-data["base_prefix"] = sys.base_prefix
-print(json.dumps(data), flush=True)
-sys.exit(0 if data["ok"] else 1)
-'''
-
-_NUMPY_ABI_PATTERNS = (
-    re.compile(r'_ARRAY_API not found', re.I),
-    re.compile(r'compiled using NumPy 1\.x cannot be run in NumPy 2', re.I),
-    re.compile(r'numpy\.dtype size changed', re.I),
-    re.compile(r'(?:compiled|built).*(?:NumPy|numpy).*(?:API|ABI).*(?:version|mismatch)', re.I | re.S),
-    re.compile(r'(?:NumPy|numpy).*(?:API|ABI) version.*(?:mismatch|incompatible)', re.I | re.S),
-    re.compile(r'module compiled against API version .*but this version of numpy is', re.I),
-    re.compile(r'Numba needs NumPy .* or less', re.I),
-)
-_ABI_REPAIR_ALLOWLIST = frozenset({
-    'numba', 'pandas', 'scikit-learn', 'scipy', 'sounddevice', 'soxr',
-})
-
-
-@dataclass
-class ImportProbe:
-    import_name: str
-    ok: bool
-    module_origin: Optional[str] = None
-    stdout: str = ''
-    stderr: str = ''
-    traceback: str = ''
-    numpy_version: Optional[str] = None
-    numpy_origin: Optional[str] = None
-    distributions: tuple[str, ...] = ()
-    timed_out: bool = False
-
-    def evidence(self) -> str:
-        return '\n'.join(part for part in (
-            self.stdout, self.stderr, self.traceback) if part)
-
-
-@dataclass
-class DependencyVerification:
-    ok: bool
-    combined_stdout: str = ''
-    combined_stderr: str = ''
-    failures: list[ImportProbe] = field(default_factory=list)
-    combined_only_failure: bool = False
-    timed_out: bool = False
-    repair_error: str = ''
-
-
-def _has_numpy_abi_signature(text: str) -> bool:
-    return any(pattern.search(text or '') for pattern in _NUMPY_ABI_PATTERNS)
-
-
-def _manifest_requirement_specs(plan: DependencyPlan) -> dict[str, Optional[str]]:
-    """Return unambiguous package requirements exactly as declared by manifests."""
-    requirements: dict[str, Optional[str]] = {}
-    for manifest in plan.manifests:
-        for raw in manifest.read_text(encoding='utf-8').splitlines():
-            line = raw.split('#', 1)[0].strip()
-            if not line or line.startswith(('-', 'http:', 'https:')):
-                continue
-            name = _graph_package_name(line)
-            if name:
-                previous = requirements.get(name)
-                if previous is not None and previous != line:
-                    requirements[name] = None
-                elif name not in requirements:
-                    requirements[name] = line
-    return requirements
-
-
-def _manifest_package_names(plan: DependencyPlan) -> set[str]:
-    return set(_manifest_requirement_specs(plan))
-
-
-def _distribution_for_import(probe: ImportProbe, manifest_names: set[str]) -> Optional[str]:
-    """Map one import to exactly one distribution selected by the manifest."""
-    candidates = {
-        _canonical_package_name(name) for name in probe.distributions if name
-    } & manifest_names
-    return next(iter(candidates)) if len(candidates) == 1 else None
-
-
-def _parse_import_probe(name: str, result) -> ImportProbe:
-    process_stdout = _safe_decode(getattr(result, 'stdout', '') or '')
-    process_stderr = _safe_decode(getattr(result, 'stderr', '') or '')
-    payload: Dict[str, Any] = {}
-    payload_line = None
-    stdout_lines = process_stdout.splitlines()
-    for index in range(len(stdout_lines) - 1, -1, -1):
-        line = stdout_lines[index]
-        try:
-            candidate = json.loads(line)
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if isinstance(candidate, dict) and candidate.get('import_name') == name:
-            payload = candidate
-            payload_line = index
-            break
-    if payload_line is not None:
-        del stdout_lines[payload_line]
-    unredirected_stdout = '\n'.join(stdout_lines)
-    tracebacks = '\n'.join(filter(None, (
-        payload.get('find_spec_traceback', ''),
-        payload.get('numpy_traceback', ''),
-        payload.get('traceback', ''),
-    )))
-    return ImportProbe(
-        import_name=name,
-        ok=bool(payload.get('ok', result.returncode == 0)),
-        module_origin=payload.get('module_origin'),
-        stdout=(payload.get('import_stdout', '') + unredirected_stdout),
-        stderr=(payload.get('import_stderr', '') + process_stderr),
-        traceback=tracebacks,
-        numpy_version=payload.get('numpy_version'),
-        numpy_origin=payload.get('numpy_origin'),
-        distributions=tuple(payload.get('distributions') or ()),
-        timed_out=result.returncode == 124,
-    )
-
-
-def _probe_required_import(name: str, import_module: bool = True) -> ImportProbe:
-    mode = [] if import_module else ['snapshot']
-    result = run_command([
-        'timeout', '180s', str(VENV_DIR / 'bin' / 'python'), '-c',
-        _IMPORT_PROBE, name, *mode,
-    ], check=False, capture_output=True, show_output_on_error=False)
-    return _parse_import_probe(name, result)
-
-
-def _verify_dependency_plan_detailed(plan: DependencyPlan) -> DependencyVerification:
-    imports = ', '.join(plan.required_imports)
-    combined = run_command([
-        'timeout', '60s', str(VENV_DIR / 'bin' / 'python'), '-c', f'import {imports}'
-    ], check=False, capture_output=True, show_output_on_error=False)
-    combined_timed_out = combined.returncode == 124
-    if combined_timed_out:
-        combined = run_command([
-            'timeout', '180s', str(VENV_DIR / 'bin' / 'python'), '-c', f'import {imports}'
-        ], check=False, capture_output=True, show_output_on_error=False)
-        combined_timed_out = combined.returncode == 124
-    if combined.returncode == 0:
-        return DependencyVerification(ok=True)
-
-    probes = [_probe_required_import(name) for name in plan.required_imports]
-    failures = [probe for probe in probes if not probe.ok]
-    # A combined timeout is inconclusive. Successful isolated imports are enough
-    # to retain the environment instead of discarding a large, valid installation.
-    if combined_timed_out and not failures:
-        return DependencyVerification(ok=True)
-    return DependencyVerification(
-        ok=False,
-        combined_stdout=_safe_decode(getattr(combined, 'stdout', '') or ''),
-        combined_stderr=_safe_decode(getattr(combined, 'stderr', '') or ''),
-        failures=failures,
-        combined_only_failure=not failures and not combined_timed_out,
-        timed_out=combined_timed_out or any(probe.timed_out for probe in failures),
-    )
-
-
-def _format_dependency_diagnostic(plan: DependencyPlan,
-                                  verification: DependencyVerification,
-                                  snapshot: Optional[list[ImportProbe]] = None) -> str:
-    lines = ['Dependency verification failed.',
-             'Required imports: ' + ', '.join(plan.required_imports)]
-    if verification.timed_out:
-        lines.append('Dependency verification timed out after a 60-second probe and one 180-second retry.')
-    elif verification.combined_only_failure:
-        lines.append('Every isolated import succeeded; the combined probe failed (possible import-order interaction).')
-    before_numpy = next((probe for probe in (snapshot or []) if probe.numpy_origin), None)
-    after_numpy = next((probe for probe in verification.failures if probe.numpy_origin), None)
-    if before_numpy:
-        lines.append(
-            f'NumPy before install: {before_numpy.numpy_version or "unknown"} '
-            f'at {before_numpy.numpy_origin}'
-        )
-    if after_numpy:
-        lines.append(
-            f'NumPy after install: {after_numpy.numpy_version or "unknown"} '
-            f'at {after_numpy.numpy_origin}'
-        )
-    if verification.combined_stdout:
-        lines.append('Combined stdout:\n' + verification.combined_stdout.rstrip())
-    if verification.combined_stderr:
-        lines.append('Combined stderr:\n' + verification.combined_stderr.rstrip())
-    for probe in verification.failures:
-        lines.extend([
-            f'Import: {probe.import_name}',
-            f'Origin: {probe.module_origin or "unknown"}',
-            f'Distribution candidates: {", ".join(probe.distributions) or "none"}',
-            f'NumPy: {probe.numpy_version or "unknown"} ({probe.numpy_origin or "unknown"})',
-        ])
-        if probe.stdout:
-            lines.append('stdout:\n' + probe.stdout.rstrip())
-        if probe.stderr:
-            lines.append('stderr:\n' + probe.stderr.rstrip())
-        if probe.traceback:
-            lines.append('traceback:\n' + probe.traceback.rstrip())
-    if verification.repair_error:
-        lines.append('Repair pip failure:\n' + verification.repair_error.rstrip())
-    return '\n'.join(lines)
-
-
-def _summarize_dependency_failure(verification: DependencyVerification) -> str:
-    """One line for the console; the full diagnostic goes to state and --debug."""
-    def last_line(text: str) -> str:
-        lines = [line.strip() for line in (text or '').splitlines() if line.strip()]
-        return lines[-1] if lines else ''
-
-    if verification.timed_out:
-        summary = 'import check timed out'
-    elif not verification.failures:
-        summary = 'combined import failed; isolated imports succeeded'
-    else:
-        probe = verification.failures[0]
-        summary = f'{probe.import_name}: {last_line(probe.evidence()) or "import failed"}'
-    if verification.repair_error:
-        summary += f'; repair failed: {last_line(verification.repair_error)}'
-    return summary
-
-
-class DependencyVerificationError(RuntimeError):
-    """Terse message for the console; ``diagnostic`` carries the full evidence."""
-
-    def __init__(self, summary: str, diagnostic: str):
-        super().__init__(f'Dependency verification failed: {summary}')
-        self.diagnostic = diagnostic
-
-
-def _is_system_origin(origin: Optional[str]) -> bool:
-    """Return whether an import is inherited from anywhere outside the venv."""
-    if not origin:
-        return False
-    try:
-        path = Path(origin).resolve()
-        path.relative_to(VENV_DIR.resolve())
-        return False
-    except ValueError:
-        return True
-    except OSError:
-        return False
-
-
-def _has_missing_compiled_import(text: str) -> bool:
-    return bool(re.search(
-        r'(?:ModuleNotFoundError|ImportError):|No module named [\'\"]?_|'
-        r'OSError:.*PortAudio|PortAudio.*not found',
-        text or '', re.I | re.S,
-    ))
-
-
-def _numpy_needs_relocation(verification: DependencyVerification) -> bool:
-    return any(
-        _has_numpy_abi_signature(probe.evidence())
-        and _is_system_origin(probe.numpy_origin)
-        for probe in verification.failures
-    )
-
-
-def _repairable_distributions(plan: DependencyPlan,
-                              verification: DependencyVerification) -> list[str]:
-    # One repair round is intentional. If relocation exposes a second, opposite
-    # ABI mismatch, the post-repair verification records it for manual resolution.
-    requirement_specs = _manifest_requirement_specs(plan)
-    manifest_names = set(requirement_specs)
-    repairs = set()
-    for probe in verification.failures:
-        distribution = _distribution_for_import(probe, manifest_names)
-        eligible_failure = (
-            _has_numpy_abi_signature(probe.evidence())
-            or _has_missing_compiled_import(probe.evidence())
-        )
-        if (distribution in _ABI_REPAIR_ALLOWLIST
-                and requirement_specs.get(distribution)
-                and eligible_failure
-                and _is_system_origin(probe.module_origin)):
-            repairs.add(distribution)
-    ordered = sorted(repairs)
-    if (_numpy_needs_relocation(verification)
-            and requirement_specs.get('numpy')):
-        ordered.insert(0, 'numpy')
-    return ordered
-
-
-def _repair_requirement_specs(plan: DependencyPlan,
-                              distributions: list[str]) -> list[str]:
-    specs = _manifest_requirement_specs(plan)
-    return [specs[name] for name in distributions if specs.get(name)]
-
-
-def _verify_and_repair_dependency_plan(plan: DependencyPlan, pip_bin: Path) -> DependencyVerification:
-    """Verify required imports and perform at most one allowlisted repair round."""
-    verification = _verify_dependency_plan_detailed(plan)
-    repairs = _repairable_distributions(plan, verification)
-    if not repairs:
-        return verification
-
-    log_warning('Relocating incompatible inherited packages into the venv: '
-                + ', '.join(repairs))
-    # --ignore-installed deliberately relocates the selected requirement and
-    # its resolved dependency closure into the venv. Preserve manifest pins.
-    # Conflicts with already-installed pins are intentionally caught by the
-    # single post-repair verification rather than adding another repair round.
-    repair_specs = _repair_requirement_specs(plan, repairs)
-    try:
-        repair_result = run_command(
-            [str(pip_bin), 'install', '--ignore-installed', *repair_specs],
-            check=False, capture_output=True, show_output_on_error=False)
-        if repair_result.returncode == 0:
-            return _verify_dependency_plan_detailed(plan)
-        verification.repair_error = '\n'.join(filter(None, (
-            _safe_decode(getattr(repair_result, 'stdout', '') or ''),
-            _safe_decode(getattr(repair_result, 'stderr', '') or ''),
-        ))) or f'pip exited with status {repair_result.returncode}'
-    except Exception as exc:
-        verification.repair_error = str(exc)
-    return verification
-
-
-def _snapshot_inherited_dependencies(plan: DependencyPlan) -> list[ImportProbe]:
-    """Capture pre-install origins for diagnostics; never mutate dependencies."""
-    snapshots = [
-        _probe_required_import(name, import_module=False)
-        for name in plan.required_imports
-    ]
-    for probe in snapshots:
-        log_debug(
-            f'Pre-install import snapshot: {probe.import_name}: '
-            f'{probe.module_origin or "not found"}; NumPy '
-            f'{probe.numpy_version or "unknown"} at {probe.numpy_origin or "unknown"}'
-        )
-    return snapshots
-
-
 def _verify_dependency_plan(plan: DependencyPlan) -> bool:
-    """Compatibility wrapper for callers that only need a boolean result."""
-    return _verify_dependency_plan_detailed(plan).ok
+    imports = ', '.join(plan.required_imports)
+    result = run_command([
+        'timeout', '10s', str(VENV_DIR / 'bin' / 'python'), '-c', f'import {imports}'
+    ], check=False, capture_output=True, show_output_on_error=False)
+    return result.returncode == 0
 
 
 class VenvTransaction:
@@ -1758,14 +1295,6 @@ class VenvTransaction:
 def execute_dependency_plan(plan: DependencyPlan, custom_python: Optional[str] = None,
                             force_rebuild: bool = False) -> Path:
     """Install and verify a plan transactionally, restoring a usable old venv on failure."""
-    if os.environ.get('HYPRWHSPR_GENERATION'):
-        backend = {'rest': 'rest-api', 'realtime': 'realtime-ws', 'elevenlabs': 'realtime-ws',
-                   'cohere': 'cohere-transcribe', 'onnx': 'onnx-asr', 'faster-whisper': 'faster-whisper',
-                   'parakeet-cpp': 'parakeet-cpp', 'qwen3-asr': 'qwen3-asr', 'pywhispercpp': 'pywhispercpp'}[plan.family]
-        _managed_select(backend, custom_python, force_rebuild,
-                        provider='elevenlabs' if plan.family == 'elevenlabs' else None,
-                        variant=plan.accelerated_variant)
-        return VENV_DIR / 'bin/pip'
     # Re-resolve before any filesystem mutation; callers cannot pass a stale/malformed plan.
     checked = _manifest_closure(plan.manifest)
     if checked != plan.manifests or dependency_manifest_hash(list(checked)) != plan.fingerprint:
@@ -1784,17 +1313,21 @@ def execute_dependency_plan(plan: DependencyPlan, custom_python: Optional[str] =
     transaction = VenvTransaction(VENV_DIR).begin()
     try:
         pip_bin = setup_python_venv(custom_python=custom_python)
-        snapshot = _snapshot_inherited_dependencies(plan)
         run_command([str(pip_bin), 'install', '-r', str(plan.manifest)], check=True)
-        verification = _verify_and_repair_dependency_plan(plan, pip_bin)
-        if not verification.ok:
-            # Callers log the exception; keep the console to one line and leave
-            # the full evidence to `hyprwhspr state show` and --debug.
-            diagnostic = _format_dependency_diagnostic(plan, verification, snapshot)
-            log_debug(diagnostic)
-            set_install_state('failed', diagnostic)
-            raise DependencyVerificationError(
-                _summarize_dependency_failure(verification), diagnostic)
+        if not _verify_dependency_plan(plan) and 'sounddevice' in plan.required_imports:
+            # Some distro sounddevice>=0.5 packages (e.g. Fedora/Nobara) ship without
+            # the compiled _sounddevice extension, but still register as satisfying
+            # pip's "already installed" check via the venv's inherited system
+            # site-packages - so the plain install above silently skipped it.
+            # --ignore-installed forces pip to lay down its own working copy in the
+            # venv without trying to uninstall the (rpm-owned, unremovable) broken one.
+            log_warning('sounddevice import failed after install - retrying with --ignore-installed')
+            run_command([str(pip_bin), 'install', '--ignore-installed', 'sounddevice'], check=False)
+        if not _verify_dependency_plan(plan):
+            raise RuntimeError(
+                'Dependency installation completed but required imports failed: '
+                + ', '.join(plan.required_imports)
+            )
     except BaseException:
         transaction.rollback()
         raise
@@ -1833,347 +1366,21 @@ def install_visualizer_deps(pip_bin) -> bool:
     dictation runtime. Skipped when PyGObject is already importable from system
     packages (the venv uses --system-site-packages).
     """
-    bindings_ok = _should_skip_pygobject()
-    if not bindings_ok:
-        req = Path(HYPRWHSPR_ROOT) / 'requirements-visualizer.txt'
-        if not req.exists():
-            bindings_ok = True
-        else:
-            log_info("Installing optional mic-osd visualizer deps (best-effort)…")
-            try:
-                run_command([str(pip_bin), 'install', '-r', str(req)], check=True)
-                bindings_ok = True
-            except subprocess.CalledProcessError as e:
-                log_warning(
-                    "mic-osd visualizer deps could not be built — the animated overlay "
-                    f"will be unavailable (core dictation is unaffected): {e}"
-                )
-
-    python_bin = Path(pip_bin).parent / 'python'
-    if bindings_ok:
-        install_gtk4_layer_shell_runtime(python_bin)
-    return bindings_ok
-
-
-_VISUALIZER_IMPORT_PROBE = (
-    "import cairo, gi;"
-    "gi.require_version('Gtk', '4.0');"
-    "gi.require_version('Gtk4LayerShell', '1.0');"
-    "from gi.repository import Gtk, Gtk4LayerShell"
-)
-
-
-def _visualizer_runtime_imports(python_bin: Path, env=None) -> bool:
+    if _should_skip_pygobject():
+        return True
+    req = Path(HYPRWHSPR_ROOT) / 'requirements-visualizer.txt'
+    if not req.exists():
+        return True
+    log_info("Installing optional mic-osd visualizer deps (best-effort)…")
     try:
-        result = run_command(
-            [str(python_bin), '-c', _VISUALIZER_IMPORT_PROBE],
-            check=False, capture_output=True, env=env,
-        )
-        return result.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
-def _download_visualizer_runtime(download_dir: Path) -> tuple[Path, str]:
-    asset = download_dir / visualizer_runtime.GTK4_LAYER_SHELL_ASSET
-    base = visualizer_runtime.GTK4_LAYER_SHELL_BASE_URL
-    _download_bounded_file(
-        f"{base}/{visualizer_runtime.GTK4_LAYER_SHELL_ASSET}", asset, 16 * 1024 * 1024
-    )
-    expected = visualizer_runtime.GTK4_LAYER_SHELL_SHA256.lower()
-    if not re.fullmatch(r'[0-9a-f]{64}', expected):
-        raise RuntimeError('pinned runtime checksum is invalid')
-    actual = hashlib.sha256(asset.read_bytes()).hexdigest()
-    if actual != expected:
-        raise RuntimeError('downloaded runtime does not match its pinned checksum')
-    return asset, actual
-
-
-def _download_bounded_file(url: str, destination: Path, maximum_bytes: int) -> None:
-    """Download a small release asset with per-operation stall protection."""
-    total = 0
-    with urllib.request.urlopen(url, timeout=60) as response, destination.open('wb') as output:
-        while True:
-            block = response.read(64 * 1024)
-            if not block:
-                break
-            total += len(block)
-            if total > maximum_bytes:
-                raise RuntimeError(f'download exceeded the {maximum_bytes}-byte safety limit')
-            output.write(block)
-
-
-def _extract_visualizer_runtime(archive: Path, destination: Path, checksum: str) -> None:
-    required = {
-        'lib/libgtk4-layer-shell.so.0',
-        'lib/girepository-1.0/Gtk4LayerShell-1.0.typelib',
-        'LICENSE',
-        'manifest.json',
-    }
-    with tarfile.open(archive, 'r:gz') as bundle:
-        archive_members = bundle.getmembers()
-        members = {member.name.lstrip('./'): member for member in archive_members}
-        if (
-            len(archive_members) != len(required)
-            or set(members) != required
-            or any(not member.isfile() or member.size > 16 * 1024 * 1024 for member in members.values())
-        ):
-            raise RuntimeError('runtime archive contains an unexpected or unsafe layout')
-        for relative, member in members.items():
-            target = destination / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            source = bundle.extractfile(member)
-            if source is None:
-                raise RuntimeError(f'could not read {relative} from runtime archive')
-            with source, target.open('wb') as output:
-                shutil.copyfileobj(source, output)
-    manifest = json.loads((destination / 'manifest.json').read_text(encoding='utf-8'))
-    if (
-        manifest.get('version') != visualizer_runtime.GTK4_LAYER_SHELL_VERSION
-        or manifest.get('commit') != visualizer_runtime.GTK4_LAYER_SHELL_COMMIT
-    ):
-        raise RuntimeError('runtime manifest does not match the installer contract')
-    (destination / '.sha256').write_text(checksum + '\n', encoding='utf-8')
-
-
-def install_gtk4_layer_shell_runtime(python_bin: Path) -> bool:
-    """Best-effort install of the Noble x86_64 app-private layer-shell runtime."""
-    if _visualizer_runtime_imports(python_bin):
+        run_command([str(pip_bin), 'install', '-r', str(req)], check=True)
         return True
-    if not visualizer_runtime.is_noble_x86_64():
-        return False
-    target = visualizer_runtime.runtime_dir()
-    if visualizer_runtime.is_complete() and _visualizer_runtime_imports(
-        python_bin, visualizer_runtime.bundled_environment()
-    ):
-        return True
-
-    log_info('Installing optional bundled gtk4-layer-shell runtime…')
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix='.gtk4-layer-shell-', dir=target.parent))
-    previous = target.with_name(f'.{target.name}.previous')
-    try:
-        with tempfile.TemporaryDirectory() as download_tmp:
-            archive, checksum = _download_visualizer_runtime(Path(download_tmp))
-            _extract_visualizer_runtime(archive, staging, checksum)
-        if not _visualizer_runtime_imports(
-            python_bin, visualizer_runtime.environment_for(staging)
-        ):
-            raise RuntimeError('the bundled runtime failed its import check')
-        if previous.exists():
-            shutil.rmtree(previous)
-        if target.exists():
-            target.replace(previous)
-        staging.replace(target)
-        if previous.exists():
-            shutil.rmtree(previous, ignore_errors=True)
-        log_success('Bundled gtk4-layer-shell runtime installed')
-        try:
-            versions_root = visualizer_runtime.versions_dir()
-            if target.parent.parent == versions_root:
-                for old_version in versions_root.iterdir():
-                    if old_version.is_dir() and old_version != target.parent:
-                        shutil.rmtree(old_version, ignore_errors=True)
-        except OSError as exc:
-            log_debug(f'Could not remove an older visualizer runtime: {exc}')
-        return True
-    except Exception as exc:
-        if previous.exists() and not target.exists():
-            previous.replace(target)
+    except subprocess.CalledProcessError as e:
         log_warning(
-            'Bundled gtk4-layer-shell could not be installed; mic-osd will use '
-            f'notifications instead (core dictation is unaffected): {exc}'
+            "mic-osd visualizer deps could not be built — the animated overlay "
+            f"will be unavailable (core dictation is unaffected): {e}"
         )
         return False
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
-
-
-# Largest single member across the pinned llama.cpp assets is libggml-vulkan.so
-# at ~54 MB; the cap only has to exclude an archive that is not what we pinned.
-_LLAMA_MEMBER_LIMIT = 96 * 1024 * 1024
-_LLAMA_TOTAL_LIMIT = 512 * 1024 * 1024
-
-
-def _extract_llama_runtime(archive: Path, destination: Path) -> None:
-    """Extract a pinned llama.cpp release archive into a flat runtime directory.
-
-    Written rather than reusing _extract_visualizer_runtime because that helper
-    rejects every non-regular-file member and drops mode bits: this archive
-    carries ten relative symlinks (libggml.so -> libggml.so.0 and friends) and
-    an llama-server that is useless without its exec bit.
-    """
-    prefix = qwen3_asr_runtime.LLAMA_CPP_ARCHIVE_ROOT + '/'
-    total = 0
-    with tarfile.open(archive, 'r:gz') as bundle:
-        for member in bundle.getmembers():
-            name = member.name.lstrip('./')
-            if name.rstrip('/') == qwen3_asr_runtime.LLAMA_CPP_ARCHIVE_ROOT:
-                continue
-            if not name.startswith(prefix):
-                raise RuntimeError(f'runtime archive member outside {prefix}: {member.name}')
-            relative = name[len(prefix):]
-            parts = Path(relative).parts
-            if not relative or relative.startswith('/') or '..' in parts:
-                raise RuntimeError(f'unsafe runtime archive member: {member.name}')
-            target = destination / relative
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            if member.issym():
-                # Same-directory relative links only; anything else could point
-                # outside the runtime once resolved.
-                link = member.linkname
-                if not link or '/' in link or link in ('.', '..'):
-                    raise RuntimeError(f'unsafe symlink in runtime archive: {member.name} -> {link}')
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.symlink_to(link)
-                continue
-            if not member.isfile():
-                raise RuntimeError(f'unsupported member type in runtime archive: {member.name}')
-            if member.size > _LLAMA_MEMBER_LIMIT:
-                raise RuntimeError(f'runtime archive member is oversized: {member.name}')
-            total += member.size
-            if total > _LLAMA_TOTAL_LIMIT:
-                raise RuntimeError('runtime archive exceeds its total size limit')
-            source = bundle.extractfile(member)
-            if source is None:
-                raise RuntimeError(f'could not read {relative} from runtime archive')
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with source, target.open('wb') as output:
-                shutil.copyfileobj(source, output)
-            # llama-server and the shared objects ship 0755; without this the
-            # binary extracts non-executable and the sidecar can never start.
-            os.chmod(target, member.mode & 0o777)
-
-
-def _download_llama_runtime(device: str, download_dir: Path) -> Path:
-    filename, size, digest = qwen3_asr_runtime.LLAMA_CPP_ASSETS[device]
-    archive = download_dir / filename
-    _download_bounded_file(
-        f'{qwen3_asr_runtime.LLAMA_CPP_BASE_URL}/{filename}', archive, size + 1024)
-    expected = digest.lower()
-    if not re.fullmatch(r'[0-9a-f]{64}', expected):
-        raise RuntimeError('pinned runtime checksum is invalid')
-    actual = compute_file_hash(archive)
-    if archive.stat().st_size != size or actual != expected:
-        raise RuntimeError(f'{filename} failed pinned size/SHA-256 validation')
-    return archive
-
-
-def install_qwen3_asr_runtime(device: str, force: bool = False) -> bool:
-    """Install the pinned llama.cpp sidecar for `device`, atomically.
-
-    `force` re-downloads and re-extracts even when the runtime looks present, so
-    an explicit reinstall can repair a damaged tree.
-    """
-    if device not in qwen3_asr_runtime.LLAMA_CPP_ASSETS:
-        log_error(f'Unsupported Qwen3-ASR runtime device: {device}')
-        return False
-    if platform.machine() not in ('x86_64', 'amd64'):
-        log_error(
-            f'Qwen3-ASR ships pinned x86_64 llama.cpp binaries; this host is '
-            f'{platform.machine()}. Select a different backend.')
-        return False
-
-    target = qwen3_asr_runtime.runtime_dir(device)
-    if not force and qwen3_asr_runtime.runtime_installed(device):
-        log_success(f'Qwen3-ASR runtime present: {qwen3_asr_runtime.LLAMA_CPP_RELEASE} ({device})')
-        return True
-
-    log_info(f'Installing Qwen3-ASR llama.cpp runtime {qwen3_asr_runtime.LLAMA_CPP_RELEASE} ({device})…')
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix='.llama-cpp-', dir=target.parent))
-    previous = target.with_name(f'.{target.name}.previous')
-    try:
-        with tempfile.TemporaryDirectory() as download_tmp:
-            archive = _download_llama_runtime(device, Path(download_tmp))
-            _extract_llama_runtime(archive, staging)
-        server = staging / 'llama-server'
-        if not server.is_file() or not os.access(server, os.X_OK):
-            raise RuntimeError('runtime archive did not yield an executable llama-server')
-        probe = subprocess.run([str(server), '--version'], capture_output=True,
-                               text=True, timeout=30, check=False,
-                               env={**os.environ, 'LD_LIBRARY_PATH': str(staging)})
-        if probe.returncode != 0:
-            detail = (probe.stderr or probe.stdout or '').strip().splitlines()
-            raise RuntimeError(
-                'llama-server failed its version check: '
-                + (detail[-1] if detail else f'exit {probe.returncode}'))
-        if previous.exists():
-            shutil.rmtree(previous)
-        if target.exists():
-            target.replace(previous)
-        staging.replace(target)
-        if previous.exists():
-            shutil.rmtree(previous, ignore_errors=True)
-        log_success(f'Qwen3-ASR runtime installed: {qwen3_asr_runtime.LLAMA_CPP_RELEASE} ({device})')
-        _prune_llama_runtimes()
-        return True
-    except Exception as exc:
-        if previous.exists() and not target.exists():
-            previous.replace(target)
-        log_error(f'Failed to install the Qwen3-ASR llama.cpp runtime: {exc}')
-        return False
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
-
-
-def _install_parakeet_cpp_payload(force_rebuild=False):
-    try:
-        from .parakeet_cpp_installer import install_payload
-        from .config_manager import ConfigManager
-    except ImportError:
-        from parakeet_cpp_installer import install_payload
-        from config_manager import ConfigManager
-    return install_payload(ConfigManager(), force=force_rebuild)
-
-
-def _install_qwen3_asr_payload(force_rebuild: bool = False) -> bool:
-    """Install the sidecar runtime and the configured GGUF pair.
-
-    Shared by the normal and managed install paths so a managed generation
-    cannot end up with the venv but none of the things that do the work.
-    """
-    try:
-        from .config_manager import ConfigManager
-    except ImportError:
-        from config_manager import ConfigManager
-    config = ConfigManager()
-    # An explicit reinstall re-reads the hardware, so a machine that has gained
-    # a GPU since the last setup can move off the CPU runtime.
-    device = qwen3_asr_runtime.resolve_device(config, force_probe=force_rebuild)
-    if device == 'cpu':
-        log_info("No hardware Vulkan GPU detected; installing the CPU runtime")
-    else:
-        log_info(f"Installing the {device} llama.cpp runtime")
-    # No created_items slot: install_qwen3_asr_runtime stages and swaps
-    # atomically, so a failure leaves nothing behind, and a runtime that did
-    # land should survive a later model-download failure so the retry only
-    # re-fetches the model.
-    if not install_qwen3_asr_runtime(device, force=force_rebuild):
-        return False
-
-    model_name = config.get_setting('qwen3_asr_model', qwen3_asr_runtime.DEFAULT_MODEL)
-    log_info(f"Downloading Qwen3-ASR model pair: {model_name}")
-    log_info("This may take several minutes depending on your connection speed.")
-    if not download_qwen3_asr_model(model_name):
-        log_info("Re-run 'hyprwhspr model download' to resume.")
-        return False
-    return True
-
-
-def _prune_llama_runtimes() -> None:
-    """Drop runtime trees from llama.cpp releases we no longer pin."""
-    root = qwen3_asr_runtime.QWEN3_ASR_RUNTIMES_DIR
-    try:
-        for entry in root.iterdir():
-            if entry.is_dir() and entry.name != qwen3_asr_runtime.LLAMA_CPP_RELEASE:
-                shutil.rmtree(entry, ignore_errors=True)
-    except OSError as exc:
-        log_debug(f'Could not remove an older llama.cpp runtime: {exc}')
 
 
 def _extract_package_name(requirement_line: str) -> str:
@@ -2251,18 +1458,24 @@ def install_pywhispercpp_cpu(pip_bin: Path, requirements_file: Path) -> bool:
             temp_req_path.unlink()
 
 
-def _prepare_pywhispercpp_sources() -> bool:
-    """Clean stale build artifacts and put the pywhispercpp checkout on the pinned commit.
+def install_pywhispercpp_cuda(pip_bin: Path) -> bool:
+    """Install pywhispercpp with CUDA support"""
+    log_info("Installing pywhispercpp with CUDA support...")
 
-    Returns False if the tree does not end up on PYWHISPERCPP_PINNED_COMMIT: building from
-    a stale checkout silently reintroduces whatever the pin bump was meant to fix.
-    """
-    verbosity = OutputController.get_verbosity()
-    verbose = verbosity.value >= VerbosityLevel.VERBOSE.value
+    # Try pre-built wheel first (much faster than source build)
+    wheel_path = download_pywhispercpp_wheel()  # Auto-detects CUDA version
+    if wheel_path:
+        if install_pywhispercpp_from_wheel(pip_bin, wheel_path):
+            return True
+        log_warning("Pre-built wheel failed, falling back to source build...")
+
+    install_system_dependencies()
+    log_info("Building from source (this may take several minutes)...")
 
     # Clean build artifacts if they exist (to avoid Python version mismatches)
     if PYWHISPERCPP_SRC_DIR.exists():
         log_info("Cleaning existing build artifacts...")
+        import shutil
         # Remove common build directories
         build_dirs = [
             PYWHISPERCPP_SRC_DIR / 'build',
@@ -2273,28 +1486,30 @@ def _prepare_pywhispercpp_sources() -> bool:
         for build_dir in build_dirs:
             if build_dir.exists():
                 shutil.rmtree(build_dir, ignore_errors=True)
-
+        
         # Remove egg-info directories
         for egg_info in PYWHISPERCPP_SRC_DIR.glob('*.egg-info'):
             if egg_info.is_dir():
                 shutil.rmtree(egg_info, ignore_errors=True)
-
+        
         # Remove CMake cache files (these can cache Python version)
         for cmake_cache in PYWHISPERCPP_SRC_DIR.rglob('CMakeCache.txt'):
             cmake_cache.unlink(missing_ok=True)
         for cmake_files in PYWHISPERCPP_SRC_DIR.rglob('CMakeFiles'):
             if cmake_files.is_dir():
                 shutil.rmtree(cmake_files, ignore_errors=True)
-
+        
         # Clean __pycache__ directories
         for pycache in PYWHISPERCPP_SRC_DIR.rglob('__pycache__'):
             if pycache.is_dir():
                 shutil.rmtree(pycache, ignore_errors=True)
-
+    
     # Clone or update pywhispercpp sources
     if not PYWHISPERCPP_SRC_DIR.exists() or not (PYWHISPERCPP_SRC_DIR / '.git').exists():
         log_info(f"Cloning pywhispercpp sources (v{PYWHISPERCPP_VERSION}) → {PYWHISPERCPP_SRC_DIR}")
         PYWHISPERCPP_SRC_DIR.parent.mkdir(parents=True, exist_ok=True)
+        verbosity = OutputController.get_verbosity()
+        verbose = verbosity.value >= VerbosityLevel.VERBOSE.value
         run_command([
             'git', 'clone', '--recurse-submodules',
             'https://github.com/Absadiki/pywhispercpp.git',
@@ -2310,48 +1525,17 @@ def _prepare_pywhispercpp_sources() -> bool:
         ], check=True, verbose=verbose)
     else:
         log_info(f"Updating pywhispercpp sources to v{PYWHISPERCPP_VERSION} in {PYWHISPERCPP_SRC_DIR}")
+        verbosity = OutputController.get_verbosity()
+        verbose = verbosity.value >= VerbosityLevel.VERBOSE.value
         try:
-            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'fetch', '--tags'],
-                        check=False, verbose=verbose)
-            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'checkout', PYWHISPERCPP_PINNED_COMMIT],
-                        check=False, verbose=verbose)
-            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'submodule', 'update', '--init', '--recursive'],
-                        check=False, verbose=verbose)
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'fetch', '--tags'], 
+                       check=False, verbose=verbose)
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'checkout', PYWHISPERCPP_PINNED_COMMIT], 
+                       check=False, verbose=verbose)
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'submodule', 'update', '--init', '--recursive'], 
+                       check=False, verbose=verbose)
         except Exception as e:
             log_warning(f"Could not update pywhispercpp repository to v{PYWHISPERCPP_VERSION}: {e}")
-
-    # The fetch/checkout above are best-effort; confirm the pin actually landed rather
-    # than building the previous commit and failing later with an unrelated-looking error.
-    head = run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'rev-parse', 'HEAD'],
-                       check=False, capture_output=True)
-    current = (head.stdout or '').strip() if head.returncode == 0 else ''
-    if current != PYWHISPERCPP_PINNED_COMMIT:
-        log_error(
-            f"pywhispercpp sources are at {current or 'an unknown commit'}, not the pinned "
-            f"{PYWHISPERCPP_PINNED_COMMIT} (v{PYWHISPERCPP_VERSION})"
-        )
-        log_error(f"Remove {PYWHISPERCPP_SRC_DIR} and re-run to get a clean checkout")
-        return False
-
-    return True
-
-
-def install_pywhispercpp_cuda(pip_bin: Path) -> bool:
-    """Install pywhispercpp with CUDA support"""
-    log_info("Installing pywhispercpp with CUDA support...")
-
-    # Try pre-built wheel first (much faster than source build)
-    wheel_path = download_pywhispercpp_wheel()  # Auto-detects CUDA version
-    if wheel_path:
-        if install_pywhispercpp_from_wheel(pip_bin, wheel_path):
-            return True
-        log_warning("Pre-built wheel failed, falling back to source build...")
-
-    install_system_dependencies()
-    log_info("Building from source (this may take several minutes)...")
-
-    if not _prepare_pywhispercpp_sources():
-        return False
     
     # Build with CUDA support
     log_info("Building pywhispercpp with CUDA (ggml CUDA) via pip - may take several minutes")
@@ -2396,8 +1580,70 @@ def install_pywhispercpp_rocm(pip_bin: Path) -> Tuple[bool, bool]:
     log_info("Installing pywhispercpp with ROCm support...")
     install_system_dependencies()
     
-    if not _prepare_pywhispercpp_sources():
-        return False, True
+    # Clean build artifacts if they exist (to avoid Python version mismatches)
+    if PYWHISPERCPP_SRC_DIR.exists():
+        log_info("Cleaning existing build artifacts...")
+        import shutil
+        # Remove common build directories
+        build_dirs = [
+            PYWHISPERCPP_SRC_DIR / 'build',
+            PYWHISPERCPP_SRC_DIR / 'dist',
+            PYWHISPERCPP_SRC_DIR / 'whisper.cpp' / 'build',
+            PYWHISPERCPP_SRC_DIR / 'whisper.cpp' / 'ggml' / 'build',
+        ]
+        for build_dir in build_dirs:
+            if build_dir.exists():
+                shutil.rmtree(build_dir, ignore_errors=True)
+        
+        # Remove egg-info directories
+        for egg_info in PYWHISPERCPP_SRC_DIR.glob('*.egg-info'):
+            if egg_info.is_dir():
+                shutil.rmtree(egg_info, ignore_errors=True)
+        
+        # Remove CMake cache files (these can cache Python version)
+        for cmake_cache in PYWHISPERCPP_SRC_DIR.rglob('CMakeCache.txt'):
+            cmake_cache.unlink(missing_ok=True)
+        for cmake_files in PYWHISPERCPP_SRC_DIR.rglob('CMakeFiles'):
+            if cmake_files.is_dir():
+                shutil.rmtree(cmake_files, ignore_errors=True)
+        
+        # Clean __pycache__ directories
+        for pycache in PYWHISPERCPP_SRC_DIR.rglob('__pycache__'):
+            if pycache.is_dir():
+                shutil.rmtree(pycache, ignore_errors=True)
+    
+    # Clone or update pywhispercpp sources
+    if not PYWHISPERCPP_SRC_DIR.exists() or not (PYWHISPERCPP_SRC_DIR / '.git').exists():
+        log_info(f"Cloning pywhispercpp sources (v{PYWHISPERCPP_VERSION}) → {PYWHISPERCPP_SRC_DIR}")
+        PYWHISPERCPP_SRC_DIR.parent.mkdir(parents=True, exist_ok=True)
+        verbosity = OutputController.get_verbosity()
+        verbose = verbosity.value >= VerbosityLevel.VERBOSE.value
+        run_command([
+            'git', 'clone', '--recurse-submodules',
+            'https://github.com/Absadiki/pywhispercpp.git',
+            str(PYWHISPERCPP_SRC_DIR)
+        ], check=True, verbose=verbose)
+        run_command([
+            'git', '-C', str(PYWHISPERCPP_SRC_DIR),
+            'checkout', PYWHISPERCPP_PINNED_COMMIT
+        ], check=True, verbose=verbose)
+        run_command([
+            'git', '-C', str(PYWHISPERCPP_SRC_DIR),
+            'submodule', 'update', '--init', '--recursive'
+        ], check=True, verbose=verbose)
+    else:
+        log_info(f"Updating pywhispercpp sources to v{PYWHISPERCPP_VERSION} in {PYWHISPERCPP_SRC_DIR}")
+        verbosity = OutputController.get_verbosity()
+        verbose = verbosity.value >= VerbosityLevel.VERBOSE.value
+        try:
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'fetch', '--tags'], 
+                       check=False, verbose=verbose)
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'checkout', PYWHISPERCPP_PINNED_COMMIT], 
+                       check=False, verbose=verbose)
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'submodule', 'update', '--init', '--recursive'], 
+                       check=False, verbose=verbose)
+        except Exception as e:
+            log_warning(f"Could not update pywhispercpp repository to v{PYWHISPERCPP_VERSION}: {e}")
     
     # Set up ROCm environment
     rocm_path = os.environ.get('ROCM_PATH', '/opt/rocm')
@@ -2447,9 +1693,7 @@ def install_pywhispercpp_rocm(pip_bin: Path) -> Tuple[bool, bool]:
 def install_pywhispercpp_vulkan(pip_bin: Path) -> bool:
     """Install pywhispercpp with Vulkan support.
 
-    Installs the pre-built Vulkan wheel when one exists for this Python and
-    glibc is at least VULKAN_WHEEL_MIN_GLIBC, otherwise builds from source
-    with GGML_VULKAN=1.
+    Uses GGML_VULKAN=1 environment variable to enable Vulkan acceleration.
     Works with AMD/Intel/ARM GPUs (discrete and integrated).
 
     Returns:
@@ -2457,29 +1701,72 @@ def install_pywhispercpp_vulkan(pip_bin: Path) -> bool:
         False if installation failed
     """
     log_info("Installing pywhispercpp with Vulkan support...")
-
-    glibc = _glibc_version()
-    if glibc is not None and glibc >= VULKAN_WHEEL_MIN_GLIBC:
-        wheel_path = download_pywhispercpp_wheel(VULKAN_WHEEL_VARIANT)
-        if wheel_path:
-            if install_pywhispercpp_from_wheel(pip_bin, wheel_path) and _wheel_native_libs_load(pip_bin):
-                return True
-            log_warning("Pre-built wheel failed, falling back to source build...")
-    else:
-        required = '.'.join(map(str, VULKAN_WHEEL_MIN_GLIBC))
-        log_info(f"Pre-built Vulkan wheel needs glibc {required} or newer; building from source")
-
-    missing = _missing_vulkan_build_tools()
-    if missing:
-        log_warning(f"Cannot build with Vulkan, missing: {', '.join(missing)}")
-        for hint in VULKAN_BUILD_PACKAGE_HINTS:
-            log_info(f"  {hint}")
-        return False
-
     install_system_dependencies()
 
-    if not _prepare_pywhispercpp_sources():
-        return False
+    # Clean build artifacts if they exist (to avoid Python version mismatches)
+    if PYWHISPERCPP_SRC_DIR.exists():
+        log_info("Cleaning existing build artifacts...")
+        import shutil
+        # Remove common build directories
+        build_dirs = [
+            PYWHISPERCPP_SRC_DIR / 'build',
+            PYWHISPERCPP_SRC_DIR / 'dist',
+            PYWHISPERCPP_SRC_DIR / 'whisper.cpp' / 'build',
+            PYWHISPERCPP_SRC_DIR / 'whisper.cpp' / 'ggml' / 'build',
+        ]
+        for build_dir in build_dirs:
+            if build_dir.exists():
+                shutil.rmtree(build_dir, ignore_errors=True)
+
+        # Remove egg-info directories
+        for egg_info in PYWHISPERCPP_SRC_DIR.glob('*.egg-info'):
+            if egg_info.is_dir():
+                shutil.rmtree(egg_info, ignore_errors=True)
+
+        # Remove CMake cache files (these can cache Python version)
+        for cmake_cache in PYWHISPERCPP_SRC_DIR.rglob('CMakeCache.txt'):
+            cmake_cache.unlink(missing_ok=True)
+        for cmake_files in PYWHISPERCPP_SRC_DIR.rglob('CMakeFiles'):
+            if cmake_files.is_dir():
+                shutil.rmtree(cmake_files, ignore_errors=True)
+
+        # Clean __pycache__ directories
+        for pycache in PYWHISPERCPP_SRC_DIR.rglob('__pycache__'):
+            if pycache.is_dir():
+                shutil.rmtree(pycache, ignore_errors=True)
+
+    # Clone or update pywhispercpp sources
+    if not PYWHISPERCPP_SRC_DIR.exists() or not (PYWHISPERCPP_SRC_DIR / '.git').exists():
+        log_info(f"Cloning pywhispercpp sources (v{PYWHISPERCPP_VERSION}) → {PYWHISPERCPP_SRC_DIR}")
+        PYWHISPERCPP_SRC_DIR.parent.mkdir(parents=True, exist_ok=True)
+        verbosity = OutputController.get_verbosity()
+        verbose = verbosity.value >= VerbosityLevel.VERBOSE.value
+        run_command([
+            'git', 'clone', '--recurse-submodules',
+            'https://github.com/Absadiki/pywhispercpp.git',
+            str(PYWHISPERCPP_SRC_DIR)
+        ], check=True, verbose=verbose)
+        run_command([
+            'git', '-C', str(PYWHISPERCPP_SRC_DIR),
+            'checkout', PYWHISPERCPP_PINNED_COMMIT
+        ], check=True, verbose=verbose)
+        run_command([
+            'git', '-C', str(PYWHISPERCPP_SRC_DIR),
+            'submodule', 'update', '--init', '--recursive'
+        ], check=True, verbose=verbose)
+    else:
+        log_info(f"Updating pywhispercpp sources to v{PYWHISPERCPP_VERSION} in {PYWHISPERCPP_SRC_DIR}")
+        verbosity = OutputController.get_verbosity()
+        verbose = verbosity.value >= VerbosityLevel.VERBOSE.value
+        try:
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'fetch', '--tags'],
+                       check=False, verbose=verbose)
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'checkout', PYWHISPERCPP_PINNED_COMMIT],
+                       check=False, verbose=verbose)
+            run_command(['git', '-C', str(PYWHISPERCPP_SRC_DIR), 'submodule', 'update', '--init', '--recursive'],
+                       check=False, verbose=verbose)
+        except Exception as e:
+            log_warning(f"Could not update pywhispercpp repository to v{PYWHISPERCPP_VERSION}: {e}")
 
     # Set up Vulkan environment
     # Start with mise-free environment if mise is active, otherwise use current environment
@@ -2521,94 +1808,6 @@ def install_pywhispercpp_vulkan(pip_bin: Path) -> bool:
 
 
 # ==================== Model Download ====================
-
-def _file_matches(path: Path, size: int, digest: str) -> bool:
-    return (path.is_file() and path.stat().st_size == size
-            and compute_file_hash(path) == digest)
-
-
-def _qwen3_model_present(path: Path, size: int, digest: str) -> bool:
-    """Is this model already installed, without re-hashing gigabytes?
-
-    A verified download records its digest in state, so the common "already
-    there" case costs a stat. Only an unrecorded file (an older install, or a
-    hand-copied one) pays the full hash.
-    """
-    if not path.is_file() or path.stat().st_size != size:
-        return False
-    if get_state(f'model_hash_{path.name}') == digest:
-        return True
-    if compute_file_hash(path) != digest:
-        return False
-    set_state(f'model_hash_{path.name}', digest)
-    return True
-
-
-def _qwen3_progress(role: str):
-    """urlretrieve reporthook mirroring download_pywhispercpp_model's output."""
-    def show_progress(block_num, block_size, total_size):
-        if not OutputController.is_progress_enabled():
-            return
-        downloaded = block_num * block_size
-        percent = min(100, (downloaded * 100) // total_size) if total_size > 0 else 0
-        size_mb = total_size / (1024 * 1024) if total_size > 0 else 0
-        downloaded_mb = min(downloaded, total_size or downloaded) / (1024 * 1024)
-        OutputController.write(
-            f"\r[INFO] {role}: {downloaded_mb:.1f}/{size_mb:.1f} MB ({percent}%)",
-            VerbosityLevel.NORMAL, flush=True)
-        if total_size > 0 and downloaded >= total_size:
-            OutputController.write("\n", VerbosityLevel.NORMAL, flush=True)
-    return show_progress
-
-
-def download_qwen3_asr_model(model_name: str = '1.7b-q8_0') -> bool:
-    """Atomically download and verify a pinned Qwen decoder/projector pair."""
-    metadata = QWEN3_ASR_MODELS.get(model_name)
-    if metadata is None:
-        log_error(f"Unsupported Qwen3-ASR model: {model_name}")
-        return False
-    QWEN3_ASR_MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    installed = []
-    partials = []
-    try:
-        for role in ('decoder', 'projector'):
-            filename, size, digest = metadata[role]
-            destination = QWEN3_ASR_MODELS_DIR / filename
-            if _qwen3_model_present(destination, size, digest):
-                log_success(f"Qwen3-ASR {role} present: {filename}")
-                installed.append(destination)
-                continue
-            partial = destination.with_name(destination.name + '.partial')
-            partials.append(partial)
-            partial.unlink(missing_ok=True)
-            url = (f"https://huggingface.co/{metadata['repo']}/resolve/"
-                   f"{metadata['revision']}/{filename}")
-            log_info(f"Downloading Qwen3-ASR {role}: {filename}")
-            urllib.request.urlretrieve(url, partial,
-                                       reporthook=_qwen3_progress(role))
-            if not _file_matches(partial, size, digest):
-                raise RuntimeError(f"{filename} failed pinned size/SHA-256 validation")
-            partial.replace(destination)
-            set_state(f'model_hash_{destination.name}', digest)
-            installed.append(destination)
-        try:
-            try:
-                from ..managed_install import record_ownership
-            except ImportError:
-                from managed_install import record_ownership
-            for path in installed:
-                if not record_ownership('file', path, 'model'):
-                    log_warning('Model installed but ownership was not recorded: '
-                                f'{path}: {record_ownership.last_error}')
-        except ImportError as exc:
-            log_warning(f"Model installed but ownership could not be recorded: {exc}")
-        log_success(f"Qwen3-ASR model installed: {model_name}")
-        return True
-    except Exception as exc:
-        log_error(f"Failed to download Qwen3-ASR model {model_name}: {exc}")
-        for partial in partials:
-            partial.unlink(missing_ok=True)
-        return False
 
 VAD_MODEL_FILENAME = 'ggml-silero-v5.1.2.bin'
 VAD_MODEL_URL = f"https://huggingface.co/ggml-org/whisper-vad/resolve/main/{VAD_MODEL_FILENAME}"
@@ -2683,90 +1882,11 @@ def download_pywhispercpp_model(model_name: str = 'base') -> bool:
         model_hash = compute_file_hash(model_file)
         set_state(f"model_hash_{model_file.name}", model_hash)
 
-        # Recorded for every install flavour: cli/uninstall.py --purge selects
-        # models purely by receipt kind, so an unrecorded model is never removed.
-        try:
-            try:
-                from ..managed_install import record_ownership
-            except ImportError:
-                from managed_install import record_ownership
-            if not record_ownership('file', model_file, 'model'):
-                log_warning('Model downloaded, but ownership could not be recorded: '
-                            f'{record_ownership.last_error}')
-        except ImportError as exc:
-            log_warning(f'Model downloaded, but ownership could not be recorded: {exc}')
-
         log_success(f"pywhispercpp model downloaded: {model_name}")
         return True
     except Exception as e:
         log_error(f"Failed to download pywhispercpp model {model_name}: {e}")
         return False
-
-
-_COHERE_DOWNLOAD_SCRIPT = r'''
-import os, traceback
-try:
-    try:
-        from huggingface_hub import enable_progress_bars
-        enable_progress_bars()
-    except ImportError:
-        pass
-    from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
-    import torch, sys
-    model_id = "CohereLabs/cohere-transcribe-03-2026"
-    token = os.environ.get("HF_TOKEN") or None
-    print("Downloading processor...", flush=True)
-    AutoProcessor.from_pretrained(model_id, trust_remote_code=True, token=token)
-    print("Downloading model weights (~4 GB)...", flush=True)
-    sys.stdout.flush()
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id, trust_remote_code=True, dtype=torch.bfloat16,
-        low_cpu_mem_usage=True, token=token,
-    )
-    del model
-    print("Model downloaded and cached successfully", flush=True)
-except BaseException:
-    diagnostic = traceback.format_exc()
-    diagnostic_path = os.environ.get("HYPRWHSPR_DOWNLOAD_DIAGNOSTIC")
-    if diagnostic_path:
-        with open(diagnostic_path, "w", encoding="utf-8") as handle:
-            handle.write(diagnostic)
-    raise
-'''
-
-
-def download_cohere_transcribe_model(hf_token: Optional[str] = None) -> Tuple[bool, Optional[str]]:
-    """Download Cohere weights through the managed venv without a fixed timeout."""
-    venv_python = VENV_DIR / 'bin' / 'python'
-    if not venv_python.exists():
-        return False, f'Cohere Transcribe venv not found at {venv_python}'
-    env = {**os.environ, 'PYTHONUNBUFFERED': '1'}
-    # Hugging Face retries/resumes files itself; this only bounds a stalled read,
-    # not the total multi-gigabyte download duration.
-    env.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '60')
-    if hf_token:
-        env['HF_TOKEN'] = hf_token
-    diagnostic_file = tempfile.NamedTemporaryFile(
-        prefix='hyprwhspr-cohere-download-', suffix='.log', delete=False)
-    diagnostic_file.close()
-    diagnostic_path = Path(diagnostic_file.name)
-    env['HYPRWHSPR_DOWNLOAD_DIAGNOSTIC'] = str(diagnostic_path)
-    try:
-        run_command([str(venv_python), '-c', _COHERE_DOWNLOAD_SCRIPT], check=True,
-                    env=env, verbose=True)
-        return True, None
-    except Exception as exc:
-        try:
-            detail = diagnostic_path.read_text(encoding='utf-8').strip()
-        except OSError:
-            detail = str(exc)
-        detail = detail or str(exc)
-        return False, f'Cohere Transcribe model download failed:\n{detail}'
-    finally:
-        try:
-            diagnostic_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def _complete_pywhispercpp_cpu_fallback(created_items: dict) -> str:
@@ -2818,26 +1938,15 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
         log_error(str(exc))
         return False
 
-    if os.environ.get('HYPRWHSPR_GENERATION'):
-        try:
-            selected, variant = _managed_backend_variant(backend_type)
-            _managed_select(selected, custom_python, force_rebuild, variant=variant)
-            if backend_type == 'parakeet-cpp':
-                return _install_parakeet_cpp_payload(force_rebuild)
-            if backend_type == 'qwen3-asr':
-                # Unlike cohere/onnx/faster-whisper, this backend has no lazy
-                # first-use download — the sidecar and GGUF pair must be placed
-                # here or the managed install is permanently non-functional.
-                return _install_qwen3_asr_payload(force_rebuild)
-            return True
-        except Exception as exc:
-            log_error(f'Managed backend installation failed: {exc}')
-            return False
-
     init_state()
     set_install_state('in_progress')
 
     log_info(f"Installing {backend_type.upper()} backend...")
+
+    # Check for MISE interference
+    if _check_mise_active():
+        log_warning("Warning! MISE is active. This may cause build errors.")
+        log_warning("To fix: mise deactivate (or: mise unuse -g python)")
 
     dependency_family = initial_plan.family
     previous_family = get_state("dependency_family")
@@ -2913,65 +2022,62 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
                 set_install_state('failed', error_msg)
                 return False
 
+            # Pre-download model weights so the service starts immediately without a
+            # multi-gigabyte fetch on first transcription. low_cpu_mem_usage=True avoids
+            # loading the full ~8 GB fp32 weights into RAM during the cache-only download.
             log_info("Downloading Cohere Transcribe model from HuggingFace (~4 GB)...")
             log_info("This may take several minutes depending on your connection speed.")
-            hf_token = None
+            venv_python = VENV_DIR / 'bin' / 'python'
+            download_script = '''
+try:
+    from huggingface_hub import enable_progress_bars
+    enable_progress_bars()
+except ImportError:
+    pass
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+import torch, os, sys
+model_id = "CohereLabs/cohere-transcribe-03-2026"
+token = os.environ.get("HF_TOKEN") or None
+print("Downloading processor...", flush=True)
+processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True, token=token)
+print("Downloading model weights (~4 GB)...", flush=True)
+sys.stdout.flush()
+model = AutoModelForSpeechSeq2Seq.from_pretrained(
+    model_id,
+    trust_remote_code=True,
+    dtype=torch.bfloat16,
+    low_cpu_mem_usage=True,
+    token=token,
+)
+del model
+print("Model downloaded and cached successfully", flush=True)
+'''
+            # Inject the HuggingFace token so the gated repo download succeeds
+            download_env = None
             try:
                 from credential_manager import get_credential
                 hf_token = get_credential('huggingface')
+                if hf_token:
+                    import os as _os
+                    download_env = {**_os.environ, 'HF_TOKEN': hf_token, 'PYTHONUNBUFFERED': '1'}
+                else:
+                    import os as _os
+                    download_env = {**_os.environ, 'PYTHONUNBUFFERED': '1'}
             except Exception:
-                pass
+                import os as _os
+                download_env = {**_os.environ, 'PYTHONUNBUFFERED': '1'}
 
-            downloaded, diagnostic = download_cohere_transcribe_model(hf_token)
-            if downloaded:
+            try:
+                run_command([str(venv_python), '-c', download_script], check=True, timeout=900,
+                            env=download_env, verbose=True)
                 log_success("Cohere Transcribe model downloaded and cached")
-            else:
-                error_msg = diagnostic or 'Cohere Transcribe model download failed'
-                log_error(error_msg)
-                log_info("Re-running setup resumes the cached Hugging Face download.")
-                log_info("If Cohere is already configured, run: hyprwhspr model download")
-                set_install_state('failed', error_msg)
-                return False
+            except Exception as e:
+                log_warning(f"Model pre-download failed: {e}")
+                log_warning("Model will be downloaded automatically on first use instead.")
+                # Don't fail the installation — the service can still download on first start
 
             set_install_state('completed')
             log_success("Cohere Transcribe backend installation completed!")
-            return True
-
-        elif backend_type == 'parakeet-cpp':
-            try:
-                execute_dependency_plan(initial_plan, custom_python=custom_python,
-                                        force_rebuild=force_rebuild)
-            except Exception as exc:
-                error_msg = f"Failed to install Parakeet.cpp dependencies: {exc}"
-                log_error(error_msg)
-                set_install_state('failed', error_msg)
-                return False
-            if not _install_parakeet_cpp_payload(force_rebuild):
-                set_install_state('failed', 'Parakeet.cpp runtime or model installation failed')
-                return False
-            set_install_state('completed')
-            return True
-
-        elif backend_type == 'qwen3-asr':
-            # Inference runs in a pinned llama.cpp sidecar, so the only Python
-            # dependencies are the core audio ones every backend shares.
-            plan = resolve_dependency_plan('qwen3-asr')
-            try:
-                execute_dependency_plan(plan, custom_python=custom_python,
-                                        force_rebuild=force_rebuild)
-            except Exception as exc:
-                error_msg = f"Failed to install Qwen3-ASR dependencies: {exc}"
-                log_error(error_msg)
-                set_install_state('failed', error_msg)
-                return False
-
-            if not _install_qwen3_asr_payload(force_rebuild):
-                error_msg = 'Qwen3-ASR runtime or model installation failed'
-                set_install_state('failed', error_msg)
-                return False
-
-            set_install_state('completed')
-            log_success("Qwen3-ASR backend installation completed!")
             return True
 
         elif backend_type == 'onnx-asr':
@@ -3009,6 +2115,27 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
                     set_install_state('failed', error_msg)
                     return False
 
+            # Pre-download models so they're ready on first use
+            log_info("Downloading ONNX-ASR model and VAD (this may take a moment)...")
+            venv_python = VENV_DIR / 'bin' / 'python'
+            try:
+                # Download and cache the ASR model + Silero VAD
+                # This mirrors what happens at runtime but ensures everything is ready
+                download_script = '''
+import onnx_asr
+print("Downloading Parakeet TDT V3 model...", flush=True)
+model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3", quantization="int8")
+print("Downloading Silero VAD...", flush=True)
+vad = onnx_asr.load_vad("silero")
+print("Models cached successfully", flush=True)
+'''
+                run_command([str(venv_python), '-c', download_script], check=True)
+                log_success("Models downloaded and cached")
+            except Exception as e:
+                log_warning(f"Model download failed: {e}")
+                log_warning("Models will be downloaded on first use instead")
+                # Don't fail installation - models can still be downloaded on first use
+
             # Installation successful for ONNX-ASR
             set_install_state('completed')
             log_success("ONNX-ASR backend installation completed!")
@@ -3019,6 +2146,18 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
         requirements_file = manifests[-1]
         cur_req_hash = dependency_manifest_hash(manifests)
         stored_req_hash = get_state("dependency_manifest_hash")
+
+        deps_installed = False
+        if VENV_DIR.exists():
+            python_bin = VENV_DIR / 'bin' / 'python'
+            try:
+                result = run_command([
+                    'timeout', '5s', str(python_bin), '-c',
+                    'import sounddevice, pywhispercpp'
+                ], check=False, capture_output=True, show_output_on_error=False)
+                deps_installed = result.returncode == 0
+            except Exception:
+                pass
 
         # Which pywhispercpp build variant is being requested *right now*?
         # (Differs from backend_type only inside this function: GPU setup may
@@ -3032,18 +2171,6 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
             requested_variant = 'vulkan'
         else:
             requested_variant = 'cpu'
-
-        planned_dependency_state = resolve_dependency_plan(
-            backend_type, accelerated_variant=requested_variant)
-        deps_installed = False
-        if VENV_DIR.exists():
-            try:
-                # A failed required import—including inherited NumPy/soxr—forces
-                # a fresh transaction instead of repairing the live venv in place.
-                deps_installed = _verify_dependency_plan_detailed(
-                    planned_dependency_state).ok
-            except Exception:
-                pass
 
         stored_installed_backend = get_state("installed_backend")
         backend_mismatch = bool(stored_installed_backend) and stored_installed_backend != requested_variant
@@ -3062,11 +2189,6 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
         if needs_install:
             created_items['venv_created'] = True
             created_items['venv_path'] = str(VENV_DIR)
-            snapshot_plan = resolve_dependency_plan(
-                backend_type, accelerated_variant=requested_variant)
-            snapshot = _snapshot_inherited_dependencies(snapshot_plan)
-        else:
-            snapshot = []
 
         # Install pywhispercpp if needed
         if needs_install:
@@ -3205,18 +2327,10 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
             log_info("Python dependencies up to date (skipping pip install)")
         
         plan = resolve_dependency_plan(backend_type, accelerated_variant=requested_variant)
-        if needs_install:
-            verification = _verify_and_repair_dependency_plan(plan, pip_bin)
-        else:
-            # The precheck above proved this live venv healthy. Do not mutate it
-            # outside a VenvTransaction if a later/racing verification now fails.
-            verification = _verify_dependency_plan_detailed(plan)
-        if not verification.ok:
-            diagnostic = _format_dependency_diagnostic(plan, verification, snapshot)
-            log_error('Dependency verification failed: '
-                      + _summarize_dependency_failure(verification))
-            log_debug(diagnostic)
-            set_install_state('failed', diagnostic)
+        if not _verify_dependency_plan(plan):
+            error_msg = "pywhispercpp installation did not provide required imports"
+            log_error(error_msg)
+            set_install_state('failed', error_msg)
             _cleanup_partial_installation(created_items, pip_bin)
             return False
 
@@ -3239,10 +2353,7 @@ def install_backend(backend_type: str, cleanup_on_failure: bool = True, force_re
         
         # Installation successful
         set_install_state('completed')
-        if requested_variant == 'cpu' and (enable_cuda or enable_rocm or enable_vulkan):
-            log_warning(f"{backend_type.upper()} build failed; installed CPU-only instead.")
-        else:
-            log_success(f"{backend_type.upper()} backend installation completed!")
+        log_success(f"{backend_type.upper()} backend installation completed!")
         return True
         
     except KeyboardInterrupt:
@@ -3310,45 +2421,3 @@ def _cleanup_partial_installation(created_items: dict, pip_bin: Optional[Path]):
                        check=False, capture_output=True)
         except Exception:
             pass
-
-
-def _managed_backend_variant(backend):
-    probes = {'nvidia': setup_nvidia_support, 'amd': setup_amd_support,
-              'vulkan': setup_vulkan_support}
-    if backend in probes:
-        if not probes[backend]():
-            log_warning(f'{backend} support unavailable; falling back to CPU')
-            return 'cpu', 'cpu'
-        return backend, backend
-    if backend in ('onnx-asr', 'faster-whisper') and _detect_nvidia_gpu_listing():
-        return backend, 'gpu' if backend == 'onnx-asr' else 'cuda'
-    return backend, 'cpu' if backend == 'cpu' else None
-
-
-def _managed_select(backend, python, repair, provider=None, variant=None):
-    """Keep setup callers on the newly selected immutable environment."""
-    global VENV_DIR
-    try:
-        from .managed_install import Installation, CommittedCleanupError
-    except ImportError:
-        from managed_install import Installation, CommittedCleanupError
-    previous = VENV_DIR
-    current = json.loads(os.environ['HYPRWHSPR_GENERATION'])
-    cleanup_error = None
-    try:
-        generation = Installation().update(current['version'], python, False,
-                                           {'backend': backend, 'provider': provider, 'variant': variant},
-                                           force_backend=repair, local_payload=True)
-    except CommittedCleanupError as exc:
-        generation = exc.generation
-        cleanup_error = exc
-    VENV_DIR = Path(generation['backend']['path'])
-    os.environ['HYPRWHSPR_BACKEND_ENV'] = str(VENV_DIR)
-    os.environ['HYPRWHSPR_GENERATION'] = json.dumps(generation)
-    # Existing CLI modules import this constant; update only this process after
-    # the transaction succeeds. Daemons retain their original generation.
-    for module in tuple(sys.modules.values()):
-        if getattr(module, 'VENV_DIR', None) == previous:
-            module.VENV_DIR = VENV_DIR
-    if cleanup_error:
-        raise SystemExit(f'Backend activated successfully. {cleanup_error}. Retry install repair for cleanup.')

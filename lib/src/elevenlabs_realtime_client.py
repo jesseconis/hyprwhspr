@@ -14,11 +14,6 @@ try:
 except ImportError:
     from realtime_base import RealtimeAudioClientBase
 
-try:
-    from .text_script import join_segments
-except ImportError:
-    from text_script import join_segments
-
 import numpy as np
 
 
@@ -28,8 +23,8 @@ class ElevenLabsRealtimeClient(RealtimeAudioClientBase):
     LOG_TAG = '[ELEVENLABS]'
     DEFAULT_SAMPLE_RATE = 16000
 
-    def __init__(self, mode: str = 'transcribe'):
-        """Initialize ElevenLabs realtime client (transcription only; mode is ignored)"""
+    def __init__(self):
+        """Initialize ElevenLabs realtime client"""
         super().__init__()
         self.model = 'scribe_v2_realtime'
         self.input_sample_rate = self.DEFAULT_SAMPLE_RATE
@@ -50,6 +45,7 @@ class ElevenLabsRealtimeClient(RealtimeAudioClientBase):
         self._partial_transcript = ''
         self._transcript_generation = 0
         self._committed_segments = []
+        self._partial_transcript_callback: Optional[Callable[[str], None]] = None
 
         # Auto-commit helper:
         # ElevenLabs punctuation often improves on committed transcripts.
@@ -459,19 +455,32 @@ class ElevenLabsRealtimeClient(RealtimeAudioClientBase):
         callback: Optional[Callable[[str], None]],
     ) -> None:
         """Set the live-preview callback retained across reconnects."""
-        super().set_partial_transcript_callback(callback)
+        with self.lock:
+            self._partial_transcript_callback = callback
         if callback is not None:
             self._emit_partial_transcript()
 
     def _committed_text_locked(self) -> str:
         """Joined committed transcript. Call with self.lock held."""
-        return join_segments(self._committed_segments)
+        parts = [part for part in self._committed_segments if part]
+        return ' '.join(parts).strip()
 
     def _emit_partial_transcript(self) -> None:
         with self.lock:
+            callback = self._partial_transcript_callback
             committed = self._committed_text_locked()
-            partial = self._partial_transcript
-        self._publish_live_text(committed, partial)
+            partial = self._partial_transcript.strip()
+            preview = f'{committed} {partial}'.strip() if partial else committed
+
+        if callback is None:
+            return
+        try:
+            callback(preview)
+        except Exception as exc:
+            print(
+                f'[ELEVENLABS] Failed to update partial transcript preview: {exc}',
+                flush=True,
+            )
 
     def clear_audio_buffer(self):
         """Clear state before starting a new recording"""
