@@ -18,6 +18,12 @@ gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib
 
 
+try:
+    from .transcript_stability import decode_meta, meta_path_for
+except ImportError:
+    from mic_osd.transcript_stability import decode_meta, meta_path_for
+
+
 def is_gnome():
     desktop = os.environ.get('XDG_CURRENT_DESKTOP', '').lower()
     return 'gnome' in desktop
@@ -428,12 +434,26 @@ class MicOSD:
                 self.audio_monitor = None
 
     def _clear_preview_file(self):
-        try:
-            if TRANSCRIPT_PREVIEW_FILE.exists():
-                TRANSCRIPT_PREVIEW_FILE.unlink()
-        except Exception:
-            pass
+        for path in (TRANSCRIPT_PREVIEW_FILE, meta_path_for(TRANSCRIPT_PREVIEW_FILE)):
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
     
+    @staticmethod
+    def _read_preview_committed_length(preview):
+        """Finalized-prefix length for ``preview`` from its sidecar, if valid."""
+        if not preview:
+            return None
+        try:
+            meta_file = meta_path_for(TRANSCRIPT_PREVIEW_FILE)
+            if not meta_file.exists():
+                return None
+            return decode_meta(preview, meta_file.read_text(encoding='utf-8'))
+        except Exception:
+            return None
+
     def _update(self):
         """Update visualization with current audio data."""
         if self.audio_monitor and self.window and self.visible:
@@ -467,10 +487,14 @@ class MicOSD:
             preview = ""
             if TRANSCRIPT_PREVIEW_FILE.exists():
                 preview = TRANSCRIPT_PREVIEW_FILE.read_text(encoding='utf-8').rstrip('\r\n')
-            if preview != self._last_preview_text:
-                self._last_preview_text = preview
+            committed_length = self._read_preview_committed_length(preview)
+            snapshot = (preview, committed_length)
+            if snapshot != self._last_preview_text:
+                self._last_preview_text = snapshot
                 if self.window and hasattr(self.window, 'set_preview_text'):
-                    self.window.set_preview_text(preview)
+                    self.window.set_preview_text(
+                        preview, committed_length=committed_length
+                    )
         except Exception:
             pass  # Ignore file read errors
         return True  # Continue polling

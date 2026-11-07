@@ -27,6 +27,16 @@ except ImportError:
         MIC_OSD_LEVEL_FEED_FILE, MIC_OSD_VISIBLE_FILE,
     )
 
+try:
+    from .transcript_stability import encode_meta, meta_path_for
+except ImportError:
+    from mic_osd.transcript_stability import encode_meta, meta_path_for
+
+
+def _committed_length_of(text):
+    value = getattr(text, "committed_length", None)
+    return value if isinstance(value, int) else None
+
 
 class MicOSDRunner:
     """
@@ -562,8 +572,16 @@ sys.exit(main())
             print(f"[MIC-OSD] Failed to clear visualizer state: {e}", flush=True)
 
     def set_preview_text(self, text: str):
-        """Set live transcript preview text."""
-        text = (text or "").rstrip('\r\n')
+        """Set live transcript preview text.
+
+        ``text`` may carry a ``committed_length`` attribute (see
+        ``src.preview_text.PreviewText``); it is forwarded to the OSD so the
+        finalized prefix can be styled apart from the provisional tail.
+        """
+        committed_length = _committed_length_of(text)
+        text = str(text or "").rstrip('\r\n')
+        if committed_length is not None:
+            committed_length = min(committed_length, len(text))
 
         with self._preview_lock:
             if not text:
@@ -577,10 +595,10 @@ sys.exit(main())
             if elapsed >= self.PREVIEW_WRITE_INTERVAL_SECONDS:
                 self._cancel_pending_preview_flush()
                 self._last_preview_write_at = now
-                self._write_preview_text_file(text)
+                self._write_preview_text_file(text, committed_length)
                 return
 
-            self._pending_preview_text = text
+            self._pending_preview_text = (text, committed_length)
             if self._preview_flush_timer is None:
                 generation = self._preview_generation
                 delay = self.PREVIEW_WRITE_INTERVAL_SECONDS - elapsed
@@ -603,15 +621,16 @@ sys.exit(main())
             if generation != self._preview_generation:
                 return
 
-            text = self._pending_preview_text
+            pending = self._pending_preview_text
             self._pending_preview_text = None
             self._preview_flush_timer = None
 
-            if text is None:
+            if pending is None:
                 return
 
+            text, committed_length = pending
             self._last_preview_write_at = time.monotonic()
-            self._write_preview_text_file(text)
+            self._write_preview_text_file(text, committed_length)
 
     @staticmethod
     def _atomic_write_runtime_file(path, text: str):
@@ -640,13 +659,30 @@ sys.exit(main())
         except Exception:
             pass
 
-    def _write_preview_text_file(self, text: str):
-        """Write live preview text to the runtime IPC file."""
+    @staticmethod
+    def _unlink_if_exists(path):
+        if path.exists():
+            path.unlink()
+
+    def _write_preview_text_file(self, text: str, committed_length=None):
+        """Write live preview text (and its stability sidecar) for the OSD.
+
+        The sidecar is written first and is bound to the text by checksum, so
+        a reader that sees the new sidecar with the old text ignores it.
+        """
+        meta_file = meta_path_for(TRANSCRIPT_PREVIEW_FILE)
         try:
             if text:
+                if committed_length is None:
+                    self._unlink_if_exists(meta_file)
+                else:
+                    self._atomic_write_runtime_file(
+                        meta_file, encode_meta(text, committed_length)
+                    )
                 self._atomic_write_runtime_file(TRANSCRIPT_PREVIEW_FILE, text)
-            elif TRANSCRIPT_PREVIEW_FILE.exists():
-                TRANSCRIPT_PREVIEW_FILE.unlink()
+            else:
+                self._unlink_if_exists(TRANSCRIPT_PREVIEW_FILE)
+                self._unlink_if_exists(meta_file)
         except Exception as e:
             print(f"[MIC-OSD] Failed to write transcript preview: {e}", flush=True)
 
@@ -656,8 +692,8 @@ sys.exit(main())
             with self._preview_lock:
                 self._cancel_pending_preview_flush()
                 self._preview_generation += 1
-                if TRANSCRIPT_PREVIEW_FILE.exists():
-                    TRANSCRIPT_PREVIEW_FILE.unlink()
+                self._unlink_if_exists(TRANSCRIPT_PREVIEW_FILE)
+                self._unlink_if_exists(meta_path_for(TRANSCRIPT_PREVIEW_FILE))
         except Exception as e:
             print(f"[MIC-OSD] Failed to clear transcript preview: {e}", flush=True)
 

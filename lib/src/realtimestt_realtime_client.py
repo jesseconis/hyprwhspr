@@ -15,8 +15,10 @@ from typing import Optional
 
 try:
     from .realtime_base import WebSocketRealtimeClientBase
+    from .preview_text import PreviewText
 except ImportError:
     from realtime_base import WebSocketRealtimeClientBase
+    from preview_text import PreviewText
 
 
 class RealtimeSTTRealtimeClient(WebSocketRealtimeClientBase):
@@ -184,6 +186,16 @@ class RealtimeSTTRealtimeClient(WebSocketRealtimeClientBase):
         segment = self._segment_key(event)
         text = (event.get("text") or "").strip()
         if not text:
+            # An empty final still closes the segment: its provisional partial
+            # will never be confirmed, so stop presenting it.
+            with self.lock:
+                if not self._accept_segment_locked(segment):
+                    return
+                self._latest_sequences.pop(segment, None)
+                if self._partial_by_segment.pop(segment, None) is None:
+                    return
+                preview = self._preview_text_locked()
+            self._notify_partial_transcript(preview)
             return
 
         with self.lock:
@@ -229,15 +241,59 @@ class RealtimeSTTRealtimeClient(WebSocketRealtimeClientBase):
             return False
         return True
 
-    def _preview_text_locked(self, active_segment=None) -> str:
-        parts = list(self._final_by_segment.values())
-        if active_segment is not None:
-            partial = self._partial_by_segment.get(active_segment, "")
-            if partial:
-                parts.append(partial)
-        elif self._partial_by_segment:
-            parts.extend(self._partial_by_segment.values())
-        return " ".join(part for part in parts if part).strip()
+    def _ordered_preview_segments_locked(self):
+        """Segments in spoken order: numeric ids ascending, unnumbered last.
+
+        A partial whose segment is older than the newest final can no longer be
+        finalized (the server moved on without confirming it), so it is
+        dropped rather than left on screen as text the result won't contain.
+        """
+        keys = list(self._final_by_segment)
+        keys.extend(k for k in self._partial_by_segment if k not in self._final_by_segment)
+        numbered = sorted(k for k in keys if isinstance(k, int))
+        unnumbered = [k for k in keys if not isinstance(k, int)]
+        finalized_numbers = [k for k in self._final_by_segment if isinstance(k, int)]
+        newest_final = max(finalized_numbers) if finalized_numbers else None
+        ordered = []
+        for key in numbered + unnumbered:
+            if (
+                key not in self._final_by_segment
+                and isinstance(key, int)
+                and newest_final is not None
+                and key < newest_final
+            ):
+                continue
+            ordered.append(key)
+        return ordered
+
+    def _preview_text_locked(self, active_segment=None) -> PreviewText:
+        """Finals plus every still-pending partial, in segment order.
+
+        Earlier segments' partials stay visible while their (slower) final
+        inference is in flight, instead of vanishing as soon as the next
+        segment starts streaming and then reappearing.  The result records how
+        many leading characters are finalized so the OSD can style the
+        provisional tail differently.  ``active_segment`` is accepted for
+        compatibility; every pending segment is always included.
+        """
+        parts = []
+        committed_length = 0
+        prefix_final = True
+        for key in self._ordered_preview_segments_locked():
+            if key in self._final_by_segment:
+                part = self._final_by_segment[key]
+                is_final = True
+            else:
+                part = self._partial_by_segment.get(key, "")
+                is_final = False
+            if not part:
+                continue
+            parts.append(part)
+            if prefix_final and is_final:
+                committed_length = len(" ".join(parts))
+            else:
+                prefix_final = False
+        return PreviewText(" ".join(parts), committed_length)
 
     def set_partial_transcript_callback(self, callback):
         self.partial_transcript_callback = callback

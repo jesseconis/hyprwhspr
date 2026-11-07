@@ -25,6 +25,7 @@ from gi.repository import Gtk, Gdk, GLib
 from .theme import theme
 from .osd_config import MicOSDConfig
 from .transcript_preview import PillTranscriptAnimator, PillTranscriptConfig
+from .transcript_stability import TranscriptChangeTracker
 
 if LAYER_SHELL_AVAILABLE:
     from gi.repository import Gtk4LayerShell
@@ -93,6 +94,8 @@ class OSDWindow(Gtk.Window):
         self._height = height
         self._meter_height = height
         self._preview_text = ""
+        self._preview_committed_length = None
+        self._stability_tracker = None
         self._visualizer_state = "recording"
         self._pill_transcript_animator = None
         if self._is_pill_preview:
@@ -198,9 +201,19 @@ class OSDWindow(Gtk.Window):
         self.visualization.update(level, samples)
         self.drawing_area.queue_draw()
 
-    def set_preview_text(self, text: str):
-        """Set compact transcript preview text."""
+    def set_preview_text(self, text: str, committed_length=None):
+        """Set compact transcript preview text.
+
+        ``committed_length`` is the number of leading characters the backend
+        has finalized, when known; the spectrum preview styles the rest as
+        provisional.
+        """
         self._preview_text = (text or "").rstrip('\r\n')
+        self._preview_committed_length = (
+            min(committed_length, len(self._preview_text))
+            if isinstance(committed_length, int)
+            else None
+        )
         if self._pill_transcript_animator is not None:
             self._pill_transcript_animator.set_text(self._preview_text)
         self.drawing_area.queue_draw()
@@ -225,6 +238,13 @@ class OSDWindow(Gtk.Window):
                 self,
                 Gtk4LayerShell.Edge.BOTTOM,
                 osd_config.bottom_margin,
+            )
+
+        tracker = getattr(self, '_stability_tracker', None)
+        if tracker is not None:
+            tracker.configure(
+                osd_config.transcript_change_highlight_ms / 1000.0,
+                osd_config.transcript_stability_cues,
             )
 
         if self._is_dynamic_preview:
@@ -330,11 +350,161 @@ class OSDWindow(Gtk.Window):
             pass
         return max(self._meter_height, 720)
 
+    # -- spectrum transcript: stability-aware layout and painting ----------
+
+    # Provisional text keeps this fraction of the configured opacity.
+    LIVE_TEXT_ALPHA = 0.72
+    # How far provisional text is tinted toward the theme's transcript-live.
+    LIVE_TINT = 0.45
+    # Left-gutter marker drawn beside lines holding a highlighted revision.
+    CHANGE_GUTTER_X = 8.0
+    CHANGE_GUTTER_WIDTH = 3.0
+
+    def _transcript_tracker(self) -> TranscriptChangeTracker:
+        tracker = getattr(self, '_stability_tracker', None)
+        if tracker is None:
+            config = self._osd_config
+            tracker = TranscriptChangeTracker(
+                highlight_seconds=config.transcript_change_highlight_ms / 1000.0,
+                enabled=config.transcript_stability_cues,
+            )
+            self._stability_tracker = tracker
+        return tracker
+
+    def _layout_preview_cues(self, cr: cairo.Context, cues, max_width: float):
+        """Greedy-wrap word cues into lines of ``(cue_index, x, text)`` pieces.
+
+        Mirrors ``_wrap_preview_lines`` (paragraph breaks, long-token
+        splitting) but keeps each word's identity and x offset so words can be
+        styled individually.  Empty lists are blank paragraph lines.
+        """
+        if not cues or max_width <= 0:
+            return []
+
+        lines = []
+        current = []
+        current_text = ""
+
+        for index, cue in enumerate(cues):
+            if cue.breaks_before:
+                if current:
+                    lines.append(current)
+                    current, current_text = [], ""
+                if cue.breaks_before >= 2 and lines and lines[-1]:
+                    lines.append([])
+
+            word = cue.text
+            candidate = f"{current_text} {word}" if current_text else word
+            if self._text_advance(cr, candidate) <= max_width:
+                x = (
+                    self._text_advance(cr, current_text + " ")
+                    if current_text
+                    else 0.0
+                )
+                current.append((index, x, word))
+                current_text = candidate
+                continue
+
+            if current:
+                lines.append(current)
+                current, current_text = [], ""
+
+            remainder = word
+            while remainder and self._text_advance(cr, remainder) > max_width:
+                count = self._bisect_truncate(
+                    lambda n: self._text_advance(cr, remainder[:n]),
+                    max_width,
+                    len(remainder),
+                )
+                count = max(1, count)
+                lines.append([(index, 0.0, remainder[:count])])
+                remainder = remainder[count:]
+            if remainder:
+                current = [(index, 0.0, remainder)]
+                current_text = remainder
+
+        if current:
+            lines.append(current)
+        while lines and not lines[-1]:
+            lines.pop()
+        return lines
+
+    def _prefix_truncated_line(self, cr: cairo.Context, line, max_width: float):
+        """Prefix the oldest visible line with an ellipsis, dropping its
+        leading words if needed so the line still fits."""
+        prefix = "… "
+        if not line:
+            return line
+        pieces = list(line)
+        while (
+            len(pieces) > 1
+            and self._text_advance(
+                cr, prefix + " ".join(piece[2] for piece in pieces)
+            ) > max_width
+        ):
+            pieces.pop(0)
+
+        rebuilt = []
+        text_so_far = prefix
+        for position, (index, _x, text) in enumerate(pieces):
+            if position == 0:
+                rebuilt.append((index, 0.0, prefix + text))
+                text_so_far += text
+            else:
+                x = self._text_advance(cr, text_so_far + " ")
+                rebuilt.append((index, x, text))
+                text_so_far += " " + text
+        return rebuilt
+
+    @staticmethod
+    def _cue_style_key(cue):
+        # Quantize so runs of similarly styled words are painted together.
+        return (
+            round(cue.settled * 16) / 16.0,
+            round(cue.highlight * 32) / 32.0,
+        )
+
+    def _line_runs(self, line, cues):
+        """Group a line's pieces into maximal runs sharing one style."""
+        runs = []
+        for index, x, text in line:
+            key = self._cue_style_key(cues[index])
+            if runs and runs[-1]["key"] == key:
+                runs[-1]["texts"].append(text)
+            else:
+                runs.append({"key": key, "x": x, "texts": [text]})
+        for run in runs:
+            run["text"] = " ".join(run["texts"])
+        return runs
+
+    @staticmethod
+    def _mix(a, b, amount):
+        return tuple(a[i] + (b[i] - a[i]) * amount for i in range(3))
+
+    @staticmethod
+    def _rounded_rect(cr: cairo.Context, x, y, w, h, r):
+        r = max(0.0, min(r, w / 2.0, h / 2.0))
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2.0, 0.0)
+        cr.arc(x + w - r, y + h - r, r, 0.0, math.pi / 2.0)
+        cr.arc(x + r, y + h - r, r, math.pi / 2.0, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+        cr.close_path()
+
     def _draw_dynamic_preview_text(self, cr: cairo.Context, width: int):
         config = self._osd_config
+        tracker = self._transcript_tracker()
         if not self._preview_text or self._visualizer_state != "recording":
+            tracker.reset()
             self._set_dynamic_height(self._meter_height)
             return
+
+        # Diff against the previous frame's text (a no-op when unchanged).
+        tracker.update(
+            self._preview_text,
+            getattr(self, '_preview_committed_length', None),
+        )
+        cues = tracker.cues()
 
         padding_x = 20.0
         padding_bottom = 14.0
@@ -346,7 +516,7 @@ class OSDWindow(Gtk.Window):
             cairo.FONT_WEIGHT_NORMAL,
         )
         cr.set_font_size(config.transcript_font_size)
-        lines = self._wrap_preview_lines(cr, self._preview_text, max_width)
+        lines = self._layout_preview_cues(cr, cues, max_width)
         if not lines:
             self._set_dynamic_height(self._meter_height)
             return
@@ -357,7 +527,7 @@ class OSDWindow(Gtk.Window):
         visible_lines = max(1, int(available // line_height))
         if len(lines) > visible_lines:
             lines = lines[-visible_lines:]
-            lines[0] = self._ellipsize(cr, "… " + lines[0], max_width)
+            lines[0] = self._prefix_truncated_line(cr, lines[0], max_width)
         target_height = int(
             math.ceil(text_top + line_height * len(lines) + padding_bottom)
         )
@@ -365,17 +535,74 @@ class OSDWindow(Gtk.Window):
 
         text_color = theme.text
         theme_alpha = text_color[3] if len(text_color) > 3 else 1.0
-        alpha = config.transcript_opacity * theme_alpha
+        base_alpha = config.transcript_opacity * theme_alpha
+        final_rgb = tuple(text_color[:3])
+        live_rgb = self._mix(final_rgb, theme.transcript_live, self.LIVE_TINT)
+        change_rgb = theme.transcript_change
+
+        laid_out = []
         for index, line in enumerate(lines):
             if not line:
                 continue
             baseline = text_top + ascent + index * line_height
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.52 * alpha)
-            cr.move_to(padding_x, baseline + 2.0)
-            cr.show_text(line)
-            cr.set_source_rgba(text_color[0], text_color[1], text_color[2], alpha)
-            cr.move_to(padding_x, baseline)
-            cr.show_text(line)
+            laid_out.append((baseline, self._line_runs(line, cues)))
+
+        # Pass 1, behind the text: highlight revised words and mark their
+        # lines in the left gutter so distant rewrites catch peripheral vision.
+        for baseline, runs in laid_out:
+            line_highlight = 0.0
+            for run in runs:
+                highlight = run["key"][1]
+                if highlight <= 0.0:
+                    continue
+                line_highlight = max(line_highlight, highlight)
+                run_width = self._text_advance(cr, run["text"])
+                x = padding_x + run["x"]
+                cr.set_source_rgba(*change_rgb, 0.22 * highlight * base_alpha)
+                self._rounded_rect(
+                    cr,
+                    x - 4.0,
+                    baseline - ascent * 1.05,
+                    run_width + 8.0,
+                    ascent * 1.4,
+                    5.0,
+                )
+                cr.fill()
+                cr.set_source_rgba(*change_rgb, 0.85 * highlight * base_alpha)
+                cr.rectangle(x, baseline + ascent * 0.22, run_width, 2.0)
+                cr.fill()
+            if line_highlight > 0.0:
+                cr.set_source_rgba(*change_rgb, 0.9 * line_highlight * base_alpha)
+                self._rounded_rect(
+                    cr,
+                    self.CHANGE_GUTTER_X,
+                    baseline - ascent,
+                    self.CHANGE_GUTTER_WIDTH,
+                    ascent * 1.25,
+                    self.CHANGE_GUTTER_WIDTH / 2.0,
+                )
+                cr.fill()
+
+        # Pass 2: text.  Provisional words are dimmed and tinted toward
+        # transcript-live and ease to the final colour when confirmed; revised
+        # words take on transcript-change while their highlight decays.
+        for baseline, runs in laid_out:
+            for run in runs:
+                settled, highlight = run["key"]
+                rgb = self._mix(live_rgb, final_rgb, settled)
+                alpha = base_alpha * (
+                    self.LIVE_TEXT_ALPHA + (1.0 - self.LIVE_TEXT_ALPHA) * settled
+                )
+                if highlight > 0.0:
+                    rgb = self._mix(rgb, change_rgb, 0.65 * highlight)
+                    alpha += (base_alpha - alpha) * highlight
+                x = padding_x + run["x"]
+                cr.set_source_rgba(0.0, 0.0, 0.0, 0.52 * alpha)
+                cr.move_to(x, baseline + 2.0)
+                cr.show_text(run["text"])
+                cr.set_source_rgba(rgb[0], rgb[1], rgb[2], alpha)
+                cr.move_to(x, baseline)
+                cr.show_text(run["text"])
 
     def _draw_preview_text(self, cr: cairo.Context, width: int, height: int):
         if not self._preview_text or self._visualizer_state != "recording":

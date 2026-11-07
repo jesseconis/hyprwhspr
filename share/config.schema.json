@@ -553,6 +553,18 @@
       "default": 0.96,
       "description": "Opacity of dynamically wrapped transcript text."
     },
+    "mic_osd_transcript_stability_cues": {
+      "type": "boolean",
+      "default": true,
+      "description": "Style the spectrum transcript by stability: provisional (not yet final) text is tinted with the theme's transcript-live color, and words revised away from the end of the transcript briefly highlight with transcript-change so distant rewrites are easy to spot."
+    },
+    "mic_osd_transcript_change_highlight_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000,
+      "default": 1800,
+      "description": "How long (ms) a revised word stays highlighted in the spectrum transcript before fading. 0 disables the change highlight while keeping the provisional-text tint."
+    },
     "mic_osd_pill_transcript_enabled": {
       "type": "boolean",
       "default": false,

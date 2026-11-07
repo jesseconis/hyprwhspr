@@ -810,6 +810,8 @@ is involved.
   "mic_osd_transcript_max_lines": 6,
   "mic_osd_transcript_line_spacing": 1.25,
   "mic_osd_transcript_opacity": 0.96,
+  "mic_osd_transcript_stability_cues": true,
+  "mic_osd_transcript_change_highlight_ms": 1800,
 
   "mic_osd_spectrum_gain": 1.35,
   "mic_osd_spectrum_noise_floor_db": -72,
@@ -826,6 +828,32 @@ For quieter microphones, try gain `1.6`, peak `-34` dB, curve `0.85`, rise `12` 
 and fall `85` ms. These are optional overrides, not changes to the defaults.
 The preview can only show text supplied by the backend; a rolling partial
 transcript cannot reconstruct speech the server has already omitted.
+
+##### Stability cues
+
+The wrapped transcript shows how settled each part of it is, so you can keep
+reading at the end without missing rewrites further back:
+
+- **Provisional text** (a live partial the server may still rewrite) is dimmed
+  and tinted toward the theme's `transcript-live` color. When its final
+  transcription arrives it eases to the normal text color. RealtimeSTT reports
+  exactly which prefix is final. For backends that don't, a word is treated as
+  settled once it has stopped changing for about a second.
+- **Revised words** away from the end of the transcript (a final replacing its
+  partial, re-punctuation, a re-cased word) flash `transcript-change` with a
+  box, an underline, and a bar in the left gutter of their line, then fade.
+  Words being appended or corrected right at the end stay unhighlighted, so
+  the highlight only fires when something changes away from where you're reading.
+
+```jsonc
+{
+  "mic_osd_transcript_stability_cues": true,       // false = plain text, as before
+  "mic_osd_transcript_change_highlight_ms": 1800   // 0 = no highlight, keep the provisional tint
+}
+```
+
+Both colors can be overridden in `mic-osd.css` with `@define-color
+transcript-live` and `@define-color transcript-change`.
 
 Response tuning does **not** alter the audio sent to transcription:
 

@@ -178,6 +178,8 @@ class ConfigManager:
             'mic_osd_transcript_max_lines': 6,  # Legacy; spectrum preview uses monitor-height limit
             'mic_osd_transcript_line_spacing': 1.25,
             'mic_osd_transcript_opacity': 0.96,
+            'mic_osd_transcript_stability_cues': True,  # Tint provisional text, flash distant revisions
+            'mic_osd_transcript_change_highlight_ms': 1800,
             # Live transcript above the pill OSD (ElevenLabs Scribe v2 Realtime)
             'mic_osd_pill_transcript_enabled': False,
             'mic_osd_pill_transcript_word_limit': 4,

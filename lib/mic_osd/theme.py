@@ -44,6 +44,11 @@ DEFAULT_COLORS = {
     'processing-dot': (0.2, 0.9, 0.4),      # Green
     'error-dot': (1.0, 0.2, 0.2),           # Bright red
     'success-dot': (0.0, 1.0, 0.5),         # Green
+    # Spectrum transcript stability cues: provisional (not yet final) text is
+    # tinted toward transcript-live; words revised away from the reading
+    # position flash transcript-change and fade back.
+    'transcript-live': (0.55, 0.78, 1.0),   # Soft blue
+    'transcript-change': (1.0, 0.70, 0.28), # Amber
 }
 
 
@@ -233,6 +238,14 @@ class Theme:
             self.get('spectrum-high'),
             self.get('spectrum-peak'),
         )
+
+    @property
+    def transcript_live(self):
+        return tuple(self.get('transcript-live')[:3])
+
+    @property
+    def transcript_change(self):
+        return tuple(self.get('transcript-change')[:3])
 
     @property
     def paused_dot(self):

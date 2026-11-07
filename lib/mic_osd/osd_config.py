@@ -49,6 +49,10 @@ class MicOSDConfig:
     transcript_max_lines: int = 6
     transcript_line_spacing: float = 1.25
     transcript_opacity: float = 0.96
+    # Stability cues: tint provisional text and flash words revised away from
+    # the end of the transcript (see transcript_stability.py).
+    transcript_stability_cues: bool = True
+    transcript_change_highlight_ms: float = 1800.0
     bottom_margin: int = 130
 
     @classmethod
@@ -217,6 +221,23 @@ class MicOSDConfig:
                 ),
                 0.0,
                 1.0,
+            ),
+            transcript_stability_cues=bool(
+                get_setting(
+                    "mic_osd_transcript_stability_cues",
+                    defaults.transcript_stability_cues,
+                )
+            ),
+            transcript_change_highlight_ms=_clamp(
+                _number(
+                    get_setting(
+                        "mic_osd_transcript_change_highlight_ms",
+                        defaults.transcript_change_highlight_ms,
+                    ),
+                    defaults.transcript_change_highlight_ms,
+                ),
+                0.0,
+                10000.0,
             ),
             bottom_margin=_clamp(
                 _integer(

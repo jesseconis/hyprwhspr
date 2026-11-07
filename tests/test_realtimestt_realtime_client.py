@@ -104,6 +104,61 @@ class RealtimeSTTClientTests(unittest.TestCase):
         )
         self.assertEqual(client.ws.text_messages[-1], {"type": "stop"})
 
+    def test_preview_reports_finalized_prefix_length(self):
+        previews = []
+        client = self._client()
+        client.set_partial_transcript_callback(previews.append)
+
+        client._handle_event({"type": "realtime", "segmentId": 1, "text": "hello wor"})
+        client._handle_event({"type": "final", "segmentId": 1, "text": "hello world"})
+        client._handle_event({"type": "realtime", "segmentId": 2, "text": "next seg"})
+        client._handle_event({"type": "final", "segmentId": 2, "text": "next segment"})
+
+        self.assertEqual(
+            [preview.committed_length for preview in previews],
+            [0, len("hello world"), len("hello world"), len("hello world next segment")],
+        )
+
+    def test_pending_partial_stays_visible_while_next_segment_streams(self):
+        previews = []
+        client = self._client()
+        client.set_partial_transcript_callback(previews.append)
+
+        client._handle_event({"type": "realtime", "segmentId": 1, "text": "first part"})
+        # VAD closed segment 1; its final is still being computed while
+        # segment 2 starts streaming.
+        client._handle_event({"type": "realtime", "segmentId": 2, "text": "second"})
+        client._handle_event({"type": "final", "segmentId": 1, "text": "First part."})
+
+        self.assertEqual(
+            previews,
+            ["first part", "first part second", "First part. second"],
+        )
+        self.assertEqual(previews[1].committed_length, 0)
+        self.assertEqual(previews[2].committed_length, len("First part."))
+
+    def test_partial_older_than_newest_final_is_dropped(self):
+        previews = []
+        client = self._client()
+        client.set_partial_transcript_callback(previews.append)
+
+        client._handle_event({"type": "realtime", "segmentId": 1, "text": "orphan"})
+        client._handle_event({"type": "final", "segmentId": 2, "text": "kept"})
+
+        self.assertEqual(previews[-1], "kept")
+
+    def test_empty_final_removes_its_partial_from_preview(self):
+        previews = []
+        client = self._client()
+        client.set_partial_transcript_callback(previews.append)
+
+        client._handle_event({"type": "final", "segmentId": 1, "text": "done"})
+        client._handle_event({"type": "realtime", "segmentId": 2, "text": "uh"})
+        client._handle_event({"type": "final", "segmentId": 2, "text": ""})
+
+        self.assertEqual(previews, ["done", "done uh", "done"])
+        self.assertEqual(previews[-1].committed_length, len("done"))
+
     def test_idle_stop_returns_vad_final_instead_of_waiting_full_timeout(self):
         client = self._client()
         client.STOP_IDLE_GRACE_SECONDS = 0.01

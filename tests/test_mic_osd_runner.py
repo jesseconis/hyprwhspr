@@ -137,6 +137,63 @@ class MicOSDRunnerTests(unittest.TestCase):
             finally:
                 runner_module.TRANSCRIPT_PREVIEW_FILE = original
 
+    def test_preview_committed_length_is_written_to_bound_sidecar(self):
+        from mic_osd.transcript_stability import decode_meta, meta_path_for
+        from src.preview_text import PreviewText
+
+        with tempfile.TemporaryDirectory() as tmp:
+            preview_file = Path(tmp) / "hyprwhspr" / "transcript_preview"
+            meta_file = meta_path_for(preview_file)
+            original = runner_module.TRANSCRIPT_PREVIEW_FILE
+            runner_module.TRANSCRIPT_PREVIEW_FILE = preview_file
+            try:
+                runner = MicOSDRunner()
+                runner.set_preview_text(PreviewText("final words live", 11))
+
+                text = preview_file.read_text(encoding="utf-8")
+                self.assertEqual(text, "final words live")
+                self.assertEqual(
+                    decode_meta(text, meta_file.read_text(encoding="utf-8")), 11
+                )
+                self.assertEqual(meta_file.stat().st_mode & 0o777, 0o600)
+
+                # A plain string (backend without a boundary) drops the sidecar
+                # so stale metadata can never describe newer text.
+                runner._last_preview_write_at -= runner.PREVIEW_WRITE_INTERVAL_SECONDS
+                runner.set_preview_text("plain text")
+                self.assertFalse(meta_file.exists())
+
+                runner._last_preview_write_at -= runner.PREVIEW_WRITE_INTERVAL_SECONDS
+                runner.set_preview_text(PreviewText("again", 5))
+                self.assertTrue(meta_file.exists())
+                runner.clear_preview_text()
+                self.assertFalse(meta_file.exists())
+                self.assertFalse(preview_file.exists())
+            finally:
+                runner_module.TRANSCRIPT_PREVIEW_FILE = original
+
+    def test_throttled_preview_flush_keeps_committed_length(self):
+        from mic_osd.transcript_stability import decode_meta, meta_path_for
+        from src.preview_text import PreviewText
+
+        with tempfile.TemporaryDirectory() as tmp:
+            preview_file = Path(tmp) / "hyprwhspr" / "transcript_preview"
+            original = runner_module.TRANSCRIPT_PREVIEW_FILE
+            runner_module.TRANSCRIPT_PREVIEW_FILE = preview_file
+            try:
+                with mock.patch.object(runner_module.threading, "Timer", FakeTimer):
+                    runner = MicOSDRunner()
+                    runner.set_preview_text(PreviewText("first", 0))
+                    runner.set_preview_text(PreviewText("first second", 5))
+                    runner._preview_flush_timer.fire()
+
+                text = preview_file.read_text(encoding="utf-8")
+                self.assertEqual(text, "first second")
+                meta = meta_path_for(preview_file).read_text(encoding="utf-8")
+                self.assertEqual(decode_meta(text, meta), 5)
+            finally:
+                runner_module.TRANSCRIPT_PREVIEW_FILE = original
+
     def test_preview_text_write_uses_atomic_replace(self):
         with tempfile.TemporaryDirectory() as tmp:
             preview_file = Path(tmp) / "hyprwhspr" / "transcript_preview"
@@ -401,6 +458,87 @@ class MicOSDRunnerTests(unittest.TestCase):
         self.assertEqual(cr.shown_text[-1], "nine")
         # Presentation truncation must never discard the source transcript.
         self.assertTrue(window._preview_text.startswith("one two"))
+
+    def _dynamic_window(self, text, committed_length=None):
+        window_module, _ = self._import_window_with_stubs()
+        from mic_osd.osd_config import MicOSDConfig
+
+        window = object.__new__(window_module.OSDWindow)
+        window._osd_config = MicOSDConfig(transcript_font_size=20)
+        window._width = 400
+        window._height = window._meter_height = 86
+        window._visualizer_state = "recording"
+        window._preview_height_limit = mock.Mock(return_value=2000)
+        window._pill_transcript_animator = None
+        window.drawing_area = mock.Mock()
+        window.set_default_size = mock.Mock()
+        window.set_preview_text(text, committed_length=committed_length)
+        return window
+
+    class RecordingCairoContext(FakeCairoContext):
+        def __init__(self):
+            super().__init__()
+            self.ops = []
+            self._source = None
+
+        def set_source_rgba(self, *args):
+            self._source = args
+
+        def show_text(self, text):
+            super().show_text(text)
+            self.ops.append(("text", text, self._source))
+
+        def rectangle(self, *args):
+            self.ops.append(("rect", args, self._source))
+
+        def new_sub_path(self):
+            pass
+
+        def arc(self, *args):
+            pass
+
+        def close_path(self):
+            self.ops.append(("rounded", None, self._source))
+
+    def test_dynamic_preview_styles_provisional_tail_apart_from_final_text(self):
+        window = self._dynamic_window("final words live tail", committed_length=11)
+        window._stability_tracker = None
+        window._transcript_tracker()._clock = lambda: 0.0
+        cr = self.RecordingCairoContext()
+        window._draw_dynamic_preview_text(cr, 400)
+        cr = self.RecordingCairoContext()
+        window._stability_tracker._clock = lambda: 5.0
+        window._draw_dynamic_preview_text(cr, 400)
+
+        texts = [(text, source) for kind, text, source in cr.ops if kind == "text"]
+        # Shadow + colour per run; the final and provisional words form two runs.
+        painted = [text for text, _ in texts[1::2]]
+        self.assertEqual(painted, ["final words", "live tail"])
+        final_alpha = texts[1][1][3]
+        live_alpha = texts[3][1][3]
+        self.assertLess(live_alpha, final_alpha)
+
+    def test_dynamic_preview_highlights_distant_revision_with_gutter_marker(self):
+        words = [f"w{i}" for i in range(24)]
+        window = self._dynamic_window(" ".join(words))
+        clock = [0.0]
+        window._transcript_tracker()._clock = lambda: clock[0]
+        window._draw_dynamic_preview_text(self.RecordingCairoContext(), 400)
+
+        words[1] = "REVISED"
+        window.set_preview_text(" ".join(words))
+        cr = self.RecordingCairoContext()
+        window._draw_dynamic_preview_text(cr, 400)
+
+        painted = [text for kind, text, _ in cr.ops if kind == "text"]
+        self.assertIn("REVISED", painted)
+        # Highlight box behind the word plus the line's gutter marker.
+        self.assertGreaterEqual(sum(1 for op in cr.ops if op[0] == "rounded"), 2)
+
+        clock[0] = 10.0
+        cr = self.RecordingCairoContext()
+        window._draw_dynamic_preview_text(cr, 400)
+        self.assertFalse(any(op[0] == "rounded" for op in cr.ops))
 
     def test_preview_height_limit_uses_logical_monitor_geometry(self):
         window_module, _ = self._import_window_with_stubs()
