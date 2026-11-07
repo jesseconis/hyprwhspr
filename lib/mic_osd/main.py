@@ -94,6 +94,7 @@ class MicOSD:
         self._config_signature = None
         self._last_visualizer_state = None
         self._last_preview_text = None
+        self._last_preview_signature = None
         self.daemon = daemon
         self.visible = False
         self.theme_watcher = None
@@ -376,6 +377,7 @@ class MicOSD:
             if hasattr(self.window, 'set_preview_text'):
                 self.window.set_preview_text("")
             self._last_preview_text = None
+            self._last_preview_signature = None
             self.window.set_visible(False)
             
             # Stop update timer
@@ -456,6 +458,11 @@ class MicOSD:
 
     def _update(self):
         """Update visualization with current audio data."""
+        if self.window and self.visible:
+            try:
+                self._poll_preview_file()
+            except Exception:
+                pass
         if self.audio_monitor and self.window and self.visible:
             level = self.audio_monitor.get_level()
             samples = self.audio_monitor.get_samples()
@@ -483,21 +490,50 @@ class MicOSD:
                         self.window.set_visualizer_state('recording')
                     if hasattr(self.visualization, 'set_state'):
                         self.visualization.set_state('recording')
-
-            preview = ""
-            if TRANSCRIPT_PREVIEW_FILE.exists():
-                preview = TRANSCRIPT_PREVIEW_FILE.read_text(encoding='utf-8').rstrip('\r\n')
-            committed_length = self._read_preview_committed_length(preview)
-            snapshot = (preview, committed_length)
-            if snapshot != self._last_preview_text:
-                self._last_preview_text = snapshot
-                if self.window and hasattr(self.window, 'set_preview_text'):
-                    self.window.set_preview_text(
-                        preview, committed_length=committed_length
-                    )
         except Exception:
             pass  # Ignore file read errors
         return True  # Continue polling
+
+    @staticmethod
+    def _file_signature(path):
+        """Cheap change detector: atomic replaces always yield a new inode."""
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+    def _poll_preview_file(self):
+        """Pick up a new transcript preview on the next frame.
+
+        Runs on the 16 ms frame tick rather than the 100 ms state poll, which
+        used to add up to 100 ms before each partial reached the screen.  Two
+        stat() calls per frame gate the read, so unchanged files are not
+        re-read.
+        """
+        signature = (
+            self._file_signature(TRANSCRIPT_PREVIEW_FILE),
+            self._file_signature(meta_path_for(TRANSCRIPT_PREVIEW_FILE)),
+        )
+        if signature == self._last_preview_signature:
+            return
+        self._last_preview_signature = signature
+        try:
+            preview = ""
+            if signature[0] is not None:
+                preview = TRANSCRIPT_PREVIEW_FILE.read_text(encoding='utf-8').rstrip('\r\n')
+        except OSError:
+            # Replaced or removed between stat and read: retry next frame.
+            self._last_preview_signature = None
+            return
+        committed_length = self._read_preview_committed_length(preview)
+        snapshot = (preview, committed_length)
+        if snapshot != self._last_preview_text:
+            self._last_preview_text = snapshot
+            if self.window and hasattr(self.window, 'set_preview_text'):
+                self.window.set_preview_text(
+                    preview, committed_length=committed_length
+                )
 
     def _auto_hide_callback(self):
         """Auto-hide callback triggered after 30 seconds of visibility."""

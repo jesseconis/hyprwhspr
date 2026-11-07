@@ -171,5 +171,41 @@ class PreviewMetaTests(unittest.TestCase):
         self.assertEqual(meta_path_for(path).parent, path.parent)
 
 
+class PreviewFramePollTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            import mic_osd.main as main_module
+        except Exception as exc:  # GTK unavailable in this environment
+            self.skipTest(f"mic_osd.main unavailable: {exc}")
+        self.main_module = main_module
+
+    def test_frame_poll_reads_only_when_preview_file_is_replaced(self):
+        import tempfile
+        from unittest import mock
+
+        main_module = self.main_module
+        with tempfile.TemporaryDirectory() as tmp:
+            preview = Path(tmp) / "transcript_preview"
+            with mock.patch.object(main_module, "TRANSCRIPT_PREVIEW_FILE", preview):
+                osd = object.__new__(main_module.MicOSD)
+                osd.window = mock.Mock()
+                osd._last_preview_text = None
+                osd._last_preview_signature = None
+
+                osd._poll_preview_file()
+                osd.window.set_preview_text.assert_called_once_with("", committed_length=None)
+
+                text = "hello world"
+                preview.write_text(text, encoding="utf-8")
+                meta_path_for(preview).write_text(encode_meta(text, 5), encoding="utf-8")
+                osd._poll_preview_file()
+                osd.window.set_preview_text.assert_called_with(text, committed_length=5)
+
+                calls = osd.window.set_preview_text.call_count
+                with mock.patch.object(Path, "read_text", side_effect=AssertionError):
+                    osd._poll_preview_file()  # unchanged: stat only, no read
+                self.assertEqual(osd.window.set_preview_text.call_count, calls)
+
+
 if __name__ == "__main__":
     unittest.main()
