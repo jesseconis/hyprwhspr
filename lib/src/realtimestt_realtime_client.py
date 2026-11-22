@@ -37,6 +37,7 @@ class RealtimeSTTRealtimeClient(WebSocketRealtimeClientBase):
         self._streaming = False
         self._final_by_segment = OrderedDict()
         self._partial_by_segment = {}
+        self._stable_length_by_segment = {}
         self._latest_sequences = {}
         self._awaiting_clear = False
         self._minimum_segment_id = None
@@ -179,8 +180,26 @@ class RealtimeSTTRealtimeClient(WebSocketRealtimeClientBase):
                     return
                 self._latest_sequences[segment] = sequence
             self._partial_by_segment[segment] = text
+            self._stable_length_by_segment[segment] = self._stable_prefix_length(
+                text, event.get("stableText")
+            )
             preview = self._preview_text_locked(segment)
         self._notify_partial_transcript(preview)
+
+    @staticmethod
+    def _stable_prefix_length(text: str, stable) -> int:
+        """Characters of ``text`` the server says it will not revise.
+
+        Servers that stabilize partials (RealtimeSTT's text stabilizer,
+        crisp-stt-bridge) send ``stableText``; it only counts when it really is
+        a prefix of the text being displayed.
+        """
+        if not isinstance(stable, str):
+            return 0
+        stable = stable.strip()
+        if not stable or not text.startswith(stable):
+            return 0
+        return len(stable)
 
     def _handle_final(self, event: dict):
         segment = self._segment_key(event)
@@ -205,6 +224,7 @@ class RealtimeSTTRealtimeClient(WebSocketRealtimeClientBase):
             self._stop_completion_pending = False
             self._final_by_segment[segment] = text
             self._partial_by_segment.pop(segment, None)
+            self._stable_length_by_segment.pop(segment, None)
             self._latest_sequences.pop(segment, None)
             self._committed_segments = list(self._final_by_segment.values())
             self._transcript_generation += 1
@@ -291,7 +311,12 @@ class RealtimeSTTRealtimeClient(WebSocketRealtimeClientBase):
             parts.append(part)
             if prefix_final and is_final:
                 committed_length = len(" ".join(parts))
-            else:
+            elif prefix_final:
+                # The first unfinalized segment may still carry a prefix the
+                # server has stabilized; only its remainder is provisional.
+                stable = self._stable_length_by_segment.get(key, 0)
+                if stable:
+                    committed_length = len(" ".join(parts[:-1] + [part[:stable]]))
                 prefix_final = False
         return PreviewText(" ".join(parts), committed_length)
 
@@ -317,6 +342,7 @@ class RealtimeSTTRealtimeClient(WebSocketRealtimeClientBase):
         self._reset_stream_state_locked()
         self._final_by_segment.clear()
         self._partial_by_segment.clear()
+        self._stable_length_by_segment.clear()
         self._latest_sequences.clear()
 
     def start_audio_stream(self):

@@ -119,6 +119,30 @@ class RealtimeSTTClientTests(unittest.TestCase):
             [0, len("hello world"), len("hello world"), len("hello world next segment")],
         )
 
+    def test_server_stable_text_extends_committed_prefix_into_partial(self):
+        previews = []
+        client = self._client()
+        client.set_partial_transcript_callback(previews.append)
+
+        client._handle_event({"type": "final", "segmentId": 1, "text": "Done."})
+        client._handle_event({
+            "type": "realtime",
+            "segmentId": 2,
+            "displayText": "stable words live tail",
+            "stableText": "stable words",
+        })
+        self.assertEqual(previews[-1], "Done. stable words live tail")
+        self.assertEqual(previews[-1].committed_length, len("Done. stable words"))
+
+        # stableText that is not a prefix of the displayed text is ignored.
+        client._handle_event({
+            "type": "realtime",
+            "segmentId": 2,
+            "displayText": "rewritten words live tail",
+            "stableText": "stable words",
+        })
+        self.assertEqual(previews[-1].committed_length, len("Done."))
+
     def test_pending_partial_stays_visible_while_next_segment_streams(self):
         previews = []
         client = self._client()
