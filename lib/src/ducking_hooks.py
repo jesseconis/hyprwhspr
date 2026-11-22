@@ -13,6 +13,11 @@ import subprocess
 import time
 import threading
 
+try:
+    from .status_log import StatusReporter
+except ImportError:
+    from status_log import StatusReporter
+
 
 class DuckingHooks:
     """One serialized worker per device; no subprocess I/O on recording threads."""
@@ -66,6 +71,8 @@ class _DeviceWorker:
         self.name = name
         self.command = list(command)
         self.restore_timeout = restore_timeout
+        # Availability is printed on change only, never per retry or per take.
+        self._status = StatusReporter(f'[DUCKING_HOOK] {name}:')
         self._condition = threading.Condition()
         self._active = False
         self._closed = False
@@ -99,7 +106,8 @@ class _DeviceWorker:
         except ProcessLookupError:
             pass
 
-    def _restore(self, process):
+    def _restore(self, process, report_status=True):
+        """Close stdin, wait for the command and return its exit status."""
         # Unbuffered stdin: closing never flushes a blocked pipe.
         process.stdin.close()
         try:
@@ -112,8 +120,9 @@ class _DeviceWorker:
             except subprocess.TimeoutExpired:
                 self._signal_group(process, signal.SIGKILL)
                 process.wait()
-        if process.returncode:
+        if process.returncode and report_status:
             self._log(f'command exited with status {process.returncode}')
+        return process.returncode
 
     def _run(self):
         handled = -1
@@ -126,6 +135,7 @@ class _DeviceWorker:
                     return
                 generation = handled = self._generation
             process = None
+            failure = None
             try:
                 process = subprocess.Popen(
                     self.command, stdin=subprocess.PIPE,
@@ -145,13 +155,20 @@ class _DeviceWorker:
                             break
                         self._condition.wait(timeout=self.HEARTBEAT_SECONDS)
             except (OSError, ValueError) as exc:
-                self._log(f'session failed: {exc}')
+                failure = f'session failed: {exc}'
             finally:
+                status = None
                 if process is not None:
                     try:
-                        self._restore(process)
+                        status = self._restore(process, report_status=False)
                     except OSError as exc:
                         self._log(f'cleanup failed: {exc}')
+                if failure is None and status:
+                    failure = f'command exited with status {status}'
+                if failure is not None:
+                    self._status.down(f'{failure}; recording continues without it')
+                else:
+                    self._status.up(recovered='working again')
             # Never retry within a take: repeated remote side effects are unsafe.
             # A new recording may start only after this session's cleanup ends.
 
@@ -205,7 +222,10 @@ class _PersistentDeviceWorker(_DeviceWorker):
                 )
                 os.set_blocking(process.stdin.fileno(), False)
                 self._read_reply(process, 'ready', self.READY_TIMEOUT)
-                self._log('persistent connection ready')
+                self._status.up(
+                    first='persistent connection ready',
+                    recovered='persistent connection re-established',
+                )
                 while True:
                     with self._condition:
                         if self._closed:
@@ -222,16 +242,25 @@ class _PersistentDeviceWorker(_DeviceWorker):
                             timeout=self.HEARTBEAT_SECONDS,
                         )
             except (OSError, ValueError) as exc:
-                if not self._closed:
-                    self._log(f'connection unavailable: {exc}; reconnecting in background')
+                failure = exc
+            else:
+                failure = None
             finally:
+                status = None
                 if process is not None:
                     try:
-                        self._restore(process)
+                        # A failed attempt's exit status is part of the
+                        # failure, reported once below, not a separate line.
+                        status = self._restore(process, report_status=False)
                     except OSError as exc:
                         self._log(f'cleanup failed: {exc}')
                     finally:
                         process.stdout.close()
+            if failure is not None and not self._closed:
+                detail = f'{failure} (exit status {status})' if status else str(failure)
+                self._status.down(
+                    f'connection unavailable: {detail}; retrying quietly in background'
+                )
             with self._condition:
                 if self._closed:
                     return

@@ -9,6 +9,11 @@ import socket
 import threading
 import time
 
+try:
+    from .status_log import StatusReporter
+except ImportError:
+    from status_log import StatusReporter
+
 
 def default_socket_path():
     return os.environ.get('VOXD_SOCKET') or os.path.join(
@@ -23,9 +28,11 @@ class VoiceActivity:
         self._lock = threading.Lock()
         self._sessions = set()
         self._closed = False
+        # Shared by every take: "unavailable" prints once, not per hotkey.
+        self._status = StatusReporter('[VOXD]')
 
     def begin(self, active=None):
-        session = _Session(self.path, self._forget, active)
+        session = _Session(self.path, self._forget, active, status=self._status)
         with self._lock:
             closed = self._closed
             if not closed:
@@ -54,16 +61,20 @@ class _Session:
     TIMEOUT = 0.5
     HEARTBEAT = 1.0  # voxd expires the connection after five seconds without begin
 
-    def __init__(self, path, forget, active=None):
+    def __init__(self, path, forget, active=None, status=None):
         self._active = active
+        self._status = status or StatusReporter('[VOXD]')
         self.path = path
         self._forget = forget
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._socket = None
         self._sequence = 0
-        self._warned = False
         self._thread = None
+
+    @property
+    def _warned(self):
+        return self._status.is_down
 
     def start(self):
         self._renew()
@@ -131,12 +142,13 @@ class _Session:
                     or response.get('ok') is not True or response.get('type') != 'input'
                     or response.get('active') is not True):
                 raise ValueError('voxd rejected input lease (daemon may need upgrading)')
-            self._warned = False
+            self._status.up(recovered='Input lease available again')
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             self._disconnect()
-            if not self._stop.is_set() and not self._warned:
-                print(f'[VOXD] Input lease unavailable: {exc}; dictation continues, retrying', flush=True)
-                self._warned = True
+            if not self._stop.is_set():
+                self._status.down(
+                    f'Input lease unavailable: {exc}; dictation continues without it'
+                )
 
     def _run(self):
         while not self._stop.wait(self.HEARTBEAT):
