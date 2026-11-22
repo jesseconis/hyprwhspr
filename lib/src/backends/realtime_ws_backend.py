@@ -388,11 +388,14 @@ class RealtimeWsBackend(TranscriptionBackend):
         Returns:
             Transcribed text string
         """
-        if not self._realtime_client:
+        # Snapshot: a failed connect or close on another thread may set the
+        # attribute to None at any point.
+        client = self._realtime_client
+        if not client:
             print('[REALTIME] Client not initialized')
             return ""
         
-        if not self._realtime_client.connected:
+        if not client.connected:
             print('[REALTIME] Client not connected')
             return ""
         
@@ -402,8 +405,8 @@ class RealtimeWsBackend(TranscriptionBackend):
             # connect time and cannot update it after audio has been streamed —
             # doing so would trigger a reconnect and silently drop the audio.
             if language_override is not None:
-                if getattr(self._realtime_client, 'supports_mid_session_language_update', True):
-                    self._realtime_client.update_language(language_override)
+                if getattr(client, 'supports_mid_session_language_update', True):
+                    client.update_language(language_override)
                 else:
                     print(
                         f'[REALTIME] Provider does not support mid-session language override '
@@ -415,7 +418,7 @@ class RealtimeWsBackend(TranscriptionBackend):
             timeout = self.config.get_setting('realtime_timeout', 30)
             
             # Commit and get text (audio was already streamed via callback)
-            transcription = self._realtime_client.commit_and_get_text(timeout=timeout)
+            transcription = client.commit_and_get_text(timeout=timeout)
             
             return transcription.strip()
             
@@ -433,20 +436,24 @@ class RealtimeWsBackend(TranscriptionBackend):
         backend = self.config.get_setting('transcription_backend', 'pywhispercpp')
         backend = normalize_backend(backend)
         
-        if backend == 'realtime-ws' and self._realtime_client:
+        client = self._realtime_client  # snapshot; see transcribe()
+        if backend == 'realtime-ws' and client:
             # If the server closed the socket while idle, reconnect on-demand here
             # (before we start capturing audio) to avoid dropping the first chunks.
-            if not self._realtime_client.connected:
+            if not client.connected:
                 if not self._reconnect_realtime_client():
+                    return None
+                client = self._realtime_client
+                if not client:
                     return None
 
             # Start a fresh provider-side take before capture begins. Protocol
             # adapters may need more than a generic buffer clear (RealtimeSTT
             # sends clear + start on the same session-owned socket).
             start_stream = getattr(
-                self._realtime_client,
+                client,
                 'start_audio_stream',
-                self._realtime_client.clear_audio_buffer,
+                client.clear_audio_buffer,
             )
             start_stream()
             self._clear_realtime_partial_preview()

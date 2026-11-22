@@ -2288,7 +2288,16 @@ class hyprwhsprApp:
             print(f"\n[INIT] Loading model in background (shortcuts active, recording will unblock when ready)...", flush=True)
             self._start_backend_init_background()
         else:
-            if not self.whisper_manager.initialize():
+            # The FIFO listener is already running: a hotkey pressed while this
+            # (possibly network-bound) init runs must hit the "still loading"
+            # gate, not race the backend being built or torn down.
+            with self._backend_init_lock:
+                self._model_initializing = True
+            try:
+                ok = self.whisper_manager.initialize()
+            finally:
+                self._model_initializing = False
+            if not ok:
                 # Stay alive with recording blocked; the record gate retries init
                 print("[ERROR] Failed to initialize backend - will retry on next record attempt", flush=True)
                 self._backend_init_failed = True
