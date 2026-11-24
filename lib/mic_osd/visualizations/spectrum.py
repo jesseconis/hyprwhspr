@@ -81,6 +81,13 @@ class SpectrumVisualization(BaseVisualization):
         values = np.abs(np.asarray(values, dtype=np.float64).reshape(-1))
         if len(values) == count:
             return values
+        if len(values) > count:
+            # Downsampling: RMS-pool neighbouring bands so no band's energy
+            # is skipped (plain interpolation would drop every other one).
+            edges = np.linspace(0, len(values), count + 1).round().astype(int)
+            power = np.concatenate(([0.0], np.cumsum(values ** 2)))
+            widths = np.maximum(1, edges[1:] - edges[:-1])
+            return np.sqrt((power[edges[1:]] - power[edges[:-1]]) / widths)
         source = np.linspace(0.0, 1.0, len(values))
         target = np.linspace(0.0, 1.0, count)
         return np.interp(target, source, values)
@@ -95,6 +102,24 @@ class SpectrumVisualization(BaseVisualization):
         normalized = np.clip((decibels - floor) / (peak - floor), 0.0, 1.0)
         shaped = np.power(normalized, self.osd_config.spectrum_curve)
         return np.clip(shaped * self.osd_config.spectrum_gain, 0.0, 1.0)
+
+    @property
+    def mirrored(self) -> bool:
+        return getattr(self.osd_config, "spectrum_layout", "linear") == "mirrored"
+
+    def _recording_target(self, samples) -> np.ndarray:
+        """Bar targets for live audio in the configured layout.
+
+        Mirrored mode spends half the bars on the full (log-spaced) frequency
+        range and reflects it around the centre: lows in the middle, highs at
+        both edges.  An odd bar count shares the lowest band in the centre.
+        """
+        if not self.mirrored:
+            return self._spectrum_target(self._resample(samples, self.num_bars))
+        half = (self.num_bars + 1) // 2
+        side = self._spectrum_target(self._resample(samples, half))
+        skip = self.num_bars % 2
+        return np.concatenate((side[::-1], side[skip:]))
 
     def set_state(self, state_str: str):
         self.state_manager.set_state_from_string(state_str or "recording")
@@ -111,11 +136,12 @@ class SpectrumVisualization(BaseVisualization):
         state = self.state_manager.current_state
         positions = np.linspace(0.0, 1.0, self.num_bars)
         if state == VisualizerState.RECORDING:
-            target = self._spectrum_target(
-                self._resample(samples, self.num_bars)
-            )
+            target = self._recording_target(samples)
         elif state == VisualizerState.PROCESSING:
             phase = self.state_manager.animation_phase
+            if self.mirrored:
+                # Ripple outward from the centre to match the layout.
+                positions = np.abs(positions - 0.5)
             primary = 0.5 + 0.5 * np.sin(
                 phase - positions * 4.5 * math.pi
             )

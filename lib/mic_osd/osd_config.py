@@ -24,6 +24,9 @@ def _clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
+SPECTRUM_LAYOUTS = ("linear", "mirrored")
+
+
 @dataclass(frozen=True)
 class MicOSDConfig:
     """Settings shared by the layer-shell window and spectrum renderer."""
@@ -32,6 +35,10 @@ class MicOSDConfig:
     spectrum_meter_height: int = 86
     spectrum_background_opacity: float = 0.46
     spectrum_border_opacity: float = 0.30
+    # "linear": low -> high frequency from left to right.  "mirrored": low
+    # frequencies in the centre, fanning out symmetrically to both edges, so
+    # speech (mostly low/mid energy) fills the meter evenly.
+    spectrum_layout: str = "linear"
 
     # FFT amplitudes are converted to dB, mapped between floor and peak, then
     # multiplied by gain.  These three settings cover quiet microphones,
@@ -44,8 +51,10 @@ class MicOSDConfig:
     spectrum_rise_ms: float = 35.0
     spectrum_fall_ms: float = 150.0
 
-    transcript_font_family: str = "sans-serif"
+    transcript_font_family: str = "Inter, Inter Variable, Inter Nerd Font Propo, sans-serif"
     transcript_font_size: float = 18.0
+    # CSS-style weight (100-900); 500 = medium reads well on translucent panels.
+    transcript_font_weight: int = 500
     transcript_max_lines: int = 6
     transcript_line_spacing: float = 1.25
     transcript_opacity: float = 0.96
@@ -89,7 +98,13 @@ class MicOSDConfig:
         if not isinstance(family, str) or not family.strip():
             family = defaults.transcript_font_family
 
+        layout = get_setting("mic_osd_spectrum_layout", defaults.spectrum_layout)
+        layout = layout.strip().lower() if isinstance(layout, str) else ""
+        if layout not in SPECTRUM_LAYOUTS:
+            layout = defaults.spectrum_layout
+
         return cls(
+            spectrum_layout=layout,
             spectrum_width=_clamp(
                 _integer(
                     get_setting(
@@ -188,6 +203,17 @@ class MicOSDConfig:
                 ),
                 8.0,
                 72.0,
+            ),
+            transcript_font_weight=_clamp(
+                _integer(
+                    get_setting(
+                        "mic_osd_transcript_font_weight",
+                        defaults.transcript_font_weight,
+                    ),
+                    defaults.transcript_font_weight,
+                ),
+                100,
+                900,
             ),
             transcript_max_lines=_clamp(
                 _integer(

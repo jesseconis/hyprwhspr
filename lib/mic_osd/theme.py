@@ -44,11 +44,14 @@ DEFAULT_COLORS = {
     'processing-dot': (0.2, 0.9, 0.4),      # Green
     'error-dot': (1.0, 0.2, 0.2),           # Bright red
     'success-dot': (0.0, 1.0, 0.5),         # Green
-    # Spectrum transcript stability cues: provisional (not yet final) text is
-    # tinted toward transcript-live; words revised away from the reading
-    # position flash transcript-change and fade back.
-    'transcript-live': (0.55, 0.78, 1.0),   # Soft blue
-    'transcript-change': (1.0, 0.70, 0.28), # Amber
+    # Spectrum transcript stability cues: confirmed text uses
+    # transcript-final, provisional (not yet final) text transcript-live;
+    # words revised away from the reading position flash transcript-change
+    # and fade back.  The three hues are kept far apart so the cue reads at a
+    # glance rather than as a subtle shade shift.
+    'transcript-final': (0.64, 0.90, 1.0),   # Soft cyan
+    'transcript-live': (1.0, 0.66, 0.30),    # Warm orange
+    'transcript-change': (1.0, 0.42, 0.78),  # Pink
 }
 
 
@@ -238,6 +241,10 @@ class Theme:
             self.get('spectrum-high'),
             self.get('spectrum-peak'),
         )
+
+    @property
+    def transcript_final(self):
+        return tuple(self.get('transcript-final')[:3])
 
     @property
     def transcript_live(self):

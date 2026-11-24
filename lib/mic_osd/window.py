@@ -30,6 +30,65 @@ from .transcript_stability import TranscriptChangeTracker
 if LAYER_SHELL_AVAILABLE:
     from gi.repository import Gtk4LayerShell
 
+try:
+    gi.require_version('Pango', '1.0')
+    gi.require_version('PangoCairo', '1.0')
+    from gi.repository import Pango, PangoCairo
+except (ImportError, ValueError, AttributeError):
+    Pango = PangoCairo = None
+
+
+class PangoText:
+    """Pango-shaped text for the spectrum transcript.
+
+    Cairo's toy text API has no kerning, no font fallback and coarse hinting,
+    which makes long wrapped transcripts look rough.  This measures and paints
+    through one reusable PangoLayout with grey antialiasing, slight hinting
+    and unhinted metrics so glyph positions stay subpixel-accurate.
+    """
+
+    def __init__(self, cr, family: str, size: float, weight: int):
+        self.layout = PangoCairo.create_layout(cr)
+        description = Pango.FontDescription.from_string(family)
+        description.set_absolute_size(size * Pango.SCALE)
+        description.set_weight(int(weight))
+        self.layout.set_font_description(description)
+
+        options = cairo.FontOptions()
+        options.set_antialias(cairo.ANTIALIAS_GRAY)
+        options.set_hint_style(cairo.HINT_STYLE_SLIGHT)
+        options.set_hint_metrics(cairo.HINT_METRICS_OFF)
+        PangoCairo.context_set_font_options(self.layout.get_context(), options)
+        self.layout.context_changed()
+
+        self._advances = {}
+        metrics = self.layout.get_context().get_metrics(description, None)
+        self.ascent = metrics.get_ascent() / Pango.SCALE
+        self.height = (metrics.get_ascent() + metrics.get_descent()) / Pango.SCALE
+
+    @classmethod
+    def create(cls, cr, family: str, size: float, weight: int):
+        """A Pango text helper, or None when Pango can't draw on ``cr``."""
+        if PangoCairo is None:
+            return None
+        try:
+            return cls(cr, family, size, weight)
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def advance(self, text: str) -> float:
+        cached = self._advances.get(text)
+        if cached is None:
+            self.layout.set_text(text, -1)
+            cached = self.layout.get_extents()[1].width / Pango.SCALE
+            self._advances[text] = cached
+        return cached
+
+    def show(self, cr, x: float, baseline: float, text: str):
+        self.layout.set_text(text, -1)
+        cr.move_to(x, baseline - self.layout.get_baseline() / Pango.SCALE)
+        PangoCairo.show_layout(cr, self.layout)
+
 
 class OSDWindow(Gtk.Window):
     """
@@ -318,6 +377,12 @@ class OSDWindow(Gtk.Window):
 
     def _font_metrics(self, cr: cairo.Context):
         font_size = self._osd_config.transcript_font_size
+        pango = getattr(self, '_pango_text', None)
+        if pango is not None:
+            line_height = max(font_size, pango.height) * (
+                self._osd_config.transcript_line_spacing
+            )
+            return pango.ascent, line_height
         try:
             extents = cr.font_extents()
             ascent = self._text_extent(extents, 'ascent', 0)
@@ -352,10 +417,11 @@ class OSDWindow(Gtk.Window):
 
     # -- spectrum transcript: stability-aware layout and painting ----------
 
-    # Provisional text keeps this fraction of the configured opacity.
-    LIVE_TEXT_ALPHA = 0.72
+    # Provisional text keeps this fraction of the configured opacity.  Hue
+    # carries the distinction; heavy dimming just made it look washed out.
+    LIVE_TEXT_ALPHA = 0.88
     # How far provisional text is tinted toward the theme's transcript-live.
-    LIVE_TINT = 0.45
+    LIVE_TINT = 1.0
     # Left-gutter marker drawn beside lines holding a highlighted revision.
     CHANGE_GUTTER_X = 8.0
     CHANGE_GUTTER_WIDTH = 3.0
@@ -510,12 +576,39 @@ class OSDWindow(Gtk.Window):
         padding_bottom = 14.0
         gap = 2.0
         max_width = max(0.0, width - padding_x * 2.0)
-        cr.select_font_face(
+        self._pango_text = PangoText.create(
+            cr,
             config.transcript_font_family,
-            cairo.FONT_SLANT_NORMAL,
-            cairo.FONT_WEIGHT_NORMAL,
+            config.transcript_font_size,
+            config.transcript_font_weight,
         )
-        cr.set_font_size(config.transcript_font_size)
+        try:
+            self._paint_dynamic_preview(cr, cues, padding_x, padding_bottom, gap, max_width)
+        finally:
+            self._pango_text = None
+
+    def _show_text_at(self, cr: cairo.Context, x: float, baseline: float, text: str):
+        pango = getattr(self, '_pango_text', None)
+        if pango is not None:
+            pango.show(cr, x, baseline, text)
+        else:
+            cr.move_to(x, baseline)
+            cr.show_text(text)
+
+    def _paint_dynamic_preview(
+        self, cr: cairo.Context, cues, padding_x, padding_bottom, gap, max_width
+    ):
+        config = self._osd_config
+        if getattr(self, '_pango_text', None) is None:
+            # The toy API takes a single family, not a fallback list.
+            cr.select_font_face(
+                config.transcript_font_family.split(",")[0].strip(),
+                cairo.FONT_SLANT_NORMAL,
+                cairo.FONT_WEIGHT_BOLD
+                if config.transcript_font_weight >= 600
+                else cairo.FONT_WEIGHT_NORMAL,
+            )
+            cr.set_font_size(config.transcript_font_size)
         lines = self._layout_preview_cues(cr, cues, max_width)
         if not lines:
             self._set_dynamic_height(self._meter_height)
@@ -536,7 +629,7 @@ class OSDWindow(Gtk.Window):
         text_color = theme.text
         theme_alpha = text_color[3] if len(text_color) > 3 else 1.0
         base_alpha = config.transcript_opacity * theme_alpha
-        final_rgb = tuple(text_color[:3])
+        final_rgb = theme.transcript_final if config.transcript_stability_cues else tuple(text_color[:3])
         live_rgb = self._mix(final_rgb, theme.transcript_live, self.LIVE_TINT)
         change_rgb = theme.transcript_change
 
@@ -597,12 +690,12 @@ class OSDWindow(Gtk.Window):
                     rgb = self._mix(rgb, change_rgb, 0.65 * highlight)
                     alpha += (base_alpha - alpha) * highlight
                 x = padding_x + run["x"]
-                cr.set_source_rgba(0.0, 0.0, 0.0, 0.52 * alpha)
-                cr.move_to(x, baseline + 2.0)
-                cr.show_text(run["text"])
+                # Soft, tight drop shadow: enough to lift text off busy
+                # backgrounds without the doubled look of a 2px hard offset.
+                cr.set_source_rgba(0.0, 0.0, 0.0, 0.38 * alpha)
+                self._show_text_at(cr, x, baseline + 1.0, run["text"])
                 cr.set_source_rgba(rgb[0], rgb[1], rgb[2], alpha)
-                cr.move_to(x, baseline)
-                cr.show_text(run["text"])
+                self._show_text_at(cr, x, baseline, run["text"])
 
     def _draw_preview_text(self, cr: cairo.Context, width: int, height: int):
         if not self._preview_text or self._visualizer_state != "recording":
@@ -791,6 +884,9 @@ class OSDWindow(Gtk.Window):
         return self._text_extent(cr.text_extents(text), 'width', 2)
 
     def _text_advance(self, cr: cairo.Context, text: str) -> float:
+        pango = getattr(self, '_pango_text', None)
+        if pango is not None:
+            return pango.advance(text)
         extents = cr.text_extents(text)
         advance = self._text_extent(extents, 'x_advance', 4)
         if advance > 0:

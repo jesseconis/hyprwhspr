@@ -477,6 +477,12 @@
       "default": 0.3,
       "description": "Spectrum panel border opacity."
     },
+    "mic_osd_spectrum_layout": {
+      "type": "string",
+      "enum": ["linear", "mirrored"],
+      "default": "linear",
+      "description": "Spectrum bar layout. 'linear' runs low to high frequency from left to right; 'mirrored' places low frequencies in the centre and fans out symmetrically to both edges, so speech fills the meter evenly."
+    },
     "mic_osd_spectrum_gain": {
       "type": "number",
       "minimum": 0.05,
@@ -522,8 +528,15 @@
     "mic_osd_transcript_font_family": {
       "type": "string",
       "minLength": 1,
-      "default": "sans-serif",
-      "description": "Cairo font family for the dynamically wrapped spectrum transcript."
+      "default": "Inter, Inter Variable, Inter Nerd Font Propo, sans-serif",
+      "description": "Font family (Pango/fontconfig name, or a comma-separated fallback list) for the dynamically wrapped spectrum transcript."
+    },
+    "mic_osd_transcript_font_weight": {
+      "type": "integer",
+      "minimum": 100,
+      "maximum": 900,
+      "default": 500,
+      "description": "CSS-style font weight for the spectrum transcript (400 = regular, 500 = medium, 600 = semibold)."
     },
     "mic_osd_transcript_font_size": {
       "type": "number",

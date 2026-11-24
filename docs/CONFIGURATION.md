@@ -804,9 +804,11 @@ is involved.
   "mic_osd_spectrum_meter_height": 86,
   "mic_osd_spectrum_background_opacity": 0.46,
   "mic_osd_spectrum_border_opacity": 0.30,
+  "mic_osd_spectrum_layout": "linear",
 
-  "mic_osd_transcript_font_family": "sans-serif",
+  "mic_osd_transcript_font_family": "Inter, Inter Variable, Inter Nerd Font Propo, sans-serif",
   "mic_osd_transcript_font_size": 18,
+  "mic_osd_transcript_font_weight": 500,
   "mic_osd_transcript_max_lines": 6,
   "mic_osd_transcript_line_spacing": 1.25,
   "mic_osd_transcript_opacity": 0.96,
@@ -822,6 +824,18 @@ is involved.
 }
 ```
 
+`mic_osd_spectrum_layout` controls how frequency bands are placed. With
+`"linear"`, they run from low on the left to high on the right, so speech
+mostly lights up the left side. With `"mirrored"`, the low frequencies sit in
+the centre and fan out symmetrically to both edges, so activity fills the meter
+evenly.
+
+The transcript is shaped with Pango, so `mic_osd_transcript_font_family`
+accepts any fontconfig family or a comma-separated fallback list. The default
+prefers Inter and falls back to `sans-serif`. Pango also falls back per glyph
+for emoji and other scripts. `mic_osd_transcript_font_weight` takes a CSS-style
+weight from 100 to 900.
+
 For a larger, more responsive live preview, try width `900`, meter height `110`,
 transcript font size `26`, line spacing `1.3`, and background opacity `0.85`.
 For quieter microphones, try gain `1.6`, peak `-34` dB, curve `0.85`, rise `12` ms,
@@ -834,9 +848,10 @@ transcript cannot reconstruct speech the server has already omitted.
 The wrapped transcript shows how settled each part of it is, so you can keep
 reading at the end without missing rewrites further back:
 
-- **Provisional text** (a live partial the server may still rewrite) is dimmed
-  and tinted toward the theme's `transcript-live` color. When its final
-  transcription arrives it eases to the normal text color. RealtimeSTT reports
+- **Confirmed text** is drawn in `transcript-final` (soft cyan by default).
+- **Provisional text** (a live partial the server may still rewrite) is drawn
+  in `transcript-live` (warm orange by default). When its final transcription
+  arrives it eases to `transcript-final`. RealtimeSTT reports
   exactly which prefix is final. For backends that don't, a word is treated as
   settled once it has stopped changing for about a second.
 - **Revised words** away from the end of the transcript (a final replacing its
@@ -852,8 +867,10 @@ reading at the end without missing rewrites further back:
 }
 ```
 
-Both colors can be overridden in `mic-osd.css` with `@define-color
-transcript-live` and `@define-color transcript-change`.
+All three colors can be overridden in `mic-osd.css` with `@define-color
+transcript-final`, `@define-color transcript-live` and `@define-color
+transcript-change` (pink by default). With stability cues disabled, the text
+uses the theme's `text-color`.
 
 Response tuning does **not** alter the audio sent to transcription:
 

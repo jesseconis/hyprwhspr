@@ -42,6 +42,20 @@ class MicOSDStyleTests(unittest.TestCase):
         self.assertEqual(config.transcript_font_size, 72.0)
         self.assertEqual(config.transcript_max_lines, 1)
 
+    def test_osd_config_validates_spectrum_layout_and_font_weight(self):
+        config = MicOSDConfig.from_getter(
+            {
+                "mic_osd_spectrum_layout": " Mirrored ",
+                "mic_osd_transcript_font_weight": 2000,
+            }.get
+        )
+        self.assertEqual(config.spectrum_layout, "mirrored")
+        self.assertEqual(config.transcript_font_weight, 900)
+
+        config = MicOSDConfig.from_getter({"mic_osd_spectrum_layout": "radial"}.get)
+        self.assertEqual(config.spectrum_layout, "linear")
+        self.assertEqual(config.transcript_font_weight, 500)
+
 
 if __name__ == "__main__":
     unittest.main()

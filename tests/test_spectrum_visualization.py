@@ -66,6 +66,30 @@ class SpectrumVisualizationTests(unittest.TestCase):
         self.assertGreater(float(np.max(visualization.bar_heights[12:18])), 0.5)
         self.assertLess(float(np.max(visualization.bar_heights[50:])), 0.05)
 
+    def test_mirrored_layout_centres_low_frequencies_symmetrically(self):
+        config_module = importlib.import_module("mic_osd.osd_config")
+        config = config_module.MicOSDConfig(spectrum_layout="mirrored")
+        visualization = self.SpectrumVisualization(osd_config=config)
+        self._advance(visualization)
+        spectrum = np.full(96, 1e-7)
+        spectrum[:12] = 0.08  # speech-like: energy in the lowest bands
+
+        visualization.update(0.2, spectrum)
+
+        heights = visualization.bar_heights
+        np.testing.assert_allclose(heights, heights[::-1])
+        self.assertGreater(float(np.min(heights[44:52])), 0.5)
+        self.assertLess(float(np.max(heights[:20])), 0.05)
+        self.assertLess(float(np.max(heights[-20:])), 0.05)
+
+    def test_mirrored_downsampling_keeps_every_band(self):
+        spectrum = np.zeros(96)
+        spectrum[1] = 1.0  # an odd band that interpolation would skip
+
+        pooled = self.SpectrumVisualization._resample(spectrum, 48)
+
+        self.assertGreater(float(pooled[0]), 0.5)
+
     def test_configured_response_can_make_quiet_input_reach_peak(self):
         config_module = importlib.import_module("mic_osd.osd_config")
         config = config_module.MicOSDConfig(

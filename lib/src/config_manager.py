@@ -166,6 +166,7 @@ class ConfigManager:
             'mic_osd_spectrum_meter_height': 86,
             'mic_osd_spectrum_background_opacity': 0.46,
             'mic_osd_spectrum_border_opacity': 0.30,
+            'mic_osd_spectrum_layout': 'linear',  # 'linear' (low->high) or 'mirrored' (low in centre)
             'mic_osd_spectrum_gain': 1.35,
             'mic_osd_spectrum_noise_floor_db': -72.0,
             'mic_osd_spectrum_peak_db': -24.0,
@@ -173,8 +174,9 @@ class ConfigManager:
             'mic_osd_spectrum_rise_ms': 35.0,
             'mic_osd_spectrum_fall_ms': 150.0,
             # Dynamically wrapped transcript below the spectrum meter
-            'mic_osd_transcript_font_family': 'sans-serif',
+            'mic_osd_transcript_font_family': 'Inter, Inter Variable, Inter Nerd Font Propo, sans-serif',  # Pango fallback list
             'mic_osd_transcript_font_size': 18.0,
+            'mic_osd_transcript_font_weight': 500,
             'mic_osd_transcript_max_lines': 6,  # Legacy; spectrum preview uses monitor-height limit
             'mic_osd_transcript_line_spacing': 1.25,
             'mic_osd_transcript_opacity': 0.96,
